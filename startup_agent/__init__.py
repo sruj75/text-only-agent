@@ -1,0 +1,1 @@
+"""Minimal startup agent package."""
