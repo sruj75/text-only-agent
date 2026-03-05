@@ -10,8 +10,27 @@ type EventRow = {
   payload: Record<string, unknown>;
   executed: boolean;
   cron_job_id: number | null;
+  attempt_count?: number | null;
   scheduled_time?: string | null;
 };
+
+const MAX_DELIVERY_ATTEMPTS = 4;
+
+function asNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function retryDelayMinutes(nextAttemptCount: number): number | null {
+  if (nextAttemptCount === 2) return 2;
+  if (nextAttemptCount === 3) return 10;
+  if (nextAttemptCount === 4) return 30;
+  return null;
+}
 
 function localDateKey(timezoneName: string | null): string {
   if (!timezoneName) return "";
@@ -160,6 +179,33 @@ async function ensureNextMorningWake(
     return { ok: false, error: result.error.message };
   }
   return { ok: true, detail: result.data ?? null };
+}
+
+async function scheduleRetryAttempt(
+  supabase: ReturnType<typeof createClient>,
+  eventId: string,
+  timezoneName: string,
+  attemptedAtIso: string,
+  nextAttemptCount: number,
+): Promise<{ ok: boolean; jobId?: number; error?: string; retryAt?: string }> {
+  const delayMinutes = retryDelayMinutes(nextAttemptCount);
+  if (!delayMinutes) {
+    return { ok: false, error: "retry_delay_not_defined" };
+  }
+
+  const retryAt = new Date(Date.parse(attemptedAtIso) + delayMinutes * 60_000).toISOString();
+  const result = await supabase.rpc("schedule_event_retry", {
+    p_event_id: eventId,
+    p_next_run_at: retryAt,
+    p_timezone: timezoneName,
+    p_last_error: "push_failed_or_missing_token",
+    p_attempted_at: attemptedAtIso,
+  });
+  if (result.error) {
+    return { ok: false, error: result.error.message };
+  }
+
+  return { ok: true, jobId: asNumber(result.data) ?? undefined, retryAt };
 }
 
 async function resolveSessionTimezone(
@@ -313,6 +359,10 @@ Deno.serve(async (req: Request): Promise<Response> => {
     };
     if (calendarEventId) notificationData.calendar_event_id = calendarEventId;
 
+    const attemptedAt = new Date().toISOString();
+    const existingAttemptCount = Math.max(0, asNumber(event.attempt_count) ?? 0);
+    const nextAttemptCount = existingAttemptCount + 1;
+
     let pushSent = false;
     if (!sessionTimezone || !sessionId) {
       pushSent = false;
@@ -334,8 +384,9 @@ Deno.serve(async (req: Request): Promise<Response> => {
         const failedFinalize = await supabase.rpc("finalize_event_execution", {
           p_event_id: eventId,
           p_last_error: "morning_wake_continuation_failed",
-          p_attempted_at: new Date().toISOString(),
+          p_attempted_at: attemptedAt,
           p_executed: false,
+          p_attempt_count: nextAttemptCount,
         });
         if (failedFinalize.error) {
           return new Response(
@@ -357,11 +408,70 @@ Deno.serve(async (req: Request): Promise<Response> => {
       }
     }
 
+    const retryableFailure = !pushSent
+      && lastError === "push_failed_or_missing_token"
+      && sessionTimezone
+      && nextAttemptCount < MAX_DELIVERY_ATTEMPTS;
+
+    if (retryableFailure) {
+      await unscheduleIfPresent(supabase, event.cron_job_id ?? null);
+
+      const retryResult = await scheduleRetryAttempt(
+        supabase,
+        eventId,
+        sessionTimezone,
+        attemptedAt,
+        nextAttemptCount,
+      );
+      if (!retryResult.ok) {
+        const failedFinalize = await supabase.rpc("finalize_event_execution", {
+          p_event_id: eventId,
+          p_last_error: `retry_schedule_failed:${retryResult.error ?? "unknown"}`,
+          p_attempted_at: attemptedAt,
+          p_executed: true,
+          p_attempt_count: nextAttemptCount,
+        });
+        if (failedFinalize.error) {
+          return new Response(
+            JSON.stringify({ error: `finalize failed: ${failedFinalize.error.message}` }),
+            { status: 500, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            status: "terminal_failed",
+            event_id: eventId,
+            event_type: eventType,
+            push_sent: false,
+            retry_error: retryResult.error ?? "unknown",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          status: "retry_scheduled",
+          event_id: eventId,
+          event_type: eventType,
+          push_sent: false,
+          attempt_count: nextAttemptCount,
+          retry_at: retryResult.retryAt ?? null,
+          retry_job_id: retryResult.jobId ?? null,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    const terminalError = !pushSent && nextAttemptCount >= MAX_DELIVERY_ATTEMPTS
+      ? "delivery_failed_terminal"
+      : lastError;
     const finalize = await supabase.rpc("finalize_event_execution", {
       p_event_id: eventId,
-      p_last_error: lastError,
-      p_attempted_at: new Date().toISOString(),
+      p_last_error: terminalError,
+      p_attempted_at: attemptedAt,
       p_executed: true,
+      p_attempt_count: nextAttemptCount,
     });
     if (finalize.error) {
       return new Response(
@@ -378,6 +488,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
         event_id: eventId,
         event_type: eventType,
         push_sent: pushSent,
+        attempt_count: nextAttemptCount,
         next_morning_wake: nextMorningWake,
       }),
       { status: 200, headers: { "Content-Type": "application/json" } },

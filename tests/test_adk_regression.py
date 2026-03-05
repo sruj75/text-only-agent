@@ -25,3 +25,26 @@ def test_adk_requires_credentials(monkeypatch):
         assert "Missing Google ADK credentials" in str(error)
     else:
         raise AssertionError("Expected credential guard to fail without credentials")
+
+
+def test_adk_registers_function_tools_when_enabled():
+    async def _time_handler(timezone, runtime_context):
+        return {"ok": True, "timezone": timezone, "ctx": runtime_context}
+
+    async def _task_handler(action, payload, session_id, timezone, runtime_context):
+        return {
+            "ok": True,
+            "action": action,
+            "payload": payload,
+            "session_id": session_id,
+            "timezone": timezone,
+            "ctx": runtime_context,
+        }
+
+    adk = SimpleADK(
+        get_current_time_tool=_time_handler,
+        task_management_tool=_task_handler,
+        enable_task_tools=True,
+    )
+
+    assert len(adk.agent.tools or []) == 2

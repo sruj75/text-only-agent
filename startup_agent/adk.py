@@ -1,10 +1,11 @@
 import os
 from contextlib import aclosing
-from typing import AsyncGenerator, Dict
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Tuple
 
 from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
+from google.adk.tools import FunctionTool, ToolContext
 from google.genai import types
 
 
@@ -43,18 +44,39 @@ Reminder policy:
 - Unscheduled tasks stay in task lists and should not get reminder framing.
 """
 
+GetCurrentTimeToolHandler = Callable[[str | None, Dict[str, str]], Awaitable[Dict[str, Any]]]
+TaskManagementToolHandler = Callable[
+    [str, Dict[str, Any], str | None, str | None, Dict[str, str]],
+    Awaitable[Dict[str, Any]],
+]
+
 
 class SimpleADK:
-    """Google ADK-backed agent runner with in-memory ADK session service."""
+    """Google ADK-backed agent runner with optional function tool integration."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        get_current_time_tool: GetCurrentTimeToolHandler | None = None,
+        task_management_tool: TaskManagementToolHandler | None = None,
+        enable_task_tools: bool | None = None,
+    ) -> None:
         self.app_name = "intentive_agent"
         self.model_name = "gemini-2.0-flash"
+        self._get_current_time_tool = get_current_time_tool
+        self._task_management_tool = task_management_tool
+        self._runtime_context: Dict[Tuple[str, str], Dict[str, str]] = {}
+
+        tools = []
+        use_tools = enable_task_tools if enable_task_tools is not None else False
+        if use_tools and get_current_time_tool and task_management_tool:
+            tools.extend([FunctionTool(self.get_current_time), FunctionTool(self.task_management)])
 
         self.agent = LlmAgent(
             name="intentive_coach",
             model=self.model_name,
             instruction=CONVERSATION_INSTRUCTION,
+            tools=tools,
         )
         self.session_service = InMemorySessionService()
         self.runner = Runner(
@@ -82,6 +104,42 @@ class SimpleADK:
             f"User message:\n{clean_prompt}"
         )
 
+    def _tool_runtime_context(self, tool_context: ToolContext | None) -> Dict[str, str]:
+        if not tool_context:
+            return {}
+        key = (tool_context.user_id, tool_context.session.id)
+        return dict(self._runtime_context.get(key, {}))
+
+    async def get_current_time(
+        self,
+        timezone: str | None = None,
+        tool_context: ToolContext | None = None,
+    ) -> Dict[str, Any]:
+        if not self._get_current_time_tool:
+            return {"ok": False, "error": "get_current_time tool is unavailable"}
+        runtime_context = self._tool_runtime_context(tool_context)
+        return await self._get_current_time_tool(timezone, runtime_context)
+
+    async def task_management(
+        self,
+        action: str,
+        payload: Dict[str, Any] | None = None,
+        session_id: str | None = None,
+        timezone: str | None = None,
+        tool_context: ToolContext | None = None,
+    ) -> Dict[str, Any]:
+        if not self._task_management_tool:
+            return {"ok": False, "error": "task_management tool is unavailable"}
+        runtime_context = self._tool_runtime_context(tool_context)
+        normalized_payload = payload if isinstance(payload, dict) else {}
+        return await self._task_management_tool(
+            action,
+            normalized_payload,
+            session_id,
+            timezone,
+            runtime_context,
+        )
+
     async def run_stream(
         self,
         *,
@@ -101,6 +159,8 @@ class SimpleADK:
 
         content = types.Content(role="user", parts=[types.Part(text=composed_prompt)])
         last_seen = ""
+        context_key = (user_id, session_id)
+        self._runtime_context[context_key] = dict(context or {})
 
         async with aclosing(
             self.runner.run_async(
@@ -130,6 +190,8 @@ class SimpleADK:
                         yield delta
             except Exception as error:
                 raise RuntimeError(str(error)) from error
+            finally:
+                self._runtime_context.pop(context_key, None)
 
     async def run(
         self,

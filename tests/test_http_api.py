@@ -66,6 +66,35 @@ def test_bootstrap_accepts_explicit_session_id(app_client):
     assert payload["session_id"] == "session_device-beta_custom_1"
 
 
+def test_bootstrap_requires_timezone_when_user_has_none(app_client):
+    client = app_client["client"]
+
+    response = client.post(
+        "/agent/bootstrap-device",
+        json={"device_id": "device-no-tz"},
+    )
+
+    assert response.status_code == 400
+    assert "timezone is required" in response.json()["detail"].lower()
+
+
+def test_bootstrap_uses_stored_timezone_when_missing_in_request(app_client):
+    client = app_client["client"]
+
+    first = client.post(
+        "/agent/bootstrap-device",
+        json={"device_id": "device-stored-tz", "timezone": "Asia/Kolkata"},
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        "/agent/bootstrap-device",
+        json={"device_id": "device-stored-tz"},
+    )
+    assert second.status_code == 200
+    assert second.json()["timezone"] == "Asia/Kolkata"
+
+
 def test_bootstrap_rejects_foreign_session_id(app_client):
     client = app_client["client"]
     repository = app_client["repository"]
