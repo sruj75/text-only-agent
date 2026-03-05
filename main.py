@@ -713,13 +713,13 @@ class SupabaseRepository:
 
 
 def build_repository() -> InMemoryRepository | SupabaseRepository:
-    project_url = os.getenv("SUPABASE_PROJECT_URL") or os.getenv("SUPABASE_URL")
+    supabase_url = os.getenv("SUPABASE_URL")
     service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    if project_url and service_role_key:
+    if supabase_url and service_role_key:
         logger.info("Using Supabase repository for chat persistence.")
-        return SupabaseRepository(project_url=project_url, service_role_key=service_role_key)
+        return SupabaseRepository(project_url=supabase_url, service_role_key=service_role_key)
     logger.warning(
-        "SUPABASE_PROJECT_URL/SUPABASE_SERVICE_ROLE_KEY missing; using in-memory repository."
+        "SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY missing; using in-memory repository."
     )
     return InMemoryRepository()
 
@@ -1441,7 +1441,7 @@ async def _execute_task_management(
 def health() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "supabase_project_url": os.getenv("SUPABASE_PROJECT_URL", ""),
+        "supabase_url": os.getenv("SUPABASE_URL", ""),
         "repository_mode": "supabase"
         if isinstance(repository, SupabaseRepository)
         else "in_memory",
