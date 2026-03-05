@@ -1,4 +1,9 @@
-# Secrets
+# OS / filesystem junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Secrets and local env files
 .env
 .env.*
 !.env.example
@@ -8,7 +13,53 @@
 venv/
 env/
 
-# Python cache and test artifacts
+# Python bytecode and caches
 __pycache__/
 *.py[cod]
+*$py.class
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+
+# Build and packaging artifacts
+build/
+dist/
+site/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Test and coverage outputs
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# Logs and runtime files
+*.log
+logs/
+*.pid
+*.out
+*.err
+
+# Local temp/data artifacts
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*.sqlite
+*.sqlite3
+*.db
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
