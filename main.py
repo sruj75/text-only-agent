@@ -291,6 +291,13 @@ class InMemoryRepository:
             return None
         return dict(record)
 
+    async def has_conversation_history(self, user_id: str) -> bool:
+        for bucket in self.messages.values():
+            for message in bucket:
+                if message.user_id == user_id and message.role in {"user", "assistant"}:
+                    return True
+        return False
+
     async def upsert_user_profile(
         self,
         *,
@@ -491,6 +498,19 @@ class SupabaseRepository:
         if not rows:
             return None
         return rows[0]
+
+    async def has_conversation_history(self, user_id: str) -> bool:
+        rows = await self._request(
+            "GET",
+            "session_messages",
+            params={
+                "user_id": f"eq.{user_id}",
+                "role": "in.(user,assistant)",
+                "select": "id",
+                "limit": "1",
+            },
+        )
+        return bool(rows)
 
     async def upsert_user_profile(
         self,
@@ -797,6 +817,16 @@ agent = SimpleADK(
     task_management_tool=_tool_task_management,
     enable_task_tools=TASK_TOOL_CALLING_V1_ENABLED,
 )
+
+
+def _active_adk_model_name() -> str:
+    direct = getattr(agent, "model_name", None)
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    nested = getattr(getattr(agent, "agent", None), "model", None)
+    if isinstance(nested, str) and nested.strip():
+        return nested.strip()
+    return "unknown"
 
 
 @asynccontextmanager
@@ -1458,6 +1488,7 @@ def health() -> Dict[str, Any]:
         else "in_memory",
         "task_mgmt_v1_enabled": TASK_MGMT_V1_ENABLED,
         "task_tool_calling_v1_enabled": TASK_TOOL_CALLING_V1_ENABLED,
+        "adk_model": _active_adk_model_name(),
     }
 
 
@@ -1475,7 +1506,11 @@ async def run_agent(payload: AgentRunRequest) -> Dict[str, str]:
             context=context,
         )
     except Exception as error:
-        raise HTTPException(status_code=503, detail=f"Google ADK unavailable: {error}") from error
+        model_name = _active_adk_model_name()
+        raise HTTPException(
+            status_code=503,
+            detail=f"Google ADK unavailable (model={model_name}): {error}",
+        ) from error
     return {"output": output}
 
 
@@ -1711,6 +1746,136 @@ async def agent_ws(
         timezone_name,
     )
 
+    def _startup_prompt(entry_context: EntryContext) -> str:
+        trigger_type = (entry_context.trigger_type or "").strip().lower()
+        if trigger_type == "post_onboarding":
+            return (
+                "Conversation bootstrap: first post-onboarding handoff. "
+                "Generate the first assistant message naturally using context. "
+                "Keep it brief, supportive, and action-oriented."
+            )
+        if entry_context.entry_mode == "proactive":
+            return (
+                "Conversation bootstrap: proactive check-in open. "
+                "Generate the first assistant message naturally using trigger context. "
+                "Keep it brief and guide the next concrete step."
+            )
+        return (
+            "Conversation bootstrap: reactive open. "
+            "Generate the first assistant message naturally using context. "
+            "Keep it brief and focused."
+        )
+
+    async def _build_runtime_context() -> Dict[str, str]:
+        session_record = await repository.get_session(
+            session_id=active_session_id,
+            user_id=active_user_id,
+        )
+        session_state = dict(session_record.state) if session_record else {}
+        profile_context = session_state.get("profile_context")
+        if not isinstance(profile_context, dict):
+            user_profile = await repository.get_user_profile(user_id=active_user_id)
+            profile_context = _build_profile_context(user_profile)
+            session_state["profile_context"] = profile_context
+        task_state = _coerce_task_state(session_state, timezone_name)
+
+        context_map = {
+            "session_id": active_session_id,
+            "user_id": active_user_id,
+            "timezone": timezone_name,
+            "entry_mode": latest_entry_context.entry_mode,
+            "trigger_type": latest_entry_context.trigger_type or "",
+            "entry_context": json.dumps(latest_entry_context.model_dump(), separators=(",", ":")),
+            "profile_context": json.dumps(profile_context, separators=(",", ":")),
+        }
+
+        should_run_due_diligence = (
+            latest_entry_context.entry_mode == "proactive"
+            and (latest_entry_context.trigger_type or "") != "post_onboarding"
+            and TASK_MGMT_V1_ENABLED
+        )
+        if should_run_due_diligence:
+            due_time = _get_current_time_context(timezone_name)
+            due_schedule = _build_schedule_response(
+                task_state=task_state,
+                timezone_name=timezone_name,
+                raw_date="today",
+            )
+            context_map["due_diligence_time"] = json.dumps(due_time, separators=(",", ":"))
+            context_map["due_diligence_schedule"] = json.dumps(due_schedule, separators=(",", ":"))
+        return context_map
+
+    async def _run_assistant_turn(
+        *,
+        prompt: str,
+        metadata: Dict[str, Any] | None = None,
+    ) -> bool:
+        assistant_message_id = str(uuid.uuid4())
+        context_map = await _build_runtime_context()
+
+        cumulative = ""
+        try:
+            async for delta in agent.run_stream(
+                prompt=prompt,
+                user_id=active_user_id,
+                session_id=active_session_id,
+                context=context_map,
+            ):
+                if not delta:
+                    continue
+                cumulative += delta
+                await websocket.send_json(
+                    {
+                        "type": "assistant_delta",
+                        "message_id": assistant_message_id,
+                        "delta": delta,
+                        "text": cumulative,
+                    }
+                )
+        except Exception as error:
+            model_name = _active_adk_model_name()
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "code": "adk_error",
+                    "detail": f"Google ADK unavailable (model={model_name}): {error}",
+                }
+            )
+            return False
+
+        assistant_text = cumulative.strip() or "I could not generate a response right now."
+        assistant_metadata: Dict[str, Any] = {"model": "google-adk", "streamed": True}
+        if metadata:
+            assistant_metadata.update(metadata)
+
+        assistant_message = MessageRecord(
+            id=assistant_message_id,
+            session_id=active_session_id,
+            user_id=active_user_id,
+            role="assistant",
+            content=assistant_text,
+            metadata=assistant_metadata,
+            created_at=_iso_now(),
+        )
+        await repository.insert_message(payload=assistant_message)
+
+        await _ensure_session(
+            user_id=active_user_id,
+            session_id=active_session_id,
+            timezone_name=timezone_name,
+            entry_context=latest_entry_context,
+            state_patch={"last_message_id": assistant_message_id, "last_role": "assistant"},
+        )
+
+        await websocket.send_json(
+            {
+                "type": "assistant_done",
+                "message_id": assistant_message_id,
+                "text": assistant_text,
+            }
+        )
+        return True
+
     try:
         while True:
             raw = await websocket.receive_text()
@@ -1733,6 +1898,19 @@ async def agent_ws(
                     latest_entry_context = EntryContext(**entry_payload)
                 except Exception:
                     latest_entry_context = EntryContext()
+
+                # post_onboarding is a one-time lifetime handoff.
+                # If the user already has any past conversation, downgrade to reactive.
+                is_post_onboarding = (latest_entry_context.trigger_type or "").strip().lower() == "post_onboarding"
+                if is_post_onboarding and await repository.has_conversation_history(user_id=active_user_id):
+                    latest_entry_context = latest_entry_context.model_copy(
+                        update={"entry_mode": "reactive", "trigger_type": None}
+                    )
+                    logger.info(
+                        "Ignoring repeated post_onboarding for device_id=%s session_id=%s",
+                        active_user_id,
+                        active_session_id,
+                    )
 
                 await repository.ensure_user(user_id=active_user_id, timezone_name=timezone_name)
                 user_profile = await repository.get_user_profile(user_id=active_user_id)
@@ -1759,6 +1937,16 @@ async def agent_ws(
                     }
                 )
                 initialized = True
+
+                startup_needed = not any(message.role in {"user", "assistant"} for message in history)
+                if startup_needed:
+                    await _run_assistant_turn(
+                        prompt=_startup_prompt(latest_entry_context),
+                        metadata={
+                            "startup_turn": True,
+                            "entry_context": latest_entry_context.model_dump(),
+                        },
+                    )
                 continue
 
             if frame_type != "user_message":
@@ -1802,103 +1990,8 @@ async def agent_ws(
             )
             await repository.insert_message(payload=user_message)
 
-            assistant_message_id = str(uuid.uuid4())
-
-            session_record = await repository.get_session(
-                session_id=active_session_id,
-                user_id=active_user_id,
-            )
-            session_state = dict(session_record.state) if session_record else {}
-            profile_context = session_state.get("profile_context")
-            if not isinstance(profile_context, dict):
-                user_profile = await repository.get_user_profile(user_id=active_user_id)
-                profile_context = _build_profile_context(user_profile)
-                session_state["profile_context"] = profile_context
-            task_state = _coerce_task_state(session_state, timezone_name)
-
-            context_map = {
-                "session_id": active_session_id,
-                "user_id": active_user_id,
-                "timezone": timezone_name,
-                "entry_mode": latest_entry_context.entry_mode,
-                "trigger_type": latest_entry_context.trigger_type or "",
-                "entry_context": json.dumps(latest_entry_context.model_dump(), separators=(",", ":")),
-                "profile_context": json.dumps(profile_context, separators=(",", ":")),
-            }
-
-            should_run_due_diligence = (
-                latest_entry_context.entry_mode == "proactive"
-                and (latest_entry_context.trigger_type or "") != "post_onboarding"
-                and TASK_MGMT_V1_ENABLED
-            )
-
-            if should_run_due_diligence:
-                due_time = _get_current_time_context(timezone_name)
-                due_schedule = _build_schedule_response(
-                    task_state=task_state,
-                    timezone_name=timezone_name,
-                    raw_date="today",
-                )
-                context_map["due_diligence_time"] = json.dumps(due_time, separators=(",", ":"))
-                context_map["due_diligence_schedule"] = json.dumps(due_schedule, separators=(",", ":"))
-
-            cumulative = ""
-            try:
-                async for delta in agent.run_stream(
-                    prompt=text,
-                    user_id=active_user_id,
-                    session_id=active_session_id,
-                    context=context_map,
-                ):
-                    if not delta:
-                        continue
-                    cumulative += delta
-                    await websocket.send_json(
-                        {
-                            "type": "assistant_delta",
-                            "message_id": assistant_message_id,
-                            "delta": delta,
-                            "text": cumulative,
-                        }
-                    )
-            except Exception as error:
-                await websocket.send_json(
-                    {
-                        "type": "error",
-                        "code": "adk_error",
-                        "detail": f"Google ADK unavailable: {error}",
-                    }
-                )
+            if not await _run_assistant_turn(prompt=text):
                 continue
-
-            assistant_text = cumulative.strip() or "I could not generate a response right now."
-
-            assistant_message = MessageRecord(
-                id=assistant_message_id,
-                session_id=active_session_id,
-                user_id=active_user_id,
-                role="assistant",
-                content=assistant_text,
-                metadata={"model": "google-adk", "streamed": True},
-                created_at=_iso_now(),
-            )
-            await repository.insert_message(payload=assistant_message)
-
-            await _ensure_session(
-                user_id=active_user_id,
-                session_id=active_session_id,
-                timezone_name=timezone_name,
-                entry_context=latest_entry_context,
-                state_patch={"last_message_id": assistant_message_id, "last_role": "assistant"},
-            )
-
-            await websocket.send_json(
-                {
-                    "type": "assistant_done",
-                    "message_id": assistant_message_id,
-                    "text": assistant_text,
-                }
-            )
 
     except WebSocketDisconnect:
         logger.info(

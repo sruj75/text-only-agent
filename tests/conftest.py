@@ -10,6 +10,7 @@ import main
 
 class FakeADK:
     def __init__(self) -> None:
+        self.model_name = "fake-adk-model"
         self.run_calls: list[dict[str, Any]] = []
         self.stream_calls: list[dict[str, Any]] = []
 

@@ -13,6 +13,7 @@ def test_health_endpoint(app_client):
     payload = response.json()
     assert payload["status"] == "ok"
     assert payload["repository_mode"] == "in_memory"
+    assert payload["adk_model"] == "fake-adk-model"
 
 
 def test_bootstrap_creates_daily_session_and_reuses_it(app_client):
@@ -191,6 +192,7 @@ def test_agent_run_returns_503_when_adk_fails(app_client):
 
     assert response.status_code == 503
     assert "Google ADK unavailable" in response.json()["detail"]
+    assert "model=fake-adk-model" in response.json()["detail"]
 
 
 def test_complete_onboarding_updates_user_and_bootstrap_context(app_client):
