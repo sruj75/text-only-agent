@@ -21,6 +21,17 @@ def _drain_until_done(ws):
             return frames
 
 
+def _drain_until_done_count(ws, target_done_count: int):
+    frames = []
+    done_count = 0
+    while done_count < target_done_count:
+        frame = ws.receive_json()
+        frames.append(frame)
+        if frame.get("type") == "assistant_done":
+            done_count += 1
+    return frames
+
+
 def _init_session(
     ws,
     *,
@@ -160,6 +171,45 @@ def test_ws_blocks_duplicate_message_ids(app_client):
 
     assert frame["type"] == "error"
     assert frame["code"] == "duplicate_message"
+
+
+def test_ws_handles_back_to_back_user_messages(app_client):
+    client = app_client["client"]
+    bootstrap = _bootstrap(client, device_id="device-burst")
+
+    with client.websocket_connect(
+        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
+    ) as ws:
+        _init_session(
+            ws,
+            device_id=bootstrap["device_id"],
+            session_id=bootstrap["session_id"],
+            entry_context={"source": "manual", "entry_mode": "reactive"},
+        )
+
+        ws.send_json({"type": "user_message", "message_id": "m-burst-1", "text": "first"})
+        ws.send_json({"type": "user_message", "message_id": "m-burst-2", "text": "second"})
+        frames = _drain_until_done_count(ws, target_done_count=2)
+
+    error_frames = [frame for frame in frames if frame.get("type") == "error"]
+    done_frames = [frame for frame in frames if frame.get("type") == "assistant_done"]
+
+    assert error_frames == []
+    assert len(done_frames) == 2
+
+    messages = client.get(
+        f"/agent/threads/{bootstrap['session_id']}/messages",
+        params={"device_id": bootstrap["device_id"]},
+    )
+    assert messages.status_code == 200
+    payload = messages.json()["messages"]
+    assert [msg["role"] for msg in payload] == [
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
 
 
 def test_ws_returns_adk_error_without_followup_assistant_message(app_client):

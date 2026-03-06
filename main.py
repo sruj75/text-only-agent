@@ -6,7 +6,7 @@ import asyncio
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Literal
+from typing import Any, Awaitable, Callable, Dict, List, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -40,6 +40,7 @@ TaskManagementAction = Literal[
 ]
 TaskStatus = Literal["todo", "in_progress", "done", "blocked"]
 TaskTriggerType = Literal["before_task", "transition", "after_task"]
+TaskPanelListener = Callable[[Dict[str, Any]], Awaitable[bool]]
 
 
 def _utc_now() -> datetime:
@@ -93,6 +94,25 @@ def _date_key_for_datetime(value: datetime, timezone_name: str) -> str:
 
 def _daily_session_id(device_id: str, timezone_name: str) -> str:
     return f"session_{device_id}_{_local_date_key(timezone_name)}"
+
+
+def _session_thread_type(
+    *,
+    user_id: str,
+    session_id: str,
+    timezone_name: str,
+    entry_context: "EntryContext",
+    state: Dict[str, Any] | None = None,
+) -> str:
+    existing = state or {}
+    configured = existing.get("thread_type")
+    if isinstance(configured, str) and configured.strip():
+        return configured.strip()
+    if entry_context.entry_mode == "proactive":
+        return "proactive"
+    if session_id == _daily_session_id(user_id, timezone_name):
+        return "daily"
+    return "manual"
 
 
 def _session_title(session_id: str, date_key: str, state: Dict[str, Any]) -> str:
@@ -756,6 +776,55 @@ def build_repository() -> InMemoryRepository | SupabaseRepository:
 
 
 repository = build_repository()
+task_panel_subscribers: Dict[tuple[str, str], List[TaskPanelListener]] = {}
+
+
+def _subscribe_task_panel(
+    user_id: str,
+    session_id: str,
+    listener: TaskPanelListener,
+) -> Any:
+    key = (user_id, session_id)
+    bucket = task_panel_subscribers.setdefault(key, [])
+    bucket.append(listener)
+
+    def _unsubscribe() -> None:
+        listeners = task_panel_subscribers.get(key)
+        if not listeners:
+            return
+        try:
+            listeners.remove(listener)
+        except ValueError:
+            return
+        if not listeners:
+            task_panel_subscribers.pop(key, None)
+
+    return _unsubscribe
+
+
+async def _broadcast_task_panel(
+    user_id: str,
+    session_id: str,
+    snapshot: Dict[str, Any],
+) -> None:
+    listeners = list(task_panel_subscribers.get((user_id, session_id), []))
+    stale: List[TaskPanelListener] = []
+
+    for listener in listeners:
+        try:
+            delivered = await listener(snapshot)
+        except Exception:
+            delivered = False
+        if not delivered:
+            stale.append(listener)
+
+    if stale:
+        current = task_panel_subscribers.get((user_id, session_id), [])
+        task_panel_subscribers[(user_id, session_id)] = [
+            listener for listener in current if listener not in stale
+        ]
+        if not task_panel_subscribers[(user_id, session_id)]:
+            task_panel_subscribers.pop((user_id, session_id), None)
 
 
 async def _tool_get_current_time(
@@ -797,18 +866,86 @@ async def _tool_task_management(
     except HTTPException as error:
         return {"ok": False, "error": str(error.detail)}
 
+    target_session_id = raw_session_id or _daily_session_id(raw_user_id, timezone_name)
+
     try:
+        session_record, task_state = await _get_task_state_for_session(
+            user_id=raw_user_id,
+            session_id=target_session_id,
+            timezone_name=timezone_name,
+        )
+        target_session_id = session_record.session_id
+        await _broadcast_task_panel(
+            raw_user_id,
+            target_session_id,
+            _build_task_panel_state(
+                task_state=task_state,
+                timezone_name=timezone_name,
+                run_status="running",
+                action=action,
+                payload=payload,
+            ),
+        )
+
         output = await _execute_task_management(
             device_id=raw_user_id,
             timezone_name=timezone_name,
             action=action,  # runtime-validated in _execute_task_management
             payload=payload,
-            session_id=raw_session_id,
+            session_id=target_session_id,
+        )
+        await _broadcast_task_panel(
+            raw_user_id,
+            output["session_id"],
+            _build_task_panel_state(
+                task_state=TaskStateV1(**output["task_state"]),
+                timezone_name=timezone_name,
+                run_status="complete",
+                action=action,
+                payload=payload,
+                result=output.get("result"),
+            ),
         )
         return {"ok": True, **output}
     except HTTPException as error:
+        if target_session_id:
+            session_record = await repository.get_session(
+                session_id=target_session_id,
+                user_id=raw_user_id,
+            )
+            if session_record:
+                await _broadcast_task_panel(
+                    raw_user_id,
+                    target_session_id,
+                    _build_task_panel_state(
+                        task_state=_coerce_task_state(session_record.state, timezone_name),
+                        timezone_name=timezone_name,
+                        run_status="error",
+                        action=action,
+                        payload=payload,
+                        error_message=str(error.detail),
+                    ),
+                )
         return {"ok": False, "error": str(error.detail)}
     except Exception as error:
+        if target_session_id:
+            session_record = await repository.get_session(
+                session_id=target_session_id,
+                user_id=raw_user_id,
+            )
+            if session_record:
+                await _broadcast_task_panel(
+                    raw_user_id,
+                    target_session_id,
+                    _build_task_panel_state(
+                        task_state=_coerce_task_state(session_record.state, timezone_name),
+                        timezone_name=timezone_name,
+                        run_status="error",
+                        action=action,
+                        payload=payload,
+                        error_message=str(error),
+                    ),
+                )
         return {"ok": False, "error": str(error)}
 
 
@@ -1043,6 +1180,130 @@ def _build_schedule_response(
         "timezone": timezone_name,
         "items": items,
         "next_upcoming": next_upcoming,
+    }
+
+
+def _task_action_label(action: str | None) -> str | None:
+    labels = {
+        "capture_tasks": "Capturing tasks",
+        "get_tasks": "Refreshing tasks",
+        "set_top_essentials": "Updating top essentials",
+        "timebox_task": "Updating schedule",
+        "get_schedule": "Loading schedule",
+        "update_task_status": "Updating task status",
+    }
+    if not action:
+        return None
+    return labels.get(action, action.replace("_", " ").strip().title())
+
+
+def _task_time_label(task: TaskItem, timezone_name: str) -> str | None:
+    if not task.timebox:
+        return None
+    start_dt = _parse_iso(task.timebox.start_at).astimezone(ZoneInfo(timezone_name))
+    end_dt = _parse_iso(task.timebox.end_at).astimezone(ZoneInfo(timezone_name))
+    return f"{start_dt.strftime('%I:%M %p').lstrip('0')} - {end_dt.strftime('%I:%M %p').lstrip('0')}"
+
+
+def _active_task_ids_for_action(
+    *,
+    action: str | None,
+    payload: Dict[str, Any],
+    result: Dict[str, Any] | None,
+) -> set[str]:
+    if not action:
+        return set()
+    if action == "capture_tasks" and isinstance(result, dict):
+        created = result.get("created_task_ids")
+        if isinstance(created, list):
+            return {str(item) for item in created if str(item).strip()}
+    if action in {"timebox_task", "update_task_status"}:
+        task_id = str(payload.get("task_id") or "").strip()
+        return {task_id} if task_id else set()
+    if action == "set_top_essentials":
+        task_ids = payload.get("task_ids")
+        if isinstance(task_ids, list):
+            return {str(item) for item in task_ids if str(item).strip()}
+    return set()
+
+
+def _build_task_panel_state(
+    *,
+    task_state: TaskStateV1,
+    timezone_name: str,
+    run_status: Literal["idle", "running", "complete", "error"] = "idle",
+    action: str | None = None,
+    payload: Dict[str, Any] | None = None,
+    result: Dict[str, Any] | None = None,
+    error_message: str | None = None,
+) -> Dict[str, Any]:
+    safe_payload = payload or {}
+    active_task_ids = _active_task_ids_for_action(
+        action=action,
+        payload=safe_payload,
+        result=result,
+    )
+
+    top_essential_tasks = [
+        task for task in task_state.tasks if task.is_essential
+    ]
+    top_essential_tasks.sort(key=lambda task: (task.priority_rank or 999, task.created_at))
+
+    tasks: List[Dict[str, Any]] = []
+    for task in task_state.tasks:
+        tasks.append(
+            {
+                "id": task.task_id,
+                "title": task.title,
+                "status": task.status,
+                "time_label": _task_time_label(task, timezone_name),
+                "is_active": task.task_id in active_task_ids,
+                "is_top_essential": task.is_essential,
+            }
+        )
+
+    schedule: List[Dict[str, Any]] = []
+    for item in _build_schedule_response(
+        task_state=task_state,
+        timezone_name=timezone_name,
+        raw_date=task_state.date or "today",
+    )["items"]:
+        schedule.append(
+            {
+                "id": item["task_id"],
+                "title": item["title"],
+                "start_label": _parse_iso(item["start_at"])
+                .astimezone(ZoneInfo(timezone_name))
+                .strftime("%I:%M %p")
+                .lstrip("0"),
+                "end_label": _parse_iso(item["end_at"])
+                .astimezone(ZoneInfo(timezone_name))
+                .strftime("%I:%M %p")
+                .lstrip("0"),
+                "task_id": item["task_id"],
+                "status": item["status"],
+            }
+        )
+
+    action_label = _task_action_label(action)
+    if error_message:
+        headline = error_message
+    elif run_status == "running" and action_label:
+        headline = f"{action_label}..."
+    elif run_status == "complete" and action_label:
+        headline = f"{action_label} done."
+    else:
+        headline = "Live task changes will show here."
+
+    return {
+        "run_status": run_status,
+        "active_action": action_label,
+        "headline": headline,
+        "tasks": tasks,
+        "top_essentials": [task.title for task in top_essential_tasks],
+        "schedule": schedule,
+        "updated_at": task_state.updated_at,
+        "error_message": error_message,
     }
 
 
@@ -1471,10 +1732,20 @@ async def _execute_task_management(
         state_patch={"task_state_v1": task_state.model_dump(), "task_state_version": "v1"},
     )
 
+    task_panel_state = _build_task_panel_state(
+        task_state=task_state,
+        timezone_name=timezone_name,
+        run_status="idle",
+        action=action,
+        payload=payload,
+        result=result,
+    )
+
     return {
         "session_id": resolved_session_id,
         "task_state": task_state.model_dump(),
         "result": result,
+        "task_panel_state": task_panel_state,
     }
 
 
@@ -1528,13 +1799,21 @@ async def bootstrap_device(payload: DeviceBootstrapRequest) -> Dict[str, Any]:
     user_profile = await repository.get_user_profile(user_id=device_id)
     profile_context = _build_profile_context(user_profile)
     needs_onboarding = _needs_onboarding(user_profile)
+    existing_session = await repository.get_session_by_id(session_id=session_id)
+    thread_type = _session_thread_type(
+        user_id=device_id,
+        session_id=session_id,
+        timezone_name=timezone_name,
+        entry_context=entry_context,
+        state=existing_session.state if existing_session else None,
+    )
     await _ensure_session(
         user_id=device_id,
         session_id=session_id,
         timezone_name=timezone_name,
         entry_context=entry_context,
         state_patch={
-            "thread_type": "daily" if session_id.endswith(_local_date_key(timezone_name)) else "manual",
+            "thread_type": thread_type,
             "profile_context": profile_context,
             "lifecycle_state": "needs_onboarding" if needs_onboarding else "active",
         },
@@ -1648,13 +1927,15 @@ async def task_management(payload: TaskManagementRequest) -> Dict[str, Any]:
         provided_timezone=payload.timezone,
     )
     try:
-        return await _execute_task_management(
+        output = await _execute_task_management(
             device_id=device_id,
             timezone_name=timezone_name,
             action=payload.action,
             payload=payload.payload,
             session_id=payload.session_id,
         )
+        await _broadcast_task_panel(device_id, output["session_id"], output["task_panel_state"])
+        return output
     except HTTPException:
         raise
     except Exception as error:
@@ -1723,6 +2004,24 @@ async def agent_ws(
     entry_mode: str = Query("reactive"),
 ) -> None:
     await websocket.accept()
+    socket_closed = False
+
+    async def _safe_send_json(payload: Dict[str, Any]) -> bool:
+        nonlocal socket_closed
+        if socket_closed:
+            return False
+        try:
+            await websocket.send_json(payload)
+            return True
+        except WebSocketDisconnect:
+            socket_closed = True
+            return False
+        except RuntimeError as error:
+            # Starlette raises RuntimeError after the close handshake starts.
+            if 'Cannot call "send" once a close message has been sent.' in str(error):
+                socket_closed = True
+                return False
+            raise
 
     try:
         timezone_name = await _resolve_timezone_for_user(
@@ -1731,11 +2030,15 @@ async def agent_ws(
         )
     except HTTPException as error:
         detail = error.detail if isinstance(error.detail, str) else "Invalid timezone"
-        await websocket.send_json({"type": "error", "code": "invalid_timezone", "detail": detail})
-        await websocket.close()
+        await _safe_send_json({"type": "error", "code": "invalid_timezone", "detail": detail})
+        try:
+            await websocket.close()
+        except Exception:
+            pass
         return
     active_user_id = device_id
     active_session_id = session_id
+    unsubscribe_task_panel = None
     initialized = False
     latest_entry_context = EntryContext(entry_mode="proactive" if entry_mode == "proactive" else "reactive")
 
@@ -1824,17 +2127,20 @@ async def agent_ws(
                 if not delta:
                     continue
                 cumulative += delta
-                await websocket.send_json(
+                if not await _safe_send_json(
                     {
                         "type": "assistant_delta",
                         "message_id": assistant_message_id,
                         "delta": delta,
                         "text": cumulative,
                     }
-                )
+                ):
+                    return False
+        except WebSocketDisconnect:
+            return False
         except Exception as error:
             model_name = _active_adk_model_name()
-            await websocket.send_json(
+            await _safe_send_json(
                 {
                     "type": "error",
                     "code": "adk_error",
@@ -1867,14 +2173,13 @@ async def agent_ws(
             state_patch={"last_message_id": assistant_message_id, "last_role": "assistant"},
         )
 
-        await websocket.send_json(
+        return await _safe_send_json(
             {
                 "type": "assistant_done",
                 "message_id": assistant_message_id,
                 "text": assistant_text,
             }
         )
-        return True
 
     try:
         while True:
@@ -1882,12 +2187,16 @@ async def agent_ws(
             try:
                 frame = json.loads(raw)
             except json.JSONDecodeError:
-                await websocket.send_json({"type": "error", "code": "invalid_json", "detail": "Invalid JSON frame"})
+                if not await _safe_send_json(
+                    {"type": "error", "code": "invalid_json", "detail": "Invalid JSON frame"}
+                ):
+                    break
                 continue
 
             frame_type = frame.get("type")
             if frame_type == "ping":
-                await websocket.send_json({"type": "pong", "ts": _iso_now()})
+                if not await _safe_send_json({"type": "pong", "ts": _iso_now()}):
+                    break
                 continue
 
             if frame_type == "init":
@@ -1926,16 +2235,47 @@ async def agent_ws(
                 except HTTPException as error:
                     detail = error.detail if isinstance(error.detail, str) else "Session init failed"
                     code = "session_forbidden" if error.status_code == 403 else "session_init_failed"
-                    await websocket.send_json({"type": "error", "code": code, "detail": detail})
+                    if not await _safe_send_json({"type": "error", "code": code, "detail": detail}):
+                        break
                     continue
                 history = await repository.list_messages(session_id=active_session_id)
-                await websocket.send_json(
+                session_record = await repository.get_session(
+                    session_id=active_session_id,
+                    user_id=active_user_id,
+                )
+                current_task_state = _coerce_task_state(
+                    dict(session_record.state) if session_record else {},
+                    timezone_name,
+                )
+                if unsubscribe_task_panel:
+                    unsubscribe_task_panel()
+
+                async def _task_panel_listener(snapshot: Dict[str, Any]) -> bool:
+                    return await _safe_send_json({"type": "task_panel_state", "state": snapshot})
+
+                unsubscribe_task_panel = _subscribe_task_panel(
+                    active_user_id,
+                    active_session_id,
+                    _task_panel_listener,
+                )
+                if not await _safe_send_json(
                     {
                         "type": "session_ready",
                         "session_id": active_session_id,
                         "messages": [message.model_dump() for message in history],
                     }
-                )
+                ):
+                    break
+                if not await _safe_send_json(
+                    {
+                        "type": "task_panel_state",
+                        "state": _build_task_panel_state(
+                            task_state=current_task_state,
+                            timezone_name=timezone_name,
+                        ),
+                    }
+                ):
+                    break
                 initialized = True
 
                 startup_needed = not any(message.role in {"user", "assistant"} for message in history)
@@ -1950,33 +2290,41 @@ async def agent_ws(
                 continue
 
             if frame_type != "user_message":
-                await websocket.send_json({"type": "error", "code": "unknown_frame", "detail": "Unknown frame type"})
+                if not await _safe_send_json(
+                    {"type": "error", "code": "unknown_frame", "detail": "Unknown frame type"}
+                ):
+                    break
                 continue
 
             if not initialized:
-                await websocket.send_json({"type": "error", "code": "not_initialized", "detail": "Send init first"})
+                if not await _safe_send_json(
+                    {"type": "error", "code": "not_initialized", "detail": "Send init first"}
+                ):
+                    break
                 continue
 
             message_id = str(frame.get("message_id") or "")
             text = str(frame.get("text") or "").strip()
             if not message_id or not text:
-                await websocket.send_json(
+                if not await _safe_send_json(
                     {
                         "type": "error",
                         "code": "invalid_user_message",
                         "detail": "message_id and text are required",
                     }
-                )
+                ):
+                    break
                 continue
 
             if await repository.message_exists(session_id=active_session_id, message_id=message_id):
-                await websocket.send_json(
+                if not await _safe_send_json(
                     {
                         "type": "error",
                         "code": "duplicate_message",
                         "detail": f"message_id {message_id} already exists",
                     }
-                )
+                ):
+                    break
                 continue
 
             user_message = MessageRecord(
@@ -1991,6 +2339,8 @@ async def agent_ws(
             await repository.insert_message(payload=user_message)
 
             if not await _run_assistant_turn(prompt=text):
+                if socket_closed:
+                    break
                 continue
 
     except WebSocketDisconnect:
@@ -2007,6 +2357,9 @@ async def agent_ws(
             error,
         )
         try:
-            await websocket.send_json({"type": "error", "code": "server_error", "detail": str(error)})
+            await _safe_send_json({"type": "error", "code": "server_error", "detail": str(error)})
         except Exception:
             pass
+    finally:
+        if unsubscribe_task_panel:
+            unsubscribe_task_panel()

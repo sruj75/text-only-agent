@@ -32,15 +32,17 @@ function retryDelayMinutes(nextAttemptCount: number): number | null {
   return null;
 }
 
-function localDateKey(timezoneName: string | null): string {
+function localDateKey(timezoneName: string | null, atIso?: string | null): string {
   if (!timezoneName) return "";
+  const referenceDate = atIso ? new Date(atIso) : new Date();
+  if (Number.isNaN(referenceDate.getTime())) return "";
   try {
     const parts = new Intl.DateTimeFormat("en-CA", {
       timeZone: timezoneName,
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
-    }).formatToParts(new Date());
+    }).formatToParts(referenceDate);
     const year = parts.find((p) => p.type === "year")?.value;
     const month = parts.find((p) => p.type === "month")?.value;
     const day = parts.find((p) => p.type === "day")?.value;
@@ -51,10 +53,8 @@ function localDateKey(timezoneName: string | null): string {
   return "";
 }
 
-function getDailySessionId(userId: string, timezoneName: string | null): string {
-  const day = localDateKey(timezoneName);
-  if (!day) return "";
-  return `session_${userId}_${day}`;
+function getProactiveSessionId(userId: string, eventId: string): string {
+  return `session_${userId}_proactive_${eventId}`;
 }
 
 function asString(value: unknown): string | null {
@@ -187,6 +187,7 @@ async function scheduleRetryAttempt(
   timezoneName: string,
   attemptedAtIso: string,
   nextAttemptCount: number,
+  lastError: string,
 ): Promise<{ ok: boolean; jobId?: number; error?: string; retryAt?: string }> {
   const delayMinutes = retryDelayMinutes(nextAttemptCount);
   if (!delayMinutes) {
@@ -198,7 +199,7 @@ async function scheduleRetryAttempt(
     p_event_id: eventId,
     p_next_run_at: retryAt,
     p_timezone: timezoneName,
-    p_last_error: "push_failed_or_missing_token",
+    p_last_error: lastError,
     p_attempted_at: attemptedAtIso,
   });
   if (result.error) {
@@ -222,6 +223,80 @@ async function resolveSessionTimezone(
   });
   if (tzResult.error) return null;
   return asString(tzResult.data);
+}
+
+async function ensureProactiveSession(
+  supabase: ReturnType<typeof createClient>,
+  {
+    userId,
+    sessionId,
+    timezoneName,
+    scheduledTime,
+    title,
+    entryContext,
+  }: {
+    userId: string;
+    sessionId: string;
+    timezoneName: string;
+    scheduledTime: string | null;
+    title: string;
+    entryContext: Record<string, unknown>;
+  },
+): Promise<boolean> {
+  const dateKey = localDateKey(timezoneName, scheduledTime);
+  if (!dateKey) return false;
+
+  const existingSessionResult = await supabase
+    .from("sessions")
+    .select("date,state")
+    .eq("session_id", sessionId)
+    .eq("user_id", userId)
+    .maybeSingle();
+  if (existingSessionResult.error) {
+    console.error("sessions select failed", existingSessionResult.error.message);
+    return false;
+  }
+
+  const existingState =
+    existingSessionResult.data?.state &&
+    typeof existingSessionResult.data.state === "object" &&
+    !Array.isArray(existingSessionResult.data.state)
+      ? existingSessionResult.data.state
+      : {};
+
+  const now = new Date().toISOString();
+  const sessionState = {
+    ...existingState,
+    title,
+    thread_type: "proactive",
+    user_timezone: timezoneName,
+    entry_context: entryContext,
+    lifecycle_state: "active",
+    last_seen_at: now,
+  };
+
+  const result = await supabase
+    .from("sessions")
+    .upsert(
+      {
+        session_id: sessionId,
+        user_id: userId,
+        date: existingSessionResult.data?.date ?? dateKey,
+        state: sessionState,
+        updated_at: now,
+      },
+      {
+        onConflict: "session_id",
+        ignoreDuplicates: false,
+      },
+    );
+
+  if (result.error) {
+    console.error("sessions upsert failed", result.error.message);
+    return false;
+  }
+
+  return true;
 }
 
 Deno.serve(async (req: Request): Promise<Response> => {
@@ -331,7 +406,6 @@ Deno.serve(async (req: Request): Promise<Response> => {
     const reason = asString(eventPayload.reason) ?? "scheduled_checkin";
     const triggerType = asString(eventPayload.trigger_type) ?? eventType;
     const calendarEventId = asString(eventPayload.calendar_event_id);
-    const sessionId = getDailySessionId(eventUserId, sessionTimezone);
 
     let title = "Check-in";
     let body = "You have a scheduled check-in.";
@@ -346,6 +420,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
     } else if (eventType === "checkin") {
       body = `It is time for your check-in (${reason}).`;
     }
+
+    const sessionId = getProactiveSessionId(eventUserId, eventId);
 
     const notificationData: Record<string, unknown> = {
       session_id: sessionId,
@@ -364,15 +440,37 @@ Deno.serve(async (req: Request): Promise<Response> => {
     const nextAttemptCount = existingAttemptCount + 1;
 
     let pushSent = false;
+    let sessionReady = false;
     if (!sessionTimezone || !sessionId) {
       pushSent = false;
     } else if (!(eventType === "calendar_reminder" && !calendarTimezone)) {
-      pushSent = await sendPushNotification(supabase, eventUserId, title, body, notificationData);
+      sessionReady = await ensureProactiveSession(supabase, {
+        userId: eventUserId,
+        sessionId,
+        timezoneName: sessionTimezone,
+        scheduledTime: asString(event.scheduled_time),
+        title,
+        entryContext: {
+          source: "push",
+          event_id: eventId,
+          trigger_type: triggerType,
+          scheduled_time: asString(event.scheduled_time),
+          calendar_event_id: calendarEventId,
+          entry_mode: "proactive",
+        },
+      });
+      if (!sessionReady) {
+        pushSent = false;
+      } else {
+        pushSent = await sendPushNotification(supabase, eventUserId, title, body, notificationData);
+      }
     }
 
     let lastError: string | null = pushSent ? null : "push_failed_or_missing_token";
     if (!sessionTimezone || !sessionId) {
       lastError = "missing_timezone";
+    } else if (!sessionReady) {
+      lastError = "session_persist_failed";
     } else if (eventType === "calendar_reminder" && !calendarTimezone) {
       lastError = "missing_timezone";
     }
@@ -409,7 +507,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     }
 
     const retryableFailure = !pushSent
-      && lastError === "push_failed_or_missing_token"
+      && (lastError === "push_failed_or_missing_token" || lastError === "session_persist_failed")
       && sessionTimezone
       && nextAttemptCount < MAX_DELIVERY_ATTEMPTS;
 
@@ -422,6 +520,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
         sessionTimezone,
         attemptedAt,
         nextAttemptCount,
+        lastError,
       );
       if (!retryResult.ok) {
         const failedFinalize = await supabase.rpc("finalize_event_execution", {

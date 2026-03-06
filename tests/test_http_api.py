@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import main
+
 
 def test_health_endpoint(app_client):
     client = app_client["client"]
@@ -65,6 +67,57 @@ def test_bootstrap_accepts_explicit_session_id(app_client):
     assert response.status_code == 200
     payload = response.json()
     assert payload["session_id"] == "session_device-beta_custom_1"
+
+
+def test_bootstrap_preserves_proactive_thread_titles(app_client):
+    client = app_client["client"]
+    repository = app_client["repository"]
+
+    proactive_session_id = "session_device-proactive_proactive_event-1"
+    repository.sessions[proactive_session_id] = main.SessionRecord(
+        session_id=proactive_session_id,
+        user_id="device-proactive",
+        date="2026-03-06",
+        state={
+            "title": "Good morning",
+            "thread_type": "proactive",
+            "entry_context": {
+                "source": "push",
+                "event_id": "event-1",
+                "trigger_type": "morning_wake",
+                "scheduled_time": "2026-03-06T01:30:00Z",
+                "calendar_event_id": None,
+                "entry_mode": "proactive",
+            },
+        },
+    )
+
+    response = client.post(
+        "/agent/bootstrap-device",
+        json={
+            "device_id": "device-proactive",
+            "timezone": "UTC",
+            "session_id": proactive_session_id,
+            "entry_context": {
+                "source": "push",
+                "event_id": "event-1",
+                "trigger_type": "morning_wake",
+                "scheduled_time": "2026-03-06T01:30:00Z",
+                "calendar_event_id": None,
+                "entry_mode": "proactive",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    thread = next(
+        item for item in payload["threads"] if item["session_id"] == proactive_session_id
+    )
+
+    assert payload["session_id"] == proactive_session_id
+    assert thread["title"] == "Good morning"
+    assert thread["state"]["thread_type"] == "proactive"
 
 
 def test_bootstrap_requires_timezone_when_user_has_none(app_client):

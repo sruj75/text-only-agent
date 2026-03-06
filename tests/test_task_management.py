@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import main
+
 
 def _capture(client, device_id: str, timezone_name: str, titles: list[str]):
     response = client.post(
@@ -241,6 +243,31 @@ def test_timebox_must_stay_within_session_day(app_client):
 
     assert response.status_code == 400
     assert "Timebox must stay within the session day" in response.json()["detail"]
+
+
+def test_task_panel_uses_session_day_for_schedule_snapshot():
+    timezone_name = "UTC"
+    task_state = main.TaskStateV1(
+        date="2026-03-04",
+        timezone=timezone_name,
+        tasks=[
+            main.TaskItem(
+                task_id="task-1",
+                title="Deep work",
+                timebox=main.TaskTimebox(
+                    start_at="2026-03-04T09:00:00Z",
+                    end_at="2026-03-04T10:00:00Z",
+                ),
+            )
+        ],
+    )
+
+    snapshot = main._build_task_panel_state(
+        task_state=task_state,
+        timezone_name=timezone_name,
+    )
+
+    assert [item["task_id"] for item in snapshot["schedule"]] == ["task-1"]
 
 
 def test_rebuild_keeps_existing_events_when_new_schedule_fails(app_client):
