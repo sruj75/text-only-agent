@@ -235,6 +235,28 @@ def test_complete_onboarding_updates_user_and_bootstrap_context(app_client):
     ]
 
 
+def test_complete_onboarding_backfills_health_anchors_when_missing(app_client):
+    client = app_client["client"]
+
+    completed = client.post(
+        "/agent/onboarding/complete",
+        json={
+            "device_id": "device-onboard-default-anchors",
+            "timezone": "UTC",
+            "wake_time": "07:30",
+            "bedtime": "23:15",
+            "playbook": "Help me start with one tiny next action.",
+            "health_anchors": [],
+        },
+    )
+    assert completed.status_code == 200
+    payload = completed.json()
+    assert payload["profile_context"]["health_anchors"] == [
+        "Morning reset around 07:30",
+        "Night shutdown around 23:15",
+    ]
+
+
 def test_complete_onboarding_validates_required_fields(app_client):
     client = app_client["client"]
 

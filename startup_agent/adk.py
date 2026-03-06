@@ -1,4 +1,5 @@
 import os
+import json
 from contextlib import aclosing
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Tuple
 
@@ -123,7 +124,7 @@ class SimpleADK:
     async def task_management(
         self,
         action: str,
-        payload: Dict[str, Any] | None = None,
+        payload_json: str | None = None,
         session_id: str | None = None,
         timezone: str | None = None,
         tool_context: ToolContext | None = None,
@@ -131,7 +132,14 @@ class SimpleADK:
         if not self._task_management_tool:
             return {"ok": False, "error": "task_management tool is unavailable"}
         runtime_context = self._tool_runtime_context(tool_context)
-        normalized_payload = payload if isinstance(payload, dict) else {}
+        normalized_payload: Dict[str, Any] = {}
+        if isinstance(payload_json, str) and payload_json.strip():
+            try:
+                parsed_payload = json.loads(payload_json)
+                if isinstance(parsed_payload, dict):
+                    normalized_payload = parsed_payload
+            except json.JSONDecodeError:
+                normalized_payload = {}
         return await self._task_management_tool(
             action,
             normalized_payload,

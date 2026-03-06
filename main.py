@@ -125,6 +125,17 @@ def _normalize_text_list(value: Any) -> List[str]:
     return output
 
 
+def _default_health_anchors(wake_time: str, bedtime: str) -> List[str]:
+    anchors: List[str] = []
+    if _is_valid_hhmm(wake_time):
+        anchors.append(f"Morning reset around {wake_time}")
+    if _is_valid_hhmm(bedtime):
+        anchors.append(f"Night shutdown around {bedtime}")
+    if not anchors:
+        anchors.append("Daily consistency check-in")
+    return anchors
+
+
 def _get_current_time_context(timezone_name: str) -> Dict[str, str]:
     now_utc = _utc_now()
     now_local = now_utc.astimezone(ZoneInfo(timezone_name))
@@ -1548,7 +1559,7 @@ async def complete_onboarding(payload: OnboardingCompleteRequest) -> Dict[str, A
     if len(playbook_text) < 3:
         raise HTTPException(status_code=400, detail="playbook must have at least 3 characters")
     if not health_anchors:
-        raise HTTPException(status_code=400, detail="health_anchors requires at least one item")
+        health_anchors = _default_health_anchors(wake_time, bedtime)
 
     playbook = {"notes": playbook_text}
     completed_at = _iso_now()
