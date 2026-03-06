@@ -1,3 +1,4 @@
+import logging
 import os
 import json
 from contextlib import aclosing
@@ -9,6 +10,8 @@ from google.adk.sessions import InMemorySessionService
 from google.adk.tools import FunctionTool, ToolContext
 from google.genai import types
 
+
+logger = logging.getLogger(__name__)
 
 CONVERSATION_INSTRUCTION = """You are Intentive, a realtime ADHD support assistant.
 The user is live in the app and can hear you.
@@ -63,7 +66,7 @@ class SimpleADK:
         enable_task_tools: bool | None = None,
     ) -> None:
         self.app_name = "intentive_agent"
-        self.model_name = "gemini-2.0-flash"
+        self.model_name = "gemini-3.1-pro-preview"
         self._get_current_time_tool = get_current_time_tool
         self._task_management_tool = task_management_tool
         self._runtime_context: Dict[Tuple[str, str], Dict[str, str]] = {}
@@ -138,7 +141,18 @@ class SimpleADK:
                 parsed_payload = json.loads(payload_json)
                 if isinstance(parsed_payload, dict):
                     normalized_payload = parsed_payload
-            except json.JSONDecodeError:
+                else:
+                    logger.error(
+                        "task_management payload_json parsed to non-dict (%s); using {}. payload_json=%r",
+                        type(parsed_payload).__name__,
+                        payload_json,
+                    )
+            except json.JSONDecodeError as e:
+                logger.error(
+                    "task_management payload_json JSONDecodeError; using {}. error=%s payload_json=%r",
+                    str(e),
+                    payload_json,
+                )
                 normalized_payload = {}
         return await self._task_management_tool(
             action,
@@ -197,7 +211,12 @@ class SimpleADK:
                     if delta:
                         yield delta
             except Exception as error:
-                raise RuntimeError(str(error)) from error
+                message = str(error)
+                if "no longer available to new users" in message:
+                    message = (
+                        f"{message} Update startup_agent/adk.py with a currently available model."
+                    )
+                raise RuntimeError(message) from error
             finally:
                 self._runtime_context.pop(context_key, None)
 
