@@ -11,6 +11,9 @@ substitutions:
   _CPU: "1"
   _MEMORY: 1Gi
 
+options:
+  logging: CLOUD_LOGGING_ONLY
+
 steps:
   - name: gcr.io/cloud-builders/docker
     args:
