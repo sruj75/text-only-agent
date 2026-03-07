@@ -1,8 +1,9 @@
 substitutions:
   _SERVICE_NAME: startup-agent
-  _REGION: us-east1
+  _REGION: us-west1
   _AR_REPOSITORY: cloud-run-images
   _IMAGE_NAME: startup-agent
+  _RUNTIME_SERVICE_ACCOUNT: startup-agent-run@agentic-accountability.iam.gserviceaccount.com
   _MIN_INSTANCES: "0"
   _MAX_INSTANCES: "1"
   _CONCURRENCY: "10"
@@ -44,6 +45,8 @@ steps:
       - --platform
       - managed
       - --allow-unauthenticated
+      - --service-account
+      - ${_RUNTIME_SERVICE_ACCOUNT}
       - --cpu
       - ${_CPU}
       - --memory
