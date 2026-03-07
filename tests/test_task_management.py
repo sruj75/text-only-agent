@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -44,6 +45,18 @@ def test_task_management_happy_path(app_client):
     captured = _capture(client, "device-task-1", "UTC", ["Deep work", "Email"])
     task_ids = captured["result"]["created_task_ids"]
     assert len(task_ids) == 2
+
+    another_session = client.post(
+        "/agent/task-management",
+        json={
+            "device_id": "device-task-1",
+            "timezone": "UTC",
+            "session_id": "session_device-task-1_cross_session",
+            "action": "get_tasks",
+        },
+    )
+    assert another_session.status_code == 200
+    assert [task["task_id"] for task in another_session.json()["result"]["tasks"]] == task_ids
 
     prioritized = client.post(
         "/agent/task-management",
@@ -111,9 +124,9 @@ def test_task_management_happy_path(app_client):
     assert status_update.json()["result"]["task"]["status"] == "in_progress"
 
 
-def test_timebox_is_immutable_in_v1(app_client):
+def test_timebox_is_editable_for_persistent_tasks(app_client):
     client = app_client["client"]
-    captured = _capture(client, "device-task-immutable", "UTC", ["Task"])
+    captured = _capture(client, "device-task-editable", "UTC", ["Task"])
     task_id = captured["result"]["created_task_ids"][0]
 
     now = datetime.now(timezone.utc)
@@ -123,7 +136,7 @@ def test_timebox_is_immutable_in_v1(app_client):
     first = client.post(
         "/agent/task-management",
         json={
-            "device_id": "device-task-immutable",
+            "device_id": "device-task-editable",
             "timezone": "UTC",
             "session_id": captured["session_id"],
             "action": "timebox_task",
@@ -135,11 +148,12 @@ def test_timebox_is_immutable_in_v1(app_client):
         },
     )
     assert first.status_code == 200
+    assert len(first.json()["result"]["scheduled_events"]) == 2
 
     second = client.post(
         "/agent/task-management",
         json={
-            "device_id": "device-task-immutable",
+            "device_id": "device-task-editable",
             "timezone": "UTC",
             "session_id": captured["session_id"],
             "action": "timebox_task",
@@ -150,7 +164,10 @@ def test_timebox_is_immutable_in_v1(app_client):
             },
         },
     )
-    assert second.status_code == 409
+    assert second.status_code == 200
+    assert second.json()["result"]["task"]["timebox"]["start_at"] == (
+        start + timedelta(hours=1)
+    ).isoformat().replace("+00:00", "Z")
 
 
 def test_transition_rule_uses_gap_threshold(app_client):
@@ -214,7 +231,7 @@ def test_transition_rule_uses_gap_threshold(app_client):
     assert task_b_end_trigger.payload.get("reason") == "after_task"
 
 
-def test_timebox_must_stay_within_session_day(app_client):
+def test_timebox_must_stay_within_one_local_calendar_day(app_client):
     client = app_client["client"]
     timezone_name = "Asia/Kolkata"
 
@@ -242,10 +259,10 @@ def test_timebox_must_stay_within_session_day(app_client):
     )
 
     assert response.status_code == 400
-    assert "Timebox must stay within the session day" in response.json()["detail"]
+    assert "Timebox must stay within one local calendar day" in response.json()["detail"]
 
 
-def test_task_panel_uses_session_day_for_schedule_snapshot():
+def test_task_panel_uses_requested_day_for_schedule_snapshot():
     timezone_name = "UTC"
     task_state = main.TaskStateV1(
         date="2026-03-04",
@@ -268,6 +285,133 @@ def test_task_panel_uses_session_day_for_schedule_snapshot():
     )
 
     assert [item["task_id"] for item in snapshot["schedule"]] == ["task-1"]
+
+
+def test_done_task_unschedules_and_reopen_rebuilds_future_events(app_client):
+    client = app_client["client"]
+    repository = app_client["repository"]
+
+    captured = _capture(client, "device-status-events", "UTC", ["Task"])
+    task_id = captured["result"]["created_task_ids"][0]
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    start = now + timedelta(hours=2)
+    end = start + timedelta(minutes=30)
+
+    timeboxed = client.post(
+        "/agent/task-management",
+        json={
+            "device_id": "device-status-events",
+            "timezone": "UTC",
+            "session_id": captured["session_id"],
+            "action": "timebox_task",
+            "payload": {
+                "task_id": task_id,
+                "start_at": start.isoformat().replace("+00:00", "Z"),
+                "end_at": end.isoformat().replace("+00:00", "Z"),
+            },
+        },
+    )
+    assert timeboxed.status_code == 200
+    assert len(repository.events) == 2
+
+    done = client.post(
+        "/agent/task-management",
+        json={
+            "device_id": "device-status-events",
+            "timezone": "UTC",
+            "session_id": captured["session_id"],
+            "action": "update_task_status",
+            "payload": {"task_id": task_id, "status": "done"},
+        },
+    )
+    assert done.status_code == 200
+    assert repository.events == {}
+
+    reopened = client.post(
+        "/agent/task-management",
+        json={
+            "device_id": "device-status-events",
+            "timezone": "UTC",
+            "session_id": captured["session_id"],
+            "action": "update_task_status",
+            "payload": {"task_id": task_id, "status": "todo"},
+        },
+    )
+    assert reopened.status_code == 200
+    assert len(repository.events) == 2
+    assert any(event.event_type == "status_updated" for event in repository.task_events.values())
+
+
+def test_get_schedule_rejects_invalid_date_format(app_client):
+    client = app_client["client"]
+
+    response = client.post(
+        "/agent/task-management",
+        json={
+            "device_id": "device-invalid-date",
+            "timezone": "UTC",
+            "action": "get_schedule",
+            "payload": {"date": "tomorrow"},
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "date must be 'today' or YYYY-MM-DD"
+
+
+def test_supabase_task_list_paginates_past_500_rows():
+    repository = main.SupabaseRepository(
+        project_url="https://example.supabase.co",
+        service_role_key="service-role-key",
+    )
+    request_offsets: list[str] = []
+
+    async def fake_request(
+        method: str,
+        path: str,
+        *,
+        params=None,
+        json_body=None,
+        extra_headers=None,
+    ):
+        assert method == "GET"
+        assert path == "tasks"
+        assert json_body is None
+        assert extra_headers is None
+        request_offsets.append(params["offset"])
+
+        offset = int(params["offset"])
+        page_size = int(params["limit"])
+        total_rows = 501
+        remaining = max(total_rows - offset, 0)
+        count = min(page_size, remaining)
+        return [
+            {
+                "task_id": f"task-{offset + index:03d}",
+                "user_id": "device-paged",
+                "title": f"Task {offset + index:03d}",
+                "status": "todo",
+                "priority_rank": None,
+                "is_essential": False,
+                "timebox_start_at": None,
+                "timebox_end_at": None,
+                "created_at": f"2026-03-07T00:{(offset + index) // 60:02d}:{(offset + index) % 60:02d}Z",
+                "updated_at": f"2026-03-07T00:{(offset + index) // 60:02d}:{(offset + index) % 60:02d}Z",
+            }
+            for index in range(count)
+        ]
+
+    repository._request = fake_request  # type: ignore[assignment]
+    try:
+        rows = asyncio.run(repository.list_tasks(user_id="device-paged"))
+    finally:
+        asyncio.run(repository.close())
+
+    assert len(rows) == 501
+    assert request_offsets == ["0", "500"]
+    assert rows[0].task_id == "task-000"
+    assert rows[-1].task_id == "task-500"
 
 
 def test_rebuild_keeps_existing_events_when_new_schedule_fails(app_client):

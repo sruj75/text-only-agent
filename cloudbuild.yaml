@@ -1,0 +1,70 @@
+substitutions:
+  _SERVICE_NAME: startup-agent
+  _REGION: us-east1
+  _AR_REPOSITORY: cloud-run-images
+  _IMAGE_NAME: startup-agent
+  _MIN_INSTANCES: "0"
+  _MAX_INSTANCES: "1"
+  _CONCURRENCY: "10"
+  _TIMEOUT: "900"
+  _CPU: "1"
+  _MEMORY: 1Gi
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA
+
+  - name: postgres:16
+    entrypoint: sh
+    secretEnv:
+      - SUPABASE_DB_URL
+    args:
+      - -c
+      - psql "$$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f migrations/20260307133000_task_persistence_source_of_truth.sql
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE_NAME}
+      - --image
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA
+      - --region
+      - ${_REGION}
+      - --platform
+      - managed
+      - --allow-unauthenticated
+      - --cpu
+      - ${_CPU}
+      - --memory
+      - ${_MEMORY}
+      - --concurrency
+      - ${_CONCURRENCY}
+      - --timeout
+      - ${_TIMEOUT}
+      - --min-instances
+      - ${_MIN_INSTANCES}
+      - --max-instances
+      - ${_MAX_INSTANCES}
+      - --set-env-vars
+      - APP_ENV=production,TASK_MGMT_V1=true,TASK_TOOL_CALLING_V1=true,STRICT_STARTUP_VALIDATION=true,LOG_LEVEL=INFO
+      - --set-secrets
+      - GOOGLE_API_KEY=GOOGLE_API_KEY:latest,SUPABASE_URL=SUPABASE_URL:latest,SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SERVICE_ROLE_KEY:latest
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/SUPABASE_DB_URL/versions/latest
+      env: SUPABASE_DB_URL

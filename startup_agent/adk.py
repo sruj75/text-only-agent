@@ -24,6 +24,7 @@ Non-negotiables:
 
 Session context:
 - The runtime injects profile_context and entry_context.
+- The runtime may also inject due diligence task/schedule context from persisted data.
 - entry_mode can be proactive or reactive.
 - trigger_type may be post_onboarding for onboarding handoff.
 

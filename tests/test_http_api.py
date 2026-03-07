@@ -16,6 +16,46 @@ def test_health_endpoint(app_client):
     assert payload["status"] == "ok"
     assert payload["repository_mode"] == "in_memory"
     assert payload["adk_model"] == "fake-adk-model"
+    assert payload["runtime_env"] == "production"
+    assert payload["strict_startup_validation"] is False
+
+
+def test_runtime_validation_requires_secrets_in_production(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("STRICT_STARTUP_VALIDATION", "true")
+    monkeypatch.delenv("K_SERVICE", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+
+    try:
+        main._validate_runtime_configuration()
+    except RuntimeError as error:
+        message = str(error)
+        assert "GOOGLE_API_KEY" in message
+        assert "SUPABASE_URL" in message
+        assert "SUPABASE_SERVICE_ROLE_KEY" in message
+    else:
+        raise AssertionError("Expected production runtime validation to fail")
+
+
+def test_runtime_validation_allows_local_fallback(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("STRICT_STARTUP_VALIDATION", "false")
+    monkeypatch.delenv("K_SERVICE", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+
+    snapshot = main._validate_runtime_configuration()
+
+    assert snapshot["runtime_env"] == "production"
+    assert snapshot["strict_startup_validation"] is False
+    assert snapshot["missing_required_env_vars"] == [
+        "GOOGLE_API_KEY",
+        "SUPABASE_URL",
+        "SUPABASE_SERVICE_ROLE_KEY",
+    ]
 
 
 def test_bootstrap_creates_daily_session_and_reuses_it(app_client):

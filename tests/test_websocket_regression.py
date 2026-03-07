@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import main
+
 
 def _bootstrap(client, device_id: str = "device-ws"):
     response = client.post(
@@ -147,6 +149,7 @@ def test_ws_streams_and_persists_messages(app_client):
     assert stream_context["entry_mode"] == "proactive"
     assert "due_diligence_time" in stream_context
     assert "due_diligence_schedule" in stream_context
+    assert "due_diligence_tasks" in stream_context
 
 
 def test_ws_blocks_duplicate_message_ids(app_client):
@@ -248,7 +251,7 @@ def test_ws_returns_adk_error_without_followup_assistant_message(app_client):
     assert [msg["role"] for msg in payload] == ["assistant", "user"]
 
 
-def test_ws_skips_due_diligence_for_post_onboarding(app_client):
+def test_ws_includes_due_diligence_for_post_onboarding(app_client):
     client = app_client["client"]
     fake_agent = app_client["agent"]
     bootstrap = _bootstrap(client, device_id="device-post-onboarding")
@@ -279,8 +282,36 @@ def test_ws_skips_due_diligence_for_post_onboarding(app_client):
     stream_context = fake_agent.stream_calls[-1]["context"]
     assert stream_context["entry_mode"] == "proactive"
     assert stream_context["trigger_type"] == "post_onboarding"
-    assert "due_diligence_time" not in stream_context
-    assert "due_diligence_schedule" not in stream_context
+    assert "due_diligence_time" in stream_context
+    assert "due_diligence_schedule" in stream_context
+    assert "due_diligence_tasks" in stream_context
+
+
+def test_ws_skips_task_repository_reads_when_task_mgmt_disabled(app_client, monkeypatch):
+    client = app_client["client"]
+    repository = app_client["repository"]
+    bootstrap = _bootstrap(client, device_id="device-task-flag-off")
+    list_task_calls = {"count": 0}
+    original_list_tasks = repository.list_tasks
+
+    async def tracking_list_tasks(*args, **kwargs):
+        list_task_calls["count"] += 1
+        return await original_list_tasks(*args, **kwargs)
+
+    monkeypatch.setattr(main, "TASK_MGMT_V1_ENABLED", False)
+    repository.list_tasks = tracking_list_tasks  # type: ignore[assignment]
+
+    with client.websocket_connect(
+        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
+    ) as ws:
+        _init_session(
+            ws,
+            device_id=bootstrap["device_id"],
+            session_id=bootstrap["session_id"],
+            entry_context={"source": "manual", "entry_mode": "reactive"},
+        )
+
+    assert list_task_calls["count"] == 0
 
 
 def test_ws_includes_profile_context_from_onboarding(app_client):
@@ -343,7 +374,11 @@ def test_ws_init_starts_with_assistant_on_empty_reactive_thread(app_client):
 
     startup_done = [frame for frame in startup_frames if frame.get("type") == "assistant_done"][0]
     assert startup_done["text"] == "hello world"
-    assert fake_agent.stream_calls[0]["context"]["entry_mode"] == "reactive"
+    startup_context = fake_agent.stream_calls[0]["context"]
+    assert startup_context["entry_mode"] == "reactive"
+    assert "due_diligence_time" in startup_context
+    assert "due_diligence_schedule" in startup_context
+    assert "due_diligence_tasks" in startup_context
     assert fake_agent.stream_calls[0]["prompt"].startswith("Conversation bootstrap:")
 
     messages = client.get(

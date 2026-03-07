@@ -10,11 +10,131 @@ from typing import Any, Awaitable, Callable, Dict, List, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 from startup_agent.adk import SimpleADK
 
+
+_LOG_RESERVED_FIELDS = {
+    "args",
+    "asctime",
+    "created",
+    "exc_info",
+    "exc_text",
+    "filename",
+    "funcName",
+    "levelname",
+    "levelno",
+    "lineno",
+    "message",
+    "module",
+    "msecs",
+    "msg",
+    "name",
+    "pathname",
+    "process",
+    "processName",
+    "relativeCreated",
+    "stack_info",
+    "thread",
+    "threadName",
+}
+
+
+class JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload: Dict[str, Any] = {
+            "severity": record.levelname,
+            "message": record.getMessage(),
+            "logger": record.name,
+            "time": _iso_from_dt(datetime.fromtimestamp(record.created, timezone.utc)),
+        }
+        for key, value in record.__dict__.items():
+            if key in _LOG_RESERVED_FIELDS or key.startswith("_"):
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                payload[key] = value
+            elif isinstance(value, (dict, list, tuple)):
+                payload[key] = value
+            else:
+                payload[key] = str(value)
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+
+
+def _configure_logging() -> None:
+    if getattr(_configure_logging, "_configured", False):
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonLogFormatter())
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.addHandler(handler)
+    root_logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+    _configure_logging._configured = True  # type: ignore[attr-defined]
+
+
+def _log_event(level: int, message: str, **fields: Any) -> None:
+    logger.log(level, message, extra=fields)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _runtime_env() -> str:
+    raw = os.getenv("APP_ENV") or os.getenv("ENVIRONMENT") or "production"
+    return raw.strip().lower()
+
+
+def _is_cloud_run_runtime() -> bool:
+    return bool(os.getenv("K_SERVICE"))
+
+
+def _strict_startup_validation_enabled() -> bool:
+    default = _is_cloud_run_runtime()
+    return _env_flag("STRICT_STARTUP_VALIDATION", default)
+
+
+def _required_runtime_env_vars() -> List[str]:
+    return ["GOOGLE_API_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]
+
+
+def _runtime_config_snapshot() -> Dict[str, Any]:
+    missing = [name for name in _required_runtime_env_vars() if not os.getenv(name)]
+    return {
+        "runtime_env": _runtime_env(),
+        "cloud_run_service": os.getenv("K_SERVICE", ""),
+        "strict_startup_validation": _strict_startup_validation_enabled(),
+        "missing_required_env_vars": missing,
+    }
+
+
+def _validate_runtime_configuration() -> Dict[str, Any]:
+    config = _runtime_config_snapshot()
+    missing = config["missing_required_env_vars"]
+    if missing and config["strict_startup_validation"]:
+        raise RuntimeError(
+            "Missing required environment variables for production runtime: "
+            + ", ".join(missing)
+        )
+    if missing:
+        _log_event(
+            logging.WARNING,
+            "Runtime configuration incomplete; allowing local fallback",
+            **config,
+        )
+    else:
+        _log_event(logging.INFO, "Runtime configuration validated", **config)
+    return config
+
+
+_configure_logging()
 logger = logging.getLogger("intentive.agent")
 
 TASK_MGMT_V1_ENABLED = os.getenv("TASK_MGMT_V1", "true").lower() in {
@@ -40,6 +160,13 @@ TaskManagementAction = Literal[
 ]
 TaskStatus = Literal["todo", "in_progress", "done", "blocked"]
 TaskTriggerType = Literal["before_task", "transition", "after_task"]
+TaskEventType = Literal[
+    "created",
+    "status_updated",
+    "timebox_updated",
+    "top_essential_updated",
+    "migrated_from_session_state",
+]
 TaskPanelListener = Callable[[Dict[str, Any]], Awaitable[bool]]
 
 
@@ -262,6 +389,94 @@ class TaskStateV1(BaseModel):
     updated_at: str = Field(default_factory=_iso_now)
 
 
+class TaskRecord(BaseModel):
+    task_id: str
+    user_id: str
+    title: str
+    priority_rank: int | None = None
+    is_essential: bool = False
+    status: TaskStatus = "todo"
+    timebox_start_at: str | None = None
+    timebox_end_at: str | None = None
+    created_at: str = Field(default_factory=_iso_now)
+    updated_at: str = Field(default_factory=_iso_now)
+
+
+class TaskEventRecord(BaseModel):
+    id: str
+    task_id: str
+    user_id: str
+    event_type: TaskEventType
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=_iso_now)
+
+
+def _task_timebox_from_record(task: TaskRecord) -> TaskTimebox | None:
+    if not task.timebox_start_at or not task.timebox_end_at:
+        return None
+    return TaskTimebox(start_at=task.timebox_start_at, end_at=task.timebox_end_at)
+
+
+def _task_item_from_record(task: TaskRecord) -> TaskItem:
+    return TaskItem(
+        task_id=task.task_id,
+        title=task.title,
+        priority_rank=task.priority_rank,
+        is_essential=task.is_essential,
+        status=task.status,
+        created_at=task.created_at,
+        timebox=_task_timebox_from_record(task),
+    )
+
+
+def _task_state_from_records(
+    tasks: List[TaskRecord],
+    *,
+    timezone_name: str,
+    date_key: str | None = None,
+) -> TaskStateV1:
+    latest_update = max((task.updated_at for task in tasks), default=_iso_now())
+    return TaskStateV1(
+        date=date_key or _local_date_key(timezone_name),
+        timezone=timezone_name,
+        tasks=[_task_item_from_record(task) for task in tasks],
+        updated_at=latest_update,
+    )
+
+
+def _task_is_open(task: TaskRecord) -> bool:
+    return task.status != "done"
+
+
+def _task_sort_key(task: TaskRecord) -> tuple[int, int, int, str, str]:
+    done_rank = 1 if task.status == "done" else 0
+    essential_rank = task.priority_rank if task.is_essential and task.priority_rank is not None else 999
+    timebox_rank = 0 if task.timebox_start_at else 1
+    timebox_value = task.timebox_start_at or ""
+    return (done_rank, essential_rank, timebox_rank, timebox_value, task.created_at)
+
+
+def _day_window_bounds(raw_date: str | None, timezone_name: str) -> tuple[str, str, str]:
+    target_date = _target_date_key(raw_date, timezone_name)
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", target_date):
+        raise HTTPException(status_code=400, detail="date must be 'today' or YYYY-MM-DD")
+    try:
+        start_local = datetime.strptime(target_date, "%Y-%m-%d").replace(
+            tzinfo=ZoneInfo(timezone_name)
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail="date must be 'today' or YYYY-MM-DD",
+        ) from error
+    end_local = start_local + timedelta(days=1)
+    return (
+        target_date,
+        _iso_from_dt(start_local.astimezone(timezone.utc)),
+        _iso_from_dt(end_local.astimezone(timezone.utc)),
+    )
+
+
 class CheckinEventRecord(BaseModel):
     id: str
     user_id: str
@@ -283,6 +498,8 @@ class InMemoryRepository:
         self.messages: Dict[str, List[MessageRecord]] = {}
         self.push_tokens: Dict[str, str] = {}
         self.events: Dict[str, CheckinEventRecord] = {}
+        self.tasks: Dict[str, TaskRecord] = {}
+        self.task_events: Dict[str, TaskEventRecord] = {}
         self.next_job_id = 1000
 
     async def close(self) -> None:
@@ -385,6 +602,102 @@ class InMemoryRepository:
             return
         bucket.append(payload)
         bucket.sort(key=lambda row: row.created_at)
+
+    async def list_tasks(self, user_id: str) -> List[TaskRecord]:
+        rows = [task for task in self.tasks.values() if task.user_id == user_id]
+        rows.sort(key=_task_sort_key)
+        return [task.model_copy() for task in rows]
+
+    async def get_task(self, task_id: str, user_id: str) -> TaskRecord | None:
+        task = self.tasks.get(task_id)
+        if not task or task.user_id != user_id:
+            return None
+        return task.model_copy()
+
+    async def create_tasks(self, user_id: str, titles: List[str]) -> List[TaskRecord]:
+        created: List[TaskRecord] = []
+        for title in titles:
+            now = _iso_now()
+            task = TaskRecord(
+                task_id=str(uuid.uuid4()),
+                user_id=user_id,
+                title=title,
+                created_at=now,
+                updated_at=now,
+            )
+            self.tasks[task.task_id] = task
+            created.append(task.model_copy())
+        return created
+
+    async def update_task_status(self, task_id: str, user_id: str, status: TaskStatus) -> TaskRecord | None:
+        task = self.tasks.get(task_id)
+        if not task or task.user_id != user_id:
+            return None
+        updated = task.model_copy(update={"status": status, "updated_at": _iso_now()})
+        self.tasks[task_id] = updated
+        return updated.model_copy()
+
+    async def set_task_timebox(
+        self,
+        task_id: str,
+        user_id: str,
+        start_at: str,
+        end_at: str,
+    ) -> TaskRecord | None:
+        task = self.tasks.get(task_id)
+        if not task or task.user_id != user_id:
+            return None
+        updated = task.model_copy(
+            update={
+                "timebox_start_at": start_at,
+                "timebox_end_at": end_at,
+                "updated_at": _iso_now(),
+            }
+        )
+        self.tasks[task_id] = updated
+        return updated.model_copy()
+
+    async def replace_top_essentials(self, user_id: str, task_ids: List[str]) -> List[TaskRecord]:
+        updated: List[TaskRecord] = []
+        selected = {task_id: index for index, task_id in enumerate(task_ids, start=1)}
+        for task_id, task in list(self.tasks.items()):
+            if task.user_id != user_id:
+                continue
+            next_rank = selected.get(task_id)
+            next_task = task.model_copy(
+                update={
+                    "priority_rank": next_rank,
+                    "is_essential": next_rank is not None,
+                    "updated_at": _iso_now(),
+                }
+            )
+            self.tasks[task_id] = next_task
+            updated.append(next_task.model_copy())
+        updated.sort(key=_task_sort_key)
+        return updated
+
+    async def list_tasks_in_window(
+        self,
+        user_id: str,
+        start_at_utc: str,
+        end_at_utc: str,
+    ) -> List[TaskRecord]:
+        start_dt = _parse_iso(start_at_utc)
+        end_dt = _parse_iso(end_at_utc)
+        rows: List[TaskRecord] = []
+        for task in self.tasks.values():
+            if task.user_id != user_id or not task.timebox_start_at:
+                continue
+            start_value = _parse_iso(task.timebox_start_at)
+            if start_value < start_dt or start_value >= end_dt:
+                continue
+            rows.append(task.model_copy())
+        rows.sort(key=_task_sort_key)
+        return rows
+
+    async def append_task_event(self, payload: TaskEventRecord) -> TaskEventRecord:
+        self.task_events[payload.id] = payload
+        return payload.model_copy()
 
     async def list_future_task_events(
         self,
@@ -654,6 +967,176 @@ class SupabaseRepository:
             extra_headers={"Prefer": "return=minimal"},
         )
 
+    async def _list_task_rows(
+        self,
+        *,
+        user_id: str,
+        extra_params: Dict[str, str] | None = None,
+    ) -> List[Dict[str, Any]]:
+        page_size = 500
+        offset = 0
+        rows: List[Dict[str, Any]] = []
+
+        while True:
+            params = {
+                "user_id": f"eq.{user_id}",
+                "select": (
+                    "task_id,user_id,title,status,priority_rank,is_essential,"
+                    "timebox_start_at,timebox_end_at,created_at,updated_at"
+                ),
+                "order": "created_at.asc,task_id.asc",
+                "limit": str(page_size),
+                "offset": str(offset),
+            }
+            if extra_params:
+                params.update(extra_params)
+
+            page = await self._request(
+                "GET",
+                "tasks",
+                params=params,
+            )
+            page_rows = page or []
+            rows.extend(page_rows)
+            if len(page_rows) < page_size:
+                break
+            offset += page_size
+
+        return rows
+
+    async def list_tasks(self, user_id: str) -> List[TaskRecord]:
+        rows = await self._list_task_rows(user_id=user_id)
+        tasks = [TaskRecord(**row) for row in rows or []]
+        tasks.sort(key=_task_sort_key)
+        return tasks
+
+    async def get_task(self, task_id: str, user_id: str) -> TaskRecord | None:
+        rows = await self._request(
+            "GET",
+            "tasks",
+            params={
+                "task_id": f"eq.{task_id}",
+                "user_id": f"eq.{user_id}",
+                "select": (
+                    "task_id,user_id,title,status,priority_rank,is_essential,"
+                    "timebox_start_at,timebox_end_at,created_at,updated_at"
+                ),
+                "limit": "1",
+            },
+        )
+        if not rows:
+            return None
+        return TaskRecord(**rows[0])
+
+    async def create_tasks(self, user_id: str, titles: List[str]) -> List[TaskRecord]:
+        now = _iso_now()
+        payload = [
+            {
+                "task_id": str(uuid.uuid4()),
+                "user_id": user_id,
+                "title": title,
+                "created_at": now,
+                "updated_at": now,
+            }
+            for title in titles
+        ]
+        rows = await self._request(
+            "POST",
+            "tasks",
+            json_body=payload,
+            extra_headers={"Prefer": "return=representation"},
+        )
+        return [TaskRecord(**row) for row in rows or []]
+
+    async def update_task_status(
+        self,
+        task_id: str,
+        user_id: str,
+        status: TaskStatus,
+    ) -> TaskRecord | None:
+        rows = await self._request(
+            "PATCH",
+            "tasks",
+            params={"task_id": f"eq.{task_id}", "user_id": f"eq.{user_id}"},
+            json_body={"status": status, "updated_at": _iso_now()},
+            extra_headers={"Prefer": "return=representation"},
+        )
+        if not rows:
+            return None
+        return TaskRecord(**rows[0])
+
+    async def set_task_timebox(
+        self,
+        task_id: str,
+        user_id: str,
+        start_at: str,
+        end_at: str,
+    ) -> TaskRecord | None:
+        rows = await self._request(
+            "PATCH",
+            "tasks",
+            params={"task_id": f"eq.{task_id}", "user_id": f"eq.{user_id}"},
+            json_body={
+                "timebox_start_at": start_at,
+                "timebox_end_at": end_at,
+                "updated_at": _iso_now(),
+            },
+            extra_headers={"Prefer": "return=representation"},
+        )
+        if not rows:
+            return None
+        return TaskRecord(**rows[0])
+
+    async def replace_top_essentials(self, user_id: str, task_ids: List[str]) -> List[TaskRecord]:
+        tasks = await self.list_tasks(user_id=user_id)
+        ordered_lookup = {task_id: index for index, task_id in enumerate(task_ids, start=1)}
+        updated_rows: List[TaskRecord] = []
+        for task in tasks:
+            next_rank = ordered_lookup.get(task.task_id)
+            rows = await self._request(
+                "PATCH",
+                "tasks",
+                params={"task_id": f"eq.{task.task_id}", "user_id": f"eq.{user_id}"},
+                json_body={
+                    "priority_rank": next_rank,
+                    "is_essential": next_rank is not None,
+                    "updated_at": _iso_now(),
+                },
+                extra_headers={"Prefer": "return=representation"},
+            )
+            if rows:
+                updated_rows.append(TaskRecord(**rows[0]))
+        updated_rows.sort(key=_task_sort_key)
+        return updated_rows
+
+    async def list_tasks_in_window(
+        self,
+        user_id: str,
+        start_at_utc: str,
+        end_at_utc: str,
+    ) -> List[TaskRecord]:
+        rows = await self._list_task_rows(
+            user_id=user_id,
+            extra_params={
+                "timebox_start_at": "not.is.null",
+                "and": f"(timebox_start_at.gte.{start_at_utc},timebox_start_at.lt.{end_at_utc})",
+            },
+        )
+        tasks = [TaskRecord(**row) for row in rows or []]
+        tasks.sort(key=_task_sort_key)
+        return tasks
+
+    async def append_task_event(self, payload: TaskEventRecord) -> TaskEventRecord:
+        rows = await self._request(
+            "POST",
+            "task_events",
+            json_body=[payload.model_dump()],
+            extra_headers={"Prefer": "return=representation"},
+        )
+        if not rows:
+            raise RuntimeError("Task event insert returned empty response")
+        return TaskEventRecord(**rows[0])
+
     async def list_future_task_events(
         self,
         *,
@@ -764,13 +1247,23 @@ class SupabaseRepository:
 
 
 def build_repository() -> InMemoryRepository | SupabaseRepository:
+    runtime_config = _validate_runtime_configuration()
     supabase_url = os.getenv("SUPABASE_URL")
     service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     if supabase_url and service_role_key:
-        logger.info("Using Supabase repository for chat persistence.")
+        _log_event(
+            logging.INFO,
+            "Using Supabase repository for chat persistence",
+            repository_mode="supabase",
+            runtime_env=runtime_config["runtime_env"],
+            cloud_run_service=runtime_config["cloud_run_service"],
+        )
         return SupabaseRepository(project_url=supabase_url, service_role_key=service_role_key)
-    logger.warning(
-        "SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY missing; using in-memory repository."
+    _log_event(
+        logging.WARNING,
+        "Using in-memory repository fallback",
+        repository_mode="in_memory",
+        runtime_env=runtime_config["runtime_env"],
     )
     return InMemoryRepository()
 
@@ -853,6 +1346,9 @@ async def _tool_task_management(
     timezone: str | None,
     runtime_context: Dict[str, str],
 ) -> Dict[str, Any]:
+    if not TASK_MGMT_V1_ENABLED:
+        return {"ok": False, "error": "task_management_v1_disabled"}
+
     raw_user_id = str(runtime_context.get("user_id") or "").strip()
     if not raw_user_id:
         return {"ok": False, "error": "missing_user_id"}
@@ -869,9 +1365,13 @@ async def _tool_task_management(
     target_session_id = raw_session_id or _daily_session_id(raw_user_id, timezone_name)
 
     try:
-        session_record, task_state = await _get_task_state_for_session(
+        session_record = await _ensure_task_session(
             user_id=raw_user_id,
             session_id=target_session_id,
+            timezone_name=timezone_name,
+        )
+        task_state = await _load_task_state_for_user(
+            user_id=raw_user_id,
             timezone_name=timezone_name,
         )
         target_session_id = session_record.session_id
@@ -908,44 +1408,61 @@ async def _tool_task_management(
         )
         return {"ok": True, **output}
     except HTTPException as error:
+        _log_event(
+            logging.WARNING,
+            "Task tool action rejected",
+            device_id=raw_user_id,
+            session_id=target_session_id,
+            timezone=timezone_name,
+            action=action,
+            detail=str(error.detail),
+        )
         if target_session_id:
-            session_record = await repository.get_session(
-                session_id=target_session_id,
+            error_state = await _load_task_state_for_user(
                 user_id=raw_user_id,
+                timezone_name=timezone_name,
             )
-            if session_record:
-                await _broadcast_task_panel(
-                    raw_user_id,
-                    target_session_id,
-                    _build_task_panel_state(
-                        task_state=_coerce_task_state(session_record.state, timezone_name),
-                        timezone_name=timezone_name,
-                        run_status="error",
-                        action=action,
-                        payload=payload,
-                        error_message=str(error.detail),
-                    ),
-                )
+            await _broadcast_task_panel(
+                raw_user_id,
+                target_session_id,
+                _build_task_panel_state(
+                    task_state=error_state,
+                    timezone_name=timezone_name,
+                    run_status="error",
+                    action=action,
+                    payload=payload,
+                    error_message=str(error.detail),
+                ),
+            )
         return {"ok": False, "error": str(error.detail)}
     except Exception as error:
+        logger.exception(
+            "Task tool action failed",
+            extra={
+                "device_id": raw_user_id,
+                "session_id": target_session_id,
+                "timezone": timezone_name,
+                "action": action,
+                "error": str(error),
+            },
+        )
         if target_session_id:
-            session_record = await repository.get_session(
-                session_id=target_session_id,
+            error_state = await _load_task_state_for_user(
                 user_id=raw_user_id,
+                timezone_name=timezone_name,
             )
-            if session_record:
-                await _broadcast_task_panel(
-                    raw_user_id,
-                    target_session_id,
-                    _build_task_panel_state(
-                        task_state=_coerce_task_state(session_record.state, timezone_name),
-                        timezone_name=timezone_name,
-                        run_status="error",
-                        action=action,
-                        payload=payload,
-                        error_message=str(error),
-                    ),
-                )
+            await _broadcast_task_panel(
+                raw_user_id,
+                target_session_id,
+                _build_task_panel_state(
+                    task_state=error_state,
+                    timezone_name=timezone_name,
+                    run_status="error",
+                    action=action,
+                    payload=payload,
+                    error_message=str(error),
+                ),
+            )
         return {"ok": False, "error": str(error)}
 
 
@@ -968,13 +1485,55 @@ def _active_adk_model_name() -> str:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    startup_config = _runtime_config_snapshot()
+    _log_event(
+        logging.INFO,
+        "Application startup",
+        **startup_config,
+        repository_mode="supabase" if isinstance(repository, SupabaseRepository) else "in_memory",
+        adk_model=_active_adk_model_name(),
+    )
     try:
         yield
     finally:
+        _log_event(logging.INFO, "Application shutdown")
         await repository.close()
 
 
 app = FastAPI(title="Startup Agent API", version="0.3.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def log_http_requests(request: Request, call_next):
+    started_at = _utc_now()
+    try:
+        response = await call_next(request)
+    except Exception as error:
+        duration_ms = int((_utc_now() - started_at).total_seconds() * 1000)
+        logger.exception(
+            "HTTP request failed",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "query": str(request.url.query),
+                "duration_ms": duration_ms,
+                "error": str(error),
+            },
+        )
+        raise
+
+    duration_ms = int((_utc_now() - started_at).total_seconds() * 1000)
+    if request.url.path != "/health":
+        _log_event(
+            logging.INFO,
+            "HTTP request completed",
+            method=request.method,
+            path=request.url.path,
+            query=str(request.url.query),
+            status_code=response.status_code,
+            duration_ms=duration_ms,
+        )
+    return response
 
 
 def _entry_context_from_state(state: Dict[str, Any]) -> EntryContext:
@@ -1093,21 +1652,6 @@ async def _thread_summaries(user_id: str) -> List[Dict[str, Any]]:
     return output
 
 
-def _coerce_task_state(state: Dict[str, Any], timezone_name: str) -> TaskStateV1:
-    raw = state.get("task_state_v1")
-    if isinstance(raw, dict):
-        try:
-            parsed = TaskStateV1(**raw)
-            if not parsed.timezone:
-                parsed.timezone = timezone_name
-            if not parsed.date:
-                parsed.date = _local_date_key(timezone_name)
-            return parsed
-        except Exception:
-            pass
-    return TaskStateV1(date=_local_date_key(timezone_name), timezone=timezone_name, tasks=[])
-
-
 def _extract_titles(payload: Dict[str, Any]) -> List[str]:
     direct = payload.get("titles")
     if isinstance(direct, list):
@@ -1128,11 +1672,35 @@ def _extract_titles(payload: Dict[str, Any]) -> List[str]:
     return titles
 
 
-def _find_task(task_state: TaskStateV1, task_id: str) -> TaskItem | None:
-    for task in task_state.tasks:
-        if task.task_id == task_id:
-            return task
-    return None
+async def _load_task_state_for_user(
+    *,
+    user_id: str,
+    timezone_name: str,
+    date_key: str | None = None,
+) -> TaskStateV1:
+    if not TASK_MGMT_V1_ENABLED:
+        return _task_state_from_records([], timezone_name=timezone_name, date_key=date_key)
+    tasks = await repository.list_tasks(user_id=user_id)
+    return _task_state_from_records(tasks, timezone_name=timezone_name, date_key=date_key)
+
+
+async def _build_schedule_for_user(
+    *,
+    user_id: str,
+    timezone_name: str,
+    raw_date: str | None,
+) -> Dict[str, Any]:
+    target_date, start_at_utc, end_at_utc = _day_window_bounds(raw_date, timezone_name)
+    tasks = await repository.list_tasks_in_window(
+        user_id=user_id,
+        start_at_utc=start_at_utc,
+        end_at_utc=end_at_utc,
+    )
+    return _build_schedule_response(
+        task_state=_task_state_from_records(tasks, timezone_name=timezone_name, date_key=target_date),
+        timezone_name=timezone_name,
+        raw_date=target_date,
+    )
 
 
 def _build_schedule_response(
@@ -1313,7 +1881,7 @@ async def _schedule_task_event(
     timezone_name: str,
     date_key: str,
     trigger_type: TaskTriggerType,
-    task: TaskItem,
+    task: TaskRecord,
     run_at: datetime,
 ) -> Dict[str, Any]:
     event_id = str(uuid.uuid4())
@@ -1326,8 +1894,8 @@ async def _schedule_task_event(
         "trigger_type": trigger_type,
         "task_id": task.task_id,
         "task_title": task.title,
-        "timebox_start": task.timebox.start_at if task.timebox else None,
-        "timebox_end": task.timebox.end_at if task.timebox else None,
+        "timebox_start": task.timebox_start_at,
+        "timebox_end": task.timebox_end_at,
     }
 
     await repository.create_event(
@@ -1370,18 +1938,87 @@ def _event_identity_key(*, task_id: str, trigger_type: str, scheduled_time: str)
     return f"{task_id}:{trigger_type}:{scheduled_time}"
 
 
-async def _rebuild_task_events(
+async def _ensure_task_session(
+    *,
+    user_id: str,
+    session_id: str,
+    timezone_name: str,
+) -> SessionRecord:
+    existing = await repository.get_session(session_id=session_id, user_id=user_id)
+    if existing:
+        return existing
+    default_entry = EntryContext(source="manual", entry_mode="reactive")
+    return await _ensure_session(
+        user_id=user_id,
+        session_id=session_id,
+        timezone_name=timezone_name,
+        entry_context=default_entry,
+        state_patch={
+            "thread_type": "daily"
+            if session_id.endswith(_local_date_key(timezone_name))
+            else "manual",
+        },
+    )
+
+
+def _task_date_from_record(task: TaskRecord, timezone_name: str) -> str | None:
+    if not task.timebox_start_at:
+        return None
+    return _date_key_for_datetime(_parse_iso(task.timebox_start_at), timezone_name)
+
+
+async def _append_task_event(
+    *,
+    task_id: str,
+    user_id: str,
+    event_type: TaskEventType,
+    payload: Dict[str, Any],
+) -> None:
+    await repository.append_task_event(
+        TaskEventRecord(
+            id=str(uuid.uuid4()),
+            task_id=task_id,
+            user_id=user_id,
+            event_type=event_type,
+            payload=payload,
+            created_at=_iso_now(),
+        )
+    )
+
+
+async def _remove_task_events_for_task(
+    *,
+    user_id: str,
+    task_id: str,
+) -> None:
+    existing = await repository.list_future_task_events(
+        user_id=user_id,
+        date_key=None,
+        from_time_iso=_iso_now(),
+    )
+    for event in existing:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if str(payload.get("task_id") or "").strip() != task_id:
+            continue
+        if event.cron_job_id is not None:
+            await repository.unschedule_event_job(int(event.cron_job_id))
+        await repository.delete_event(event.id)
+
+
+async def _rebuild_task_events_for_date(
     *,
     user_id: str,
     timezone_name: str,
-    task_state: TaskStateV1,
+    date_key: str,
 ) -> List[Dict[str, Any]]:
-    lock = _get_task_rebuild_lock(user_id, task_state.date)
+    lock = _get_task_rebuild_lock(user_id, date_key)
     async with lock:
+        target_date, start_at_utc, end_at_utc = _day_window_bounds(date_key, timezone_name)
+        now_dt = _utc_now()
         now_iso = _iso_now()
         existing = await repository.list_future_task_events(
             user_id=user_id,
-            date_key=None,
+            date_key=target_date,
             from_time_iso=now_iso,
         )
 
@@ -1401,51 +2038,57 @@ async def _rebuild_task_events(
             )
             existing_by_key.setdefault(key, []).append(event)
 
-        timeboxed: List[TaskItem] = [task for task in task_state.tasks if task.timebox is not None]
-        timeboxed.sort(key=lambda task: task.timebox.start_at if task.timebox else "")
+        timeboxed = [
+            task
+            for task in await repository.list_tasks_in_window(
+                user_id=user_id,
+                start_at_utc=start_at_utc,
+                end_at_utc=end_at_utc,
+            )
+            if task.timebox_start_at and task.timebox_end_at and task.status != "done"
+        ]
+        timeboxed.sort(key=lambda task: task.timebox_start_at or "")
 
         desired_specs: List[Dict[str, Any]] = []
         for index, task in enumerate(timeboxed):
-            if not task.timebox:
-                continue
-
-            start_dt = _parse_iso(task.timebox.start_at)
-            end_dt = _parse_iso(task.timebox.end_at)
-            seed_date = _date_key_for_datetime(start_dt, timezone_name)
+            start_dt = _parse_iso(task.timebox_start_at or "")
+            end_dt = _parse_iso(task.timebox_end_at or "")
 
             before_at = start_dt - timedelta(minutes=5)
-            desired_specs.append(
-                {
-                    "task": task,
-                    "trigger_type": "before_task",
-                    "run_at": before_at,
-                    "seed_date": seed_date,
-                }
-            )
+            if before_at >= now_dt:
+                desired_specs.append(
+                    {
+                        "task": task,
+                        "trigger_type": "before_task",
+                        "run_at": before_at,
+                        "seed_date": target_date,
+                    }
+                )
 
             next_task = timeboxed[index + 1] if index + 1 < len(timeboxed) else None
             next_start: datetime | None = None
-            if next_task and next_task.timebox:
-                next_start = _parse_iso(next_task.timebox.start_at)
+            if next_task and next_task.timebox_start_at:
+                next_start = _parse_iso(next_task.timebox_start_at)
 
             end_trigger: TaskTriggerType = "after_task"
             if next_start is not None and next_start - end_dt <= timedelta(minutes=10):
                 end_trigger = "transition"
 
-            desired_specs.append(
-                {
-                    "task": task,
-                    "trigger_type": end_trigger,
-                    "run_at": end_dt,
-                    "seed_date": seed_date,
-                }
-            )
+            if end_dt >= now_dt:
+                desired_specs.append(
+                    {
+                        "task": task,
+                        "trigger_type": end_trigger,
+                        "run_at": end_dt,
+                        "seed_date": target_date,
+                    }
+                )
 
         scheduled: List[Dict[str, Any]] = []
         retained_event_ids: set[str] = set()
 
         for spec in desired_specs:
-            task: TaskItem = spec["task"]
+            task: TaskRecord = spec["task"]
             trigger_type: TaskTriggerType = spec["trigger_type"]
             run_at: datetime = spec["run_at"]
             scheduled_time = _iso_from_dt(run_at)
@@ -1499,7 +2142,6 @@ async def _run_task_management_action(
     *,
     action: TaskManagementAction,
     payload: Dict[str, Any],
-    task_state: TaskStateV1,
     timezone_name: str,
     user_id: str,
 ) -> Dict[str, Any]:
@@ -1508,30 +2150,26 @@ async def _run_task_management_action(
         if not titles:
             raise HTTPException(status_code=400, detail="capture_tasks requires at least one title")
 
-        created_ids: List[str] = []
-        for title in titles:
-            new_task = TaskItem(
-                task_id=str(uuid.uuid4()),
-                title=title,
-                priority_rank=None,
-                is_essential=False,
-                status="todo",
-                created_at=_iso_now(),
-                timebox=None,
+        created = await repository.create_tasks(user_id=user_id, titles=titles)
+        for task in created:
+            await _append_task_event(
+                task_id=task.task_id,
+                user_id=user_id,
+                event_type="created",
+                payload={"title": task.title},
             )
-            task_state.tasks.append(new_task)
-            created_ids.append(new_task.task_id)
-        task_state.updated_at = _iso_now()
+        all_tasks = await repository.list_tasks(user_id=user_id)
         return {
             "action": action,
-            "created_task_ids": created_ids,
-            "tasks": [task.model_dump() for task in task_state.tasks],
+            "created_task_ids": [task.task_id for task in created],
+            "tasks": [_task_item_from_record(task).model_dump() for task in all_tasks],
         }
 
     if action == "get_tasks":
+        tasks = await repository.list_tasks(user_id=user_id)
         return {
             "action": action,
-            "tasks": [task.model_dump() for task in task_state.tasks],
+            "tasks": [_task_item_from_record(task).model_dump() for task in tasks],
         }
 
     if action == "set_top_essentials":
@@ -1547,25 +2185,36 @@ async def _run_task_management_action(
             if task_id in seen:
                 raise HTTPException(status_code=400, detail="task_ids contains duplicates")
             seen.add(task_id)
-            if _find_task(task_state, task_id) is None:
+        existing_tasks = await repository.list_tasks(user_id=user_id)
+        existing_lookup = {task.task_id: task for task in existing_tasks}
+        for task_id in cleaned_ids:
+            if task_id not in existing_lookup:
                 raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
 
-        for task in task_state.tasks:
-            task.priority_rank = None
-            task.is_essential = False
-
-        for rank, task_id in enumerate(cleaned_ids, start=1):
-            task = _find_task(task_state, task_id)
-            if task:
-                task.priority_rank = rank
-                task.is_essential = True
-
-        task_state.updated_at = _iso_now()
+        updated_tasks = await repository.replace_top_essentials(user_id=user_id, task_ids=cleaned_ids)
+        for task in updated_tasks:
+            previous = existing_lookup.get(task.task_id)
+            before = (
+                previous.priority_rank if previous else None,
+                previous.is_essential if previous else False,
+            )
+            after = (task.priority_rank, task.is_essential)
+            if before == after:
+                continue
+            await _append_task_event(
+                task_id=task.task_id,
+                user_id=user_id,
+                event_type="top_essential_updated",
+                payload={
+                    "priority_rank": task.priority_rank,
+                    "is_essential": task.is_essential,
+                },
+            )
 
         return {
             "action": action,
             "top_essentials": cleaned_ids,
-            "tasks": [task.model_dump() for task in task_state.tasks],
+            "tasks": [_task_item_from_record(task).model_dump() for task in updated_tasks],
         }
 
     if action == "timebox_task":
@@ -1579,11 +2228,9 @@ async def _run_task_management_action(
                 detail="timebox_task requires task_id, start_at, end_at",
             )
 
-        task = _find_task(task_state, task_id)
-        if not task:
+        existing_task = await repository.get_task(task_id=task_id, user_id=user_id)
+        if not existing_task:
             raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
-        if task.timebox is not None:
-            raise HTTPException(status_code=409, detail="Timebox is immutable in v1")
 
         try:
             start_dt = _parse_iso(start_at)
@@ -1596,36 +2243,60 @@ async def _run_task_management_action(
 
         start_date_local = _date_key_for_datetime(start_dt, timezone_name)
         end_date_local = _date_key_for_datetime(end_dt, timezone_name)
-        target_date = task_state.date or _local_date_key(timezone_name)
-        if start_date_local != target_date or end_date_local != target_date:
+        if start_date_local != end_date_local:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    "Timebox must stay within the session day in your timezone "
-                    f"({target_date})."
-                ),
+                detail="Timebox must stay within one local calendar day in your timezone.",
             )
 
-        task.timebox = TaskTimebox(start_at=_iso_from_dt(start_dt), end_at=_iso_from_dt(end_dt))
-        task_state.updated_at = _iso_now()
-
-        scheduled_events = await _rebuild_task_events(
+        normalized_start = _iso_from_dt(start_dt)
+        normalized_end = _iso_from_dt(end_dt)
+        updated_task = await repository.set_task_timebox(
+            task_id=task_id,
             user_id=user_id,
-            timezone_name=timezone_name,
-            task_state=task_state,
+            start_at=normalized_start,
+            end_at=normalized_end,
         )
+        if not updated_task:
+            raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+
+        previous_date = _task_date_from_record(existing_task, timezone_name)
+        next_date = _task_date_from_record(updated_task, timezone_name)
+        await _append_task_event(
+            task_id=task_id,
+            user_id=user_id,
+            event_type="timebox_updated",
+            payload={
+                "previous_start_at": existing_task.timebox_start_at,
+                "previous_end_at": existing_task.timebox_end_at,
+                "start_at": normalized_start,
+                "end_at": normalized_end,
+            },
+        )
+
+        scheduled_events: List[Dict[str, Any]] = []
+        rebuild_dates = {date for date in [previous_date, next_date] if date}
+        for rebuild_date in sorted(rebuild_dates):
+            scheduled_events.extend(
+                await _rebuild_task_events_for_date(
+                    user_id=user_id,
+                    timezone_name=timezone_name,
+                    date_key=rebuild_date,
+                )
+            )
+        scheduled_events.sort(key=lambda row: row["scheduled_time"])
 
         return {
             "action": action,
-            "task": task.model_dump(),
+            "task": _task_item_from_record(updated_task).model_dump(),
             "scheduled_events": scheduled_events,
         }
 
     if action == "get_schedule":
         date_value = payload.get("date")
         date_text = str(date_value) if isinstance(date_value, str) else "today"
-        schedule = _build_schedule_response(
-            task_state=task_state,
+        schedule = await _build_schedule_for_user(
+            user_id=user_id,
             timezone_name=timezone_name,
             raw_date=date_text,
         )
@@ -1639,42 +2310,42 @@ async def _run_task_management_action(
         status = str(payload.get("status") or "").strip()
         if status not in {"todo", "in_progress", "done", "blocked"}:
             raise HTTPException(status_code=400, detail="Invalid status")
-        task = _find_task(task_state, task_id)
-        if not task:
+        existing_task = await repository.get_task(task_id=task_id, user_id=user_id)
+        if not existing_task:
             raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
-        task.status = status  # type: ignore[assignment]
-        task_state.updated_at = _iso_now()
+        updated_task = await repository.update_task_status(
+            task_id=task_id,
+            user_id=user_id,
+            status=status,  # type: ignore[arg-type]
+        )
+        if not updated_task:
+            raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+        await _append_task_event(
+            task_id=task_id,
+            user_id=user_id,
+            event_type="status_updated",
+            payload={"from_status": existing_task.status, "to_status": status},
+        )
+        task_date = _task_date_from_record(updated_task, timezone_name)
+        if status == "done":
+            await _remove_task_events_for_task(user_id=user_id, task_id=task_id)
+        elif (
+            existing_task.status == "done"
+            and task_date
+            and updated_task.timebox_end_at
+            and _parse_iso(updated_task.timebox_end_at) >= _utc_now()
+        ):
+            await _rebuild_task_events_for_date(
+                user_id=user_id,
+                timezone_name=timezone_name,
+                date_key=task_date,
+            )
         return {
             "action": action,
-            "task": task.model_dump(),
+            "task": _task_item_from_record(updated_task).model_dump(),
         }
 
     raise HTTPException(status_code=400, detail=f"Unsupported action: {action}")
-
-
-async def _get_task_state_for_session(
-    *,
-    user_id: str,
-    session_id: str,
-    timezone_name: str,
-) -> tuple[SessionRecord, TaskStateV1]:
-    session = await repository.get_session(session_id=session_id, user_id=user_id)
-    if not session:
-        default_entry = EntryContext(source="manual", entry_mode="reactive")
-        session = await _ensure_session(
-            user_id=user_id,
-            session_id=session_id,
-            timezone_name=timezone_name,
-            entry_context=default_entry,
-            state_patch={
-                "thread_type": "daily"
-                if session_id.endswith(_local_date_key(timezone_name))
-                else "manual",
-            },
-        )
-
-    task_state = _coerce_task_state(session.state, timezone_name)
-    return session, task_state
 
 
 async def _execute_task_management(
@@ -1699,37 +2370,21 @@ async def _execute_task_management(
     resolved_session_id = session_id or _daily_session_id(device_id, timezone_name)
 
     await repository.ensure_user(user_id=device_id, timezone_name=timezone_name)
-
-    session, task_state = await _get_task_state_for_session(
+    await _ensure_task_session(
         user_id=device_id,
         session_id=resolved_session_id,
         timezone_name=timezone_name,
     )
-
-    if action in {
-        "capture_tasks",
-        "set_top_essentials",
-        "timebox_task",
-        "update_task_status",
-    }:
-        task_state.date = session.date or _local_date_key(timezone_name)
-        task_state.timezone = timezone_name
 
     result = await _run_task_management_action(
         action=action,
         payload=payload,
-        task_state=task_state,
         timezone_name=timezone_name,
         user_id=device_id,
     )
-
-    entry_context = _entry_context_from_state(session.state)
-    await _ensure_session(
+    task_state = await _load_task_state_for_user(
         user_id=device_id,
-        session_id=resolved_session_id,
         timezone_name=timezone_name,
-        entry_context=entry_context,
-        state_patch={"task_state_v1": task_state.model_dump(), "task_state_version": "v1"},
     )
 
     task_panel_state = _build_task_panel_state(
@@ -1751,6 +2406,7 @@ async def _execute_task_management(
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
+    runtime_config = _runtime_config_snapshot()
     return {
         "status": "ok",
         "supabase_url": os.getenv("SUPABASE_URL", ""),
@@ -1760,6 +2416,9 @@ def health() -> Dict[str, Any]:
         "task_mgmt_v1_enabled": TASK_MGMT_V1_ENABLED,
         "task_tool_calling_v1_enabled": TASK_TOOL_CALLING_V1_ENABLED,
         "adk_model": _active_adk_model_name(),
+        "runtime_env": runtime_config["runtime_env"],
+        "cloud_run_service": runtime_config["cloud_run_service"],
+        "strict_startup_validation": runtime_config["strict_startup_validation"],
     }
 
 
@@ -1778,6 +2437,16 @@ async def run_agent(payload: AgentRunRequest) -> Dict[str, str]:
         )
     except Exception as error:
         model_name = _active_adk_model_name()
+        logger.exception(
+            "HTTP ADK run failed",
+            extra={
+                "user_id": user_id,
+                "session_id": session_id,
+                "timezone": timezone_name,
+                "model": model_name,
+                "error": str(error),
+            },
+        )
         raise HTTPException(
             status_code=503,
             detail=f"Google ADK unavailable (model={model_name}): {error}",
@@ -1821,6 +2490,15 @@ async def bootstrap_device(payload: DeviceBootstrapRequest) -> Dict[str, Any]:
 
     messages = await repository.list_messages(session_id=session_id)
     threads = await _thread_summaries(user_id=device_id)
+    _log_event(
+        logging.INFO,
+        "Device bootstrap completed",
+        device_id=device_id,
+        session_id=session_id,
+        timezone=timezone_name,
+        needs_onboarding=needs_onboarding,
+        thread_type=thread_type,
+    )
     return {
         "device_id": device_id,
         "user_id": device_id,
@@ -1849,6 +2527,12 @@ async def register_push_token(payload: PushTokenRequest) -> Dict[str, Any]:
     )
     await repository.ensure_user(user_id=device_id, timezone_name=timezone_name)
     await repository.upsert_push_token(user_id=device_id, expo_push_token=token)
+    _log_event(
+        logging.INFO,
+        "Push token registered",
+        device_id=device_id,
+        timezone=timezone_name,
+    )
     return {"status": "ok", "device_id": device_id, "timezone": timezone_name}
 
 
@@ -1903,6 +2587,13 @@ async def complete_onboarding(payload: OnboardingCompleteRequest) -> Dict[str, A
             "lifecycle_state": "active",
         },
     )
+    _log_event(
+        logging.INFO,
+        "Onboarding completed",
+        device_id=device_id,
+        session_id=daily_session_id,
+        timezone=timezone_name,
+    )
 
     return {
         "status": "ok",
@@ -1935,10 +2626,38 @@ async def task_management(payload: TaskManagementRequest) -> Dict[str, Any]:
             session_id=payload.session_id,
         )
         await _broadcast_task_panel(device_id, output["session_id"], output["task_panel_state"])
+        _log_event(
+            logging.INFO,
+            "Task management action completed",
+            device_id=device_id,
+            session_id=output["session_id"],
+            timezone=timezone_name,
+            action=payload.action,
+        )
         return output
-    except HTTPException:
+    except HTTPException as error:
+        _log_event(
+            logging.WARNING,
+            "Task management action rejected",
+            device_id=device_id,
+            session_id=payload.session_id,
+            timezone=timezone_name,
+            action=payload.action,
+            status_code=error.status_code,
+            detail=str(error.detail),
+        )
         raise
     except Exception as error:
+        logger.exception(
+            "Task management action failed",
+            extra={
+                "device_id": device_id,
+                "session_id": payload.session_id,
+                "timezone": timezone_name,
+                "action": payload.action,
+                "error": str(error),
+            },
+        )
         raise HTTPException(status_code=500, detail=f"Task management failed: {error}") from error
 
 
@@ -2042,11 +2761,12 @@ async def agent_ws(
     initialized = False
     latest_entry_context = EntryContext(entry_mode="proactive" if entry_mode == "proactive" else "reactive")
 
-    logger.info(
-        "WebSocket connected device_id=%s session_id=%s timezone=%s",
-        active_user_id,
-        active_session_id,
-        timezone_name,
+    _log_event(
+        logging.INFO,
+        "WebSocket connected",
+        device_id=active_user_id,
+        session_id=active_session_id,
+        timezone=timezone_name,
     )
 
     def _startup_prompt(entry_context: EntryContext) -> str:
@@ -2080,8 +2800,6 @@ async def agent_ws(
             user_profile = await repository.get_user_profile(user_id=active_user_id)
             profile_context = _build_profile_context(user_profile)
             session_state["profile_context"] = profile_context
-        task_state = _coerce_task_state(session_state, timezone_name)
-
         context_map = {
             "session_id": active_session_id,
             "user_id": active_user_id,
@@ -2092,20 +2810,35 @@ async def agent_ws(
             "profile_context": json.dumps(profile_context, separators=(",", ":")),
         }
 
-        should_run_due_diligence = (
-            latest_entry_context.entry_mode == "proactive"
-            and (latest_entry_context.trigger_type or "") != "post_onboarding"
-            and TASK_MGMT_V1_ENABLED
-        )
-        if should_run_due_diligence:
+        if TASK_MGMT_V1_ENABLED:
+            open_tasks = [
+                task
+                for task in await repository.list_tasks(user_id=active_user_id)
+                if _task_is_open(task)
+            ]
             due_time = _get_current_time_context(timezone_name)
-            due_schedule = _build_schedule_response(
-                task_state=task_state,
+            due_schedule = await _build_schedule_for_user(
+                user_id=active_user_id,
                 timezone_name=timezone_name,
                 raw_date="today",
             )
             context_map["due_diligence_time"] = json.dumps(due_time, separators=(",", ":"))
             context_map["due_diligence_schedule"] = json.dumps(due_schedule, separators=(",", ":"))
+            context_map["due_diligence_tasks"] = json.dumps(
+                [
+                    {
+                        "id": task.task_id,
+                        "title": task.title,
+                        "status": task.status,
+                        "is_essential": task.is_essential,
+                        "priority_rank": task.priority_rank,
+                        "timebox_start_at": task.timebox_start_at,
+                        "timebox_end_at": task.timebox_end_at,
+                    }
+                    for task in open_tasks
+                ],
+                separators=(",", ":"),
+            )
         return context_map
 
     async def _run_assistant_turn(
@@ -2140,6 +2873,16 @@ async def agent_ws(
             return False
         except Exception as error:
             model_name = _active_adk_model_name()
+            logger.exception(
+                "WebSocket ADK stream failed",
+                extra={
+                    "device_id": active_user_id,
+                    "session_id": active_session_id,
+                    "timezone": timezone_name,
+                    "model": model_name,
+                    "error": str(error),
+                },
+            )
             await _safe_send_json(
                 {
                     "type": "error",
@@ -2215,10 +2958,11 @@ async def agent_ws(
                     latest_entry_context = latest_entry_context.model_copy(
                         update={"entry_mode": "reactive", "trigger_type": None}
                     )
-                    logger.info(
-                        "Ignoring repeated post_onboarding for device_id=%s session_id=%s",
-                        active_user_id,
-                        active_session_id,
+                    _log_event(
+                        logging.INFO,
+                        "Ignoring repeated post_onboarding",
+                        device_id=active_user_id,
+                        session_id=active_session_id,
                     )
 
                 await repository.ensure_user(user_id=active_user_id, timezone_name=timezone_name)
@@ -2239,13 +2983,9 @@ async def agent_ws(
                         break
                     continue
                 history = await repository.list_messages(session_id=active_session_id)
-                session_record = await repository.get_session(
-                    session_id=active_session_id,
+                current_task_state = await _load_task_state_for_user(
                     user_id=active_user_id,
-                )
-                current_task_state = _coerce_task_state(
-                    dict(session_record.state) if session_record else {},
-                    timezone_name,
+                    timezone_name=timezone_name,
                 )
                 if unsubscribe_task_panel:
                     unsubscribe_task_panel()
@@ -2344,17 +3084,20 @@ async def agent_ws(
                 continue
 
     except WebSocketDisconnect:
-        logger.info(
-            "WebSocket disconnected device_id=%s session_id=%s",
-            active_user_id,
-            active_session_id,
+        _log_event(
+            logging.INFO,
+            "WebSocket disconnected",
+            device_id=active_user_id,
+            session_id=active_session_id,
         )
     except Exception as error:
         logger.exception(
-            "WebSocket failure device_id=%s session_id=%s error=%s",
-            active_user_id,
-            active_session_id,
-            error,
+            "WebSocket failure",
+            extra={
+                "device_id": active_user_id,
+                "session_id": active_session_id,
+                "error": str(error),
+            },
         )
         try:
             await _safe_send_json({"type": "error", "code": "server_error", "detail": str(error)})
