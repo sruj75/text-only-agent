@@ -3,28 +3,30 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def test_execute_event_uses_retry_path_for_push_failures():
+def test_execute_event_does_not_schedule_retry_attempts():
     source = Path("supabase/functions/execute-event/index.ts").read_text(encoding="utf-8")
 
-    assert "MAX_DELIVERY_ATTEMPTS = 4" in source
-    assert 'supabase.rpc("schedule_event_retry"' in source
-    assert 'status: "retry_scheduled"' in source
+    assert 'supabase.rpc("schedule_event_retry"' not in source
+    assert 'status: "retry_scheduled"' not in source
+    assert "MAX_DELIVERY_ATTEMPTS" not in source
 
 
-def test_execute_event_marks_terminal_failure_after_max_attempts():
+def test_execute_event_records_failure_metadata_in_single_attempt_flow():
     source = Path("supabase/functions/execute-event/index.ts").read_text(encoding="utf-8")
 
-    assert '"delivery_failed_terminal"' in source
+    assert '"push_failed_or_missing_token"' in source
+    assert '"session_persist_failed"' in source
+    assert "p_last_error: lastError" in source
     assert "p_attempt_count: nextAttemptCount" in source
 
 
-def test_execute_event_creates_dedicated_proactive_thread_per_invite():
+def test_execute_event_routes_to_daily_thread():
     source = Path("supabase/functions/execute-event/index.ts").read_text(encoding="utf-8")
 
-    assert "function getProactiveSessionId" in source
-    assert 'session_${userId}_proactive_${eventId}' in source
+    assert "function getDailySessionId" in source
+    assert "session_${userId}_${dateKey}" in source
     assert '.from("sessions")' in source
-    assert 'thread_type: "proactive"' in source
+    assert 'thread_type: "daily"' in source
     assert "title," in source
 
 
@@ -36,8 +38,8 @@ def test_execute_event_merges_existing_proactive_session_state():
     assert "existingSessionResult.data?.date ?? dateKey" in source
 
 
-def test_execute_event_retries_session_persist_failures():
+def test_execute_event_finalizes_execution_without_retry_branch():
     source = Path("supabase/functions/execute-event/index.ts").read_text(encoding="utf-8")
 
-    assert 'lastError === "session_persist_failed"' in source
-    assert "p_last_error: lastError" in source
+    assert "const finalize = await supabase.rpc(\"finalize_event_execution\"" in source
+    assert "await unscheduleIfPresent(supabase, event.cron_job_id ?? null);" in source

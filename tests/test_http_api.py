@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -290,6 +291,7 @@ def test_agent_run_returns_503_when_adk_fails(app_client):
 
 def test_complete_onboarding_updates_user_and_bootstrap_context(app_client):
     client = app_client["client"]
+    repository = app_client["repository"]
 
     bootstrap_before = client.post(
         "/agent/bootstrap-device",
@@ -315,6 +317,11 @@ def test_complete_onboarding_updates_user_and_bootstrap_context(app_client):
     assert payload["profile_context"]["wake_time"] == "07:30"
     assert payload["profile_context"]["bedtime"] == "23:15"
     assert payload["profile_context"]["playbook"]["notes"].startswith("Ask me")
+    morning_events = [
+        event for event in repository.events.values() if event.user_id == "device-onboard" and event.event_type == "morning_wake"
+    ]
+    assert len(morning_events) == 1
+    assert morning_events[0].cron_job_id is not None
 
     bootstrap_after = client.post(
         "/agent/bootstrap-device",
@@ -328,6 +335,115 @@ def test_complete_onboarding_updates_user_and_bootstrap_context(app_client):
         "Breakfast",
         "Medication",
     ]
+
+
+def test_bootstrap_backfills_missing_morning_seed_for_completed_user(app_client):
+    client = app_client["client"]
+    repository = app_client["repository"]
+
+    completed = client.post(
+        "/agent/onboarding/complete",
+        json={
+            "device_id": "device-bootstrap-seed",
+            "timezone": "UTC",
+            "wake_time": "07:30",
+            "bedtime": "23:15",
+            "playbook": "One tiny step first.",
+            "health_anchors": ["Breakfast"],
+        },
+    )
+    assert completed.status_code == 200
+    repository.events.clear()
+
+    bootstrap_after = client.post(
+        "/agent/bootstrap-device",
+        json={"device_id": "device-bootstrap-seed", "timezone": "UTC"},
+    )
+    assert bootstrap_after.status_code == 200
+    seeded_events = [
+        event
+        for event in repository.events.values()
+        if event.user_id == "device-bootstrap-seed" and event.event_type == "morning_wake"
+    ]
+    assert len(seeded_events) == 1
+    assert seeded_events[0].cron_job_id is not None
+
+
+def test_complete_onboarding_succeeds_when_morning_seed_fails(app_client, monkeypatch):
+    client = app_client["client"]
+
+    async def _raise_seed_error(*, user_id: str, timezone_name: str, wake_time: str):
+        _ = user_id
+        _ = timezone_name
+        _ = wake_time
+        raise RuntimeError("seed failed")
+
+    monkeypatch.setattr(main, "_seed_next_morning_wake_event", _raise_seed_error)
+
+    completed = client.post(
+        "/agent/onboarding/complete",
+        json={
+            "device_id": "device-onboard-seed-fail",
+            "timezone": "UTC",
+            "wake_time": "07:30",
+            "bedtime": "23:15",
+            "playbook": "One tiny step first.",
+            "health_anchors": ["Breakfast"],
+        },
+    )
+    assert completed.status_code == 200
+    payload = completed.json()
+    assert payload["needs_onboarding"] is False
+    assert payload["profile_context"]["wake_time"] == "07:30"
+
+
+def test_seed_next_morning_wake_event_handles_insert_conflict_without_duplicates(
+    app_client, monkeypatch
+):
+    repository = app_client["repository"]
+    seed_time = main._next_wake_run_at_utc(timezone_name="UTC", wake_time_hhmm="07:30")
+    seed_date = main._date_key_for_datetime(seed_time, "UTC")
+    existing_event = main.CheckinEventRecord(
+        id="existing-morning-event",
+        user_id="device-seed-conflict",
+        scheduled_time=main._iso_from_dt(seed_time),
+        event_type="morning_wake",
+        payload={"seed_date": seed_date, "reason": "daily_bootstrap"},
+        executed=False,
+        cron_job_id=999,
+        attempt_count=0,
+        created_at=main._iso_now(),
+        updated_at=main._iso_now(),
+    )
+
+    list_calls = {"count": 0}
+
+    async def _list_future_events(**kwargs):
+        _ = kwargs
+        list_calls["count"] += 1
+        if list_calls["count"] == 1:
+            return []
+        return [existing_event]
+
+    async def _raise_conflict(payload):
+        _ = payload
+        raise RuntimeError("Supabase error 409: duplicate key value violates unique constraint")
+
+    monkeypatch.setattr(repository, "list_future_events", _list_future_events)
+    monkeypatch.setattr(repository, "create_event", _raise_conflict)
+
+    result = asyncio.run(
+        main._seed_next_morning_wake_event(
+            user_id="device-seed-conflict",
+            timezone_name="UTC",
+            wake_time="07:30",
+        )
+    )
+
+    assert result["seeded"] is False
+    assert result["reason"] == "existing_pending_morning_wake"
+    assert result["event_id"] == existing_event.id
+    assert result["cron_job_id"] == 999
 
 
 def test_complete_onboarding_backfills_health_anchors_when_missing(app_client):

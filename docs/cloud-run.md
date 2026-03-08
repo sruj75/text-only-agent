@@ -38,8 +38,8 @@ If a secret already exists, add a new version instead:
 ## Manual first deploy
 1. Build the image:
    - `gcloud builds submit --tag us-west1-docker.pkg.dev/YOUR_PROJECT_ID/cloud-run-images/startup-agent:manual-001`
-2. Apply the latest task persistence migration before the first deploy:
-   - `psql "$YOUR_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/20260307133000_task_persistence_source_of_truth.sql`
+2. Apply all migrations in order before the first deploy:
+   - `for file in migrations/*.sql; do psql "$YOUR_DATABASE_URL" -v ON_ERROR_STOP=1 -f "$file"; done`
 3. Deploy manually:
    - `gcloud run deploy startup-agent --image us-west1-docker.pkg.dev/YOUR_PROJECT_ID/cloud-run-images/startup-agent:manual-001 --region us-west1 --platform managed --allow-unauthenticated --service-account startup-agent-run@YOUR_PROJECT_ID.iam.gserviceaccount.com --cpu 1 --memory 1Gi --concurrency 10 --timeout 900 --min-instances 0 --max-instances 1 --set-env-vars APP_ENV=production,TASK_MGMT_V1=true,TASK_TOOL_CALLING_V1=true,STRICT_STARTUP_VALIDATION=true,LOG_LEVEL=INFO --set-secrets GOOGLE_API_KEY=GOOGLE_API_KEY:latest,SUPABASE_URL=SUPABASE_URL:latest,SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SERVICE_ROLE_KEY:latest`
 4. Capture the service URL:

@@ -33,7 +33,11 @@ steps:
       - SUPABASE_DB_URL
     args:
       - -c
-      - psql "$$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f migrations/20260307133000_task_persistence_source_of_truth.sql
+      - |
+        set -eu
+        for file in migrations/*.sql; do
+          psql "$$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f "$$file"
+        done
 
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud

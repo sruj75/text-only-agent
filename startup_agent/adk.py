@@ -21,10 +21,12 @@ Non-negotiables:
 - Ground yourself with real context before advising.
 - Never schedule reminders manually.
 - Do not mention background modes.
+- For task intents (capture, prioritize, timebox, status), call task_management before claiming success.
 
 Session context:
 - The runtime injects profile_context and entry_context.
 - The runtime may also inject due diligence task/schedule context from persisted data.
+- The runtime may inject missed_proactive_count and missed_proactive_events (today-only missed invites).
 - entry_mode can be proactive or reactive.
 - trigger_type may be post_onboarding for onboarding handoff.
 
@@ -36,6 +38,10 @@ How to start each conversation:
 2) Then choose opening behavior:
    - proactive: address the specific transition intention immediately.
    - reactive: ask what the user needs right now, then guide.
+3) Missed invite check (once-only):
+   - If missed_proactive_count > 0, add one gentle sentence acknowledging missed invites.
+   - Ask whether to quickly address that miss or continue the current need.
+   - If the user declines or ignores it, continue the current need immediately.
 
 Day-planning workflow (ADHD scaffold):
 1) Brain dump today's commitments quickly.
@@ -71,6 +77,7 @@ class SimpleADK:
         self._get_current_time_tool = get_current_time_tool
         self._task_management_tool = task_management_tool
         self._runtime_context: Dict[Tuple[str, str], Dict[str, str]] = {}
+        self._task_write_counts: Dict[Tuple[str, str], int] = {}
 
         tools = []
         use_tools = enable_task_tools if enable_task_tools is not None else False
@@ -135,6 +142,9 @@ class SimpleADK:
     ) -> Dict[str, Any]:
         if not self._task_management_tool:
             return {"ok": False, "error": "task_management tool is unavailable"}
+        context_key: Tuple[str, str] | None = None
+        if tool_context:
+            context_key = (tool_context.user_id, tool_context.session.id)
         runtime_context = self._tool_runtime_context(tool_context)
         normalized_payload: Dict[str, Any] = {}
         if isinstance(payload_json, str) and payload_json.strip():
@@ -155,13 +165,20 @@ class SimpleADK:
                     payload_json,
                 )
                 normalized_payload = {}
-        return await self._task_management_tool(
+        output = await self._task_management_tool(
             action,
             normalized_payload,
             session_id,
             timezone,
             runtime_context,
         )
+        if (
+            context_key
+            and output.get("ok") is True
+            and action in {"capture_tasks", "set_top_essentials", "timebox_task", "update_task_status"}
+        ):
+            self._task_write_counts[context_key] = self._task_write_counts.get(context_key, 0) + 1
+        return output
 
     async def run_stream(
         self,
@@ -184,6 +201,8 @@ class SimpleADK:
         last_seen = ""
         context_key = (user_id, session_id)
         self._runtime_context[context_key] = dict(context or {})
+        self._task_write_counts[context_key] = 0
+        stream_completed = False
 
         async with aclosing(
             self.runner.run_async(
@@ -211,6 +230,7 @@ class SimpleADK:
 
                     if delta:
                         yield delta
+                stream_completed = True
             except Exception as error:
                 message = str(error)
                 if "no longer available to new users" in message:
@@ -220,6 +240,11 @@ class SimpleADK:
                 raise RuntimeError(message) from error
             finally:
                 self._runtime_context.pop(context_key, None)
+                if not stream_completed:
+                    self._task_write_counts.pop(context_key, None)
+
+    def consume_task_write_count(self, *, user_id: str, session_id: str) -> int:
+        return int(self._task_write_counts.pop((user_id, session_id), 0))
 
     async def run(
         self,

@@ -81,3 +81,45 @@ def test_adk_task_management_parses_json_payload():
 
     assert result["ok"] is True
     assert result["payload"] == {"titles": ["Write PRD"]}
+
+
+def test_adk_cleans_task_write_counter_when_stream_is_interrupted(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+    adk = SimpleADK()
+
+    class _Part:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    class _Content:
+        def __init__(self, text: str) -> None:
+            self.parts = [_Part(text)]
+
+    class _Event:
+        def __init__(self, text: str) -> None:
+            self.author = "model"
+            self.content = _Content(text)
+
+    class _Runner:
+        async def run_async(self, **kwargs):
+            _ = kwargs
+            yield _Event("hello")
+            yield _Event("hello world")
+
+    adk.runner = _Runner()
+
+    async def _consume_and_interrupt():
+        stream = adk.run_stream(
+            prompt="hello",
+            user_id="u-cleanup",
+            session_id="s-cleanup",
+            context={"timezone": "UTC"},
+        )
+        first_chunk = await anext(stream)
+        assert first_chunk
+        await stream.aclose()
+
+    asyncio.run(_consume_and_interrupt())
+
+    assert ("u-cleanup", "s-cleanup") not in adk._task_write_counts
+    assert adk.consume_task_write_count(user_id="u-cleanup", session_id="s-cleanup") == 0

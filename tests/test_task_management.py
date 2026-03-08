@@ -287,6 +287,24 @@ def test_task_panel_uses_requested_day_for_schedule_snapshot():
     assert [item["task_id"] for item in snapshot["schedule"]] == ["task-1"]
 
 
+def test_idle_task_panel_state_omits_placeholder_headline():
+    task_state = main.TaskStateV1(
+        user_id="device-headline",
+        date="today",
+        timezone="UTC",
+        updated_at="2026-03-07T12:00:00Z",
+        tasks=[],
+    )
+
+    snapshot = main._build_task_panel_state(
+        task_state=task_state,
+        timezone_name="UTC",
+    )
+
+    assert snapshot["headline"] is None
+    assert snapshot["active_action"] is None
+
+
 def test_done_task_unschedules_and_reopen_rebuilds_future_events(app_client):
     client = app_client["client"]
     repository = app_client["repository"]

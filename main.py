@@ -168,6 +168,18 @@ TaskEventType = Literal[
     "migrated_from_session_state",
 ]
 TaskPanelListener = Callable[[Dict[str, Any]], Awaitable[bool]]
+TASK_INTENT_PATTERN = re.compile(
+    r"\b(task|tasks|todo|to-do|priority|priorities|timebox|schedule|plan day|mark done|blocked)\b",
+    re.IGNORECASE,
+)
+TASK_CLAIM_PATTERN = re.compile(
+    r"\b(added|captured|saved|scheduled|timeboxed|prioritized|marked)\b",
+    re.IGNORECASE,
+)
+PROACTIVE_ACK_STATE_KEY = "proactive_ack_event_ids_v1"
+MISSED_REPORTED_STATE_KEY = "missed_reported_event_ids_v1"
+MISSED_PROACTIVE_EVENT_TYPES = {"morning_wake", "checkin", "calendar_reminder"}
+MISSED_PROACTIVE_MAX_EVENTS = 5
 
 
 def _utc_now() -> datetime:
@@ -235,9 +247,9 @@ def _session_thread_type(
     configured = existing.get("thread_type")
     if isinstance(configured, str) and configured.strip():
         return configured.strip()
-    if entry_context.entry_mode == "proactive":
-        return "proactive"
     if session_id == _daily_session_id(user_id, timezone_name):
+        return "daily"
+    if entry_context.entry_mode == "proactive":
         return "daily"
     return "manual"
 
@@ -270,6 +282,29 @@ def _normalize_text_list(value: Any) -> List[str]:
         if text:
             output.append(text)
     return output
+
+
+def _normalize_event_id_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    output: List[str] = []
+    seen: set[str] = set()
+    for item in value:
+        event_id = str(item or "").strip()
+        if not event_id or event_id in seen:
+            continue
+        seen.add(event_id)
+        output.append(event_id)
+    return output
+
+
+def _append_event_id(existing: List[str], event_id: str) -> List[str]:
+    value = event_id.strip()
+    if not value:
+        return existing
+    if value in existing:
+        return existing
+    return [*existing, value]
 
 
 def _default_health_anchors(wake_time: str, bedtime: str) -> List[str]:
@@ -723,6 +758,53 @@ class InMemoryRepository:
         rows.sort(key=lambda row: row.scheduled_time)
         return rows
 
+    async def list_future_events(
+        self,
+        *,
+        user_id: str,
+        from_time_iso: str,
+        event_type: str | None = None,
+    ) -> List[CheckinEventRecord]:
+        from_time = _parse_iso(from_time_iso)
+        rows: List[CheckinEventRecord] = []
+        for row in self.events.values():
+            if row.user_id != user_id or row.executed:
+                continue
+            if event_type and row.event_type != event_type:
+                continue
+            if _parse_iso(row.scheduled_time) < from_time:
+                continue
+            rows.append(row)
+        rows.sort(key=lambda row: row.scheduled_time)
+        return rows
+
+    async def list_events_in_window(
+        self,
+        *,
+        user_id: str,
+        start_time_iso: str,
+        end_time_iso: str,
+        executed: bool | None = None,
+        event_types: List[str] | None = None,
+    ) -> List[CheckinEventRecord]:
+        start_time = _parse_iso(start_time_iso)
+        end_time = _parse_iso(end_time_iso)
+        allowed_types = set(event_types or [])
+        rows: List[CheckinEventRecord] = []
+        for row in self.events.values():
+            if row.user_id != user_id:
+                continue
+            row_time = _parse_iso(row.scheduled_time)
+            if row_time < start_time or row_time >= end_time:
+                continue
+            if executed is not None and bool(row.executed) is not executed:
+                continue
+            if allowed_types and row.event_type not in allowed_types:
+                continue
+            rows.append(row)
+        rows.sort(key=lambda row: row.scheduled_time)
+        return rows
+
     async def create_event(self, payload: CheckinEventRecord) -> CheckinEventRecord:
         self.events[payload.id] = payload
         return payload
@@ -1164,6 +1246,58 @@ class SupabaseRepository:
         )
         return [CheckinEventRecord(**row) for row in rows or []]
 
+    async def list_future_events(
+        self,
+        *,
+        user_id: str,
+        from_time_iso: str,
+        event_type: str | None = None,
+    ) -> List[CheckinEventRecord]:
+        params: Dict[str, str] = {
+            "user_id": f"eq.{user_id}",
+            "executed": "eq.false",
+            "scheduled_time": f"gte.{from_time_iso}",
+            "select": "id,user_id,scheduled_time,event_type,payload,executed,cron_job_id,last_error,attempt_count,created_at,updated_at",
+            "order": "scheduled_time.asc",
+            "limit": "500",
+        }
+        if event_type:
+            params["event_type"] = f"eq.{event_type}"
+        rows = await self._request(
+            "GET",
+            "events",
+            params=params,
+        )
+        return [CheckinEventRecord(**row) for row in rows or []]
+
+    async def list_events_in_window(
+        self,
+        *,
+        user_id: str,
+        start_time_iso: str,
+        end_time_iso: str,
+        executed: bool | None = None,
+        event_types: List[str] | None = None,
+    ) -> List[CheckinEventRecord]:
+        params: Dict[str, str] = {
+            "user_id": f"eq.{user_id}",
+            "scheduled_time": f"gte.{start_time_iso}",
+            "and": f"(scheduled_time.lt.{end_time_iso})",
+            "select": "id,user_id,scheduled_time,event_type,payload,executed,cron_job_id,last_error,attempt_count,created_at,updated_at",
+            "order": "scheduled_time.asc",
+            "limit": "500",
+        }
+        if executed is not None:
+            params["executed"] = f"eq.{str(executed).lower()}"
+        if event_types:
+            params["event_type"] = f"in.({','.join(event_types)})"
+        rows = await self._request(
+            "GET",
+            "events",
+            params=params,
+        )
+        return [CheckinEventRecord(**row) for row in rows or []]
+
     async def create_event(self, payload: CheckinEventRecord) -> CheckinEventRecord:
         rows = await self._request(
             "POST",
@@ -1483,9 +1617,34 @@ def _active_adk_model_name() -> str:
     return "unknown"
 
 
+async def _validate_scheduler_runtime_dependencies() -> None:
+    if not isinstance(repository, SupabaseRepository):
+        return
+
+    scheduler_secret_output = await repository._rpc("get_scheduler_secret_for_execution", {})
+    scheduler_secret = scheduler_secret_output if isinstance(scheduler_secret_output, str) else ""
+    if not scheduler_secret.strip():
+        raise RuntimeError("scheduler_secret is missing from Supabase vault")
+
+    # This RPC exists only in the scheduler source-of-truth migration.
+    await repository._rpc("ensure_next_morning_wake_event", {"p_event_id": "__healthcheck__"})
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     startup_config = _runtime_config_snapshot()
+    strict_validation = bool(startup_config["strict_startup_validation"])
+    if strict_validation:
+        await _validate_scheduler_runtime_dependencies()
+    elif isinstance(repository, SupabaseRepository):
+        try:
+            await _validate_scheduler_runtime_dependencies()
+        except Exception as error:
+            _log_event(
+                logging.WARNING,
+                "Scheduler runtime validation skipped in non-strict mode",
+                error=str(error),
+            )
     _log_event(
         logging.INFO,
         "Application startup",
@@ -1587,6 +1746,183 @@ async def _resolve_timezone_for_user(
     raise HTTPException(
         status_code=400,
         detail="A valid IANA timezone is required (example: Asia/Kolkata).",
+    )
+
+
+def _next_wake_run_at_utc(*, timezone_name: str, wake_time_hhmm: str) -> datetime:
+    if not _is_valid_hhmm(wake_time_hhmm):
+        raise HTTPException(status_code=400, detail="wake_time must be HH:MM (24h)")
+    wake_hour, wake_minute = [int(part) for part in wake_time_hhmm.split(":")]
+    now_local = datetime.now(ZoneInfo(timezone_name))
+    target_local = now_local.replace(
+        hour=wake_hour,
+        minute=wake_minute,
+        second=0,
+        microsecond=0,
+    )
+    if target_local <= now_local:
+        target_local = target_local + timedelta(days=1)
+    return target_local.astimezone(timezone.utc)
+
+
+async def _seed_next_morning_wake_event(
+    *,
+    user_id: str,
+    timezone_name: str,
+    wake_time: str,
+) -> Dict[str, Any]:
+    existing = await repository.list_future_events(
+        user_id=user_id,
+        from_time_iso=_iso_now(),
+        event_type="morning_wake",
+    )
+    if existing:
+        earliest = existing[0]
+        return {
+            "seeded": False,
+            "reason": "existing_pending_morning_wake",
+            "event_id": earliest.id,
+            "cron_job_id": earliest.cron_job_id,
+            "scheduled_time": earliest.scheduled_time,
+        }
+
+    run_at = _next_wake_run_at_utc(timezone_name=timezone_name, wake_time_hhmm=wake_time)
+    seed_date = _date_key_for_datetime(run_at, timezone_name)
+    event_payload = {
+        "schedule_owner": "system",
+        "schedule_policy": "morning_bootstrap",
+        "seed_date": seed_date,
+        "timezone": timezone_name,
+        "reason": "daily_bootstrap",
+        "trigger_type": "morning_wake",
+    }
+    event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"morning_wake:{user_id}:{seed_date}"))
+    try:
+        created_event = await repository.create_event(
+            CheckinEventRecord(
+                id=event_id,
+                user_id=user_id,
+                scheduled_time=_iso_from_dt(run_at),
+                event_type="morning_wake",
+                payload=event_payload,
+                executed=False,
+                cron_job_id=None,
+                attempt_count=0,
+                created_at=_iso_now(),
+                updated_at=_iso_now(),
+            )
+        )
+    except RuntimeError as error:
+        # Supabase conflict means another concurrent request seeded this day already.
+        if "Supabase error 409" not in str(error):
+            raise
+        existing = await repository.list_future_events(
+            user_id=user_id,
+            from_time_iso=_iso_now(),
+            event_type="morning_wake",
+        )
+        matching = next(
+            (
+                event
+                for event in existing
+                if isinstance(event.payload, dict)
+                and str(event.payload.get("seed_date") or "").strip() == seed_date
+            ),
+            existing[0] if existing else None,
+        )
+        if not matching:
+            raise
+        return {
+            "seeded": False,
+            "reason": "existing_pending_morning_wake",
+            "event_id": matching.id,
+            "cron_job_id": matching.cron_job_id,
+            "scheduled_time": matching.scheduled_time,
+        }
+    try:
+        job_id = await repository.schedule_event_job(
+            event_id=created_event.id,
+            run_at=created_event.scheduled_time,
+            timezone_name=timezone_name,
+        )
+        await repository.update_event_cron_job(created_event.id, int(job_id))
+    except Exception:
+        await repository.delete_event(created_event.id)
+        raise
+
+    return {
+        "seeded": True,
+        "event_id": created_event.id,
+        "cron_job_id": int(job_id),
+        "scheduled_time": created_event.scheduled_time,
+    }
+
+
+async def _list_missed_proactive_events_for_today(
+    *,
+    user_id: str,
+    timezone_name: str,
+    current_event_id: str | None,
+    acknowledged_ids: List[str],
+    reported_ids: List[str],
+) -> List[Dict[str, Any]]:
+    _, start_at_utc, end_at_utc = _day_window_bounds("today", timezone_name)
+    events = await repository.list_events_in_window(
+        user_id=user_id,
+        start_time_iso=start_at_utc,
+        end_time_iso=end_at_utc,
+        executed=True,
+        event_types=sorted(MISSED_PROACTIVE_EVENT_TYPES),
+    )
+    now = _utc_now()
+    acknowledged = set(acknowledged_ids)
+    reported = set(reported_ids)
+    current_id = str(current_event_id or "").strip()
+    missed: List[Dict[str, Any]] = []
+
+    for event in events:
+        event_id = str(event.id).strip()
+        if not event_id:
+            continue
+        if event_id == current_id:
+            continue
+        if event_id in acknowledged or event_id in reported:
+            continue
+        try:
+            scheduled_dt = _parse_iso(event.scheduled_time)
+        except Exception:
+            continue
+        if scheduled_dt >= now:
+            continue
+
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        local_time = scheduled_dt.astimezone(ZoneInfo(timezone_name))
+        trigger_type = str(payload.get("trigger_type") or payload.get("reason") or event.event_type)
+        task_title = str(payload.get("task_title") or "").strip() or None
+
+        missed.append(
+            {
+                "event_id": event_id,
+                "event_type": event.event_type,
+                "trigger_type": trigger_type,
+                "scheduled_time": event.scheduled_time,
+                "scheduled_local_time": local_time.strftime("%H:%M"),
+                "task_title": task_title,
+            }
+        )
+        if len(missed) >= MISSED_PROACTIVE_MAX_EVENTS:
+            break
+
+    return missed
+
+
+def _looks_like_task_intent(text: str) -> bool:
+    return bool(TASK_INTENT_PATTERN.search(text or ""))
+
+
+def _looks_like_task_claim(text: str) -> bool:
+    return bool(TASK_CLAIM_PATTERN.search(text or "")) and bool(
+        TASK_INTENT_PATTERN.search(text or "")
     )
 
 
@@ -1861,7 +2197,7 @@ def _build_task_panel_state(
     elif run_status == "complete" and action_label:
         headline = f"{action_label} done."
     else:
-        headline = "Live task changes will show here."
+        headline = None
 
     return {
         "run_status": run_status,
@@ -2468,6 +2804,23 @@ async def bootstrap_device(payload: DeviceBootstrapRequest) -> Dict[str, Any]:
     user_profile = await repository.get_user_profile(user_id=device_id)
     profile_context = _build_profile_context(user_profile)
     needs_onboarding = _needs_onboarding(user_profile)
+    morning_seed: Dict[str, Any] | None = None
+    wake_time = str(profile_context.get("wake_time") or "").strip()
+    if not needs_onboarding and wake_time:
+        try:
+            morning_seed = await _seed_next_morning_wake_event(
+                user_id=device_id,
+                timezone_name=timezone_name,
+                wake_time=wake_time,
+            )
+        except Exception as error:
+            _log_event(
+                logging.WARNING,
+                "Morning wake seed skipped during bootstrap",
+                device_id=device_id,
+                timezone=timezone_name,
+                error=str(error),
+            )
     existing_session = await repository.get_session_by_id(session_id=session_id)
     thread_type = _session_thread_type(
         user_id=device_id,
@@ -2498,6 +2851,8 @@ async def bootstrap_device(payload: DeviceBootstrapRequest) -> Dict[str, Any]:
         timezone=timezone_name,
         needs_onboarding=needs_onboarding,
         thread_type=thread_type,
+        seeded=morning_seed.get("seeded") if morning_seed else None,
+        scheduled=bool(morning_seed.get("cron_job_id")) if morning_seed else None,
     )
     return {
         "device_id": device_id,
@@ -2513,9 +2868,6 @@ async def bootstrap_device(payload: DeviceBootstrapRequest) -> Dict[str, Any]:
 
 @app.post("/agent/push-token")
 async def register_push_token(payload: PushTokenRequest) -> Dict[str, Any]:
-    if not TASK_MGMT_V1_ENABLED:
-        raise HTTPException(status_code=404, detail="Task management v1 disabled")
-
     device_id = payload.device_id.strip()
     token = payload.expo_push_token.strip()
     if not device_id or not token:
@@ -2587,12 +2939,32 @@ async def complete_onboarding(payload: OnboardingCompleteRequest) -> Dict[str, A
             "lifecycle_state": "active",
         },
     )
+    morning_seed: Dict[str, Any] | None = None
+    try:
+        morning_seed = await _seed_next_morning_wake_event(
+            user_id=device_id,
+            timezone_name=timezone_name,
+            wake_time=wake_time,
+        )
+    except Exception as error:
+        _log_event(
+            logging.WARNING,
+            "Morning wake seed skipped during onboarding",
+            device_id=device_id,
+            timezone=timezone_name,
+            error=str(error),
+        )
     _log_event(
         logging.INFO,
         "Onboarding completed",
         device_id=device_id,
         session_id=daily_session_id,
         timezone=timezone_name,
+        seeded=morning_seed.get("seeded") if morning_seed else None,
+        scheduled=bool(morning_seed.get("cron_job_id")) if morning_seed else None,
+        event_id=morning_seed.get("event_id") if morning_seed else None,
+        scheduled_time=morning_seed.get("scheduled_time") if morning_seed else None,
+        reason=morning_seed.get("reason") if morning_seed else "seed_failed",
     )
 
     return {
@@ -2633,6 +3005,8 @@ async def task_management(payload: TaskManagementRequest) -> Dict[str, Any]:
             session_id=output["session_id"],
             timezone=timezone_name,
             action=payload.action,
+            task_written=payload.action
+            in {"capture_tasks", "set_top_essentials", "timebox_task", "update_task_status"},
         )
         return output
     except HTTPException as error:
@@ -2759,7 +3133,11 @@ async def agent_ws(
     active_session_id = session_id
     unsubscribe_task_panel = None
     initialized = False
+    suppress_startup_on_init = False
     latest_entry_context = EntryContext(entry_mode="proactive" if entry_mode == "proactive" else "reactive")
+    latest_missed_proactive_events: List[Dict[str, Any]] = []
+    latest_proactive_ack_ids: List[str] = []
+    latest_missed_reported_ids: List[str] = []
 
     _log_event(
         logging.INFO,
@@ -2808,6 +3186,10 @@ async def agent_ws(
             "trigger_type": latest_entry_context.trigger_type or "",
             "entry_context": json.dumps(latest_entry_context.model_dump(), separators=(",", ":")),
             "profile_context": json.dumps(profile_context, separators=(",", ":")),
+            "missed_proactive_count": str(len(latest_missed_proactive_events)),
+            "missed_proactive_events": json.dumps(
+                latest_missed_proactive_events, separators=(",", ":")
+            ),
         }
 
         if TASK_MGMT_V1_ENABLED:
@@ -2845,6 +3227,7 @@ async def agent_ws(
         *,
         prompt: str,
         metadata: Dict[str, Any] | None = None,
+        user_task_intent: bool = False,
     ) -> bool:
         assistant_message_id = str(uuid.uuid4())
         context_map = await _build_runtime_context()
@@ -2896,6 +3279,17 @@ async def agent_ws(
         assistant_metadata: Dict[str, Any] = {"model": "google-adk", "streamed": True}
         if metadata:
             assistant_metadata.update(metadata)
+        startup_turn = bool(assistant_metadata.get("startup_turn"))
+        task_write_count = 0
+        consume_write_count = getattr(agent, "consume_task_write_count", None)
+        if callable(consume_write_count):
+            try:
+                task_write_count = int(
+                    consume_write_count(user_id=active_user_id, session_id=active_session_id)
+                )
+            except Exception:
+                task_write_count = 0
+        task_written = task_write_count > 0
 
         assistant_message = MessageRecord(
             id=assistant_message_id,
@@ -2915,6 +3309,28 @@ async def agent_ws(
             entry_context=latest_entry_context,
             state_patch={"last_message_id": assistant_message_id, "last_role": "assistant"},
         )
+
+        assistant_claimed_task_action = _looks_like_task_claim(assistant_text)
+        if (user_task_intent or assistant_claimed_task_action) and not task_written and not startup_turn:
+            _log_event(
+                logging.WARNING,
+                "Task intent detected without task write",
+                device_id=active_user_id,
+                session_id=active_session_id,
+                user_task_intent=user_task_intent,
+                assistant_claimed_task_action=assistant_claimed_task_action,
+                task_written=False,
+            )
+        else:
+            _log_event(
+                logging.INFO,
+                "Assistant turn completed",
+                device_id=active_user_id,
+                session_id=active_session_id,
+                startup_turn=startup_turn,
+                task_written=task_written,
+                task_write_count=task_write_count,
+            )
 
         return await _safe_send_json(
             {
@@ -2945,6 +3361,7 @@ async def agent_ws(
             if frame_type == "init":
                 active_user_id = str(frame.get("device_id") or active_user_id)
                 active_session_id = str(frame.get("session_id") or active_session_id)
+                suppress_startup_on_init = bool(frame.get("suppress_startup_on_init"))
                 entry_payload = frame.get("entry_context") or {}
                 try:
                     latest_entry_context = EntryContext(**entry_payload)
@@ -2969,7 +3386,7 @@ async def agent_ws(
                 user_profile = await repository.get_user_profile(user_id=active_user_id)
                 profile_context = _build_profile_context(user_profile)
                 try:
-                    await _ensure_session(
+                    session_record = await _ensure_session(
                         user_id=active_user_id,
                         session_id=active_session_id,
                         timezone_name=timezone_name,
@@ -2982,6 +3399,51 @@ async def agent_ws(
                     if not await _safe_send_json({"type": "error", "code": code, "detail": detail}):
                         break
                     continue
+                session_state = dict(session_record.state if session_record else {})
+                latest_proactive_ack_ids = _normalize_event_id_list(
+                    session_state.get(PROACTIVE_ACK_STATE_KEY)
+                )
+                latest_missed_reported_ids = _normalize_event_id_list(
+                    session_state.get(MISSED_REPORTED_STATE_KEY)
+                )
+
+                current_proactive_event_id: str | None = None
+                if latest_entry_context.entry_mode == "proactive":
+                    proactive_event_id = str(latest_entry_context.event_id or "").strip()
+                    if proactive_event_id:
+                        current_proactive_event_id = proactive_event_id
+                        latest_proactive_ack_ids = _append_event_id(
+                            latest_proactive_ack_ids, proactive_event_id
+                        )
+
+                latest_missed_proactive_events = await _list_missed_proactive_events_for_today(
+                    user_id=active_user_id,
+                    timezone_name=timezone_name,
+                    current_event_id=current_proactive_event_id,
+                    acknowledged_ids=latest_proactive_ack_ids,
+                    reported_ids=latest_missed_reported_ids,
+                )
+
+                state_patch: Dict[str, Any] = {}
+                if latest_proactive_ack_ids != _normalize_event_id_list(
+                    session_state.get(PROACTIVE_ACK_STATE_KEY)
+                ):
+                    state_patch[PROACTIVE_ACK_STATE_KEY] = latest_proactive_ack_ids
+                if latest_missed_reported_ids != _normalize_event_id_list(
+                    session_state.get(MISSED_REPORTED_STATE_KEY)
+                ):
+                    state_patch[MISSED_REPORTED_STATE_KEY] = latest_missed_reported_ids
+                if state_patch:
+                    try:
+                        await _ensure_session(
+                            user_id=active_user_id,
+                            session_id=active_session_id,
+                            timezone_name=timezone_name,
+                            entry_context=latest_entry_context,
+                            state_patch=state_patch,
+                        )
+                    except HTTPException:
+                        pass
                 history = await repository.list_messages(session_id=active_session_id)
                 current_task_state = await _load_task_state_for_user(
                     user_id=active_user_id,
@@ -3017,15 +3479,57 @@ async def agent_ws(
                 ):
                     break
                 initialized = True
+                _log_event(
+                    logging.INFO,
+                    "WebSocket session initialized",
+                    device_id=active_user_id,
+                    session_id=active_session_id,
+                    ws_init=True,
+                    startup_suppressed=suppress_startup_on_init,
+                    message_count=len(history),
+                    entry_mode=latest_entry_context.entry_mode,
+                    trigger_type=latest_entry_context.trigger_type or "",
+                )
 
-                startup_needed = not any(message.role in {"user", "assistant"} for message in history)
+                startup_needed = not suppress_startup_on_init
                 if startup_needed:
-                    await _run_assistant_turn(
+                    startup_sent = await _run_assistant_turn(
                         prompt=_startup_prompt(latest_entry_context),
                         metadata={
                             "startup_turn": True,
                             "entry_context": latest_entry_context.model_dump(),
                         },
+                    )
+                    surfaced_ids = [
+                        str(item.get("event_id") or "").strip()
+                        for item in latest_missed_proactive_events
+                        if str(item.get("event_id") or "").strip()
+                    ]
+                    if startup_sent and surfaced_ids:
+                        for surfaced_id in surfaced_ids:
+                            latest_missed_reported_ids = _append_event_id(
+                                latest_missed_reported_ids, surfaced_id
+                            )
+                        try:
+                            await _ensure_session(
+                                user_id=active_user_id,
+                                session_id=active_session_id,
+                                timezone_name=timezone_name,
+                                entry_context=latest_entry_context,
+                                state_patch={
+                                    MISSED_REPORTED_STATE_KEY: latest_missed_reported_ids
+                                },
+                            )
+                        except HTTPException:
+                            pass
+                        latest_missed_proactive_events = []
+                    _log_event(
+                        logging.INFO,
+                        "Startup turn evaluated",
+                        device_id=active_user_id,
+                        session_id=active_session_id,
+                        ws_init=True,
+                        startup_sent=startup_sent,
                     )
                 continue
 
@@ -3078,7 +3582,10 @@ async def agent_ws(
             )
             await repository.insert_message(payload=user_message)
 
-            if not await _run_assistant_turn(prompt=text):
+            if not await _run_assistant_turn(
+                prompt=text,
+                user_task_intent=_looks_like_task_intent(text),
+            ):
                 if socket_closed:
                     break
                 continue
