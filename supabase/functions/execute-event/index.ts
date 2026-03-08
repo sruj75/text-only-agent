@@ -2,6 +2,9 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
 const EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
+const MAX_DELIVERY_ATTEMPTS = 4;
+const RETRY_BASE_SECONDS = 60;
+const RETRY_MAX_SECONDS = 30 * 60;
 
 type EventRow = {
   id: string;
@@ -52,6 +55,12 @@ function getDailySessionId(userId: string, timezoneName: string, atIso?: string 
 
 function asString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function nextRetryRunAtIso(attemptCount: number): string {
+  const exponent = Math.max(0, attemptCount - 1);
+  const delaySeconds = Math.min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * 2 ** exponent);
+  return new Date(Date.now() + delaySeconds * 1000).toISOString();
 }
 
 function formatCalendarReminderBody(payload: Record<string, unknown>, timezoneName: string): string {
@@ -442,77 +451,118 @@ Deno.serve(async (req: Request): Promise<Response> => {
     } else if (eventType === "calendar_reminder" && !calendarTimezone) {
       lastError = "missing_timezone";
     }
+    let deliverySucceeded = pushSent && !!sessionReady && !!sessionTimezone && !!sessionId;
 
     let nextMorningWake: { ok: boolean; detail?: unknown; error?: string } | null = null;
+    let continuationFailed = false;
     if (eventType === "morning_wake") {
       nextMorningWake = await ensureNextMorningWake(supabase, eventId);
       if (!nextMorningWake.ok) {
-        const failedFinalize = await supabase.rpc("finalize_event_execution", {
-          p_event_id: eventId,
-          p_last_error: "morning_wake_continuation_failed",
-          p_attempted_at: attemptedAt,
-          p_executed: false,
-          p_attempt_count: nextAttemptCount,
-        });
-        if (failedFinalize.error) {
-          return new Response(
-            JSON.stringify({ error: `finalize failed: ${failedFinalize.error.message}` }),
-            { status: 500, headers: { "Content-Type": "application/json" } },
-          );
+        continuationFailed = true;
+        if (!pushSent) {
+          lastError = "morning_wake_continuation_failed";
         }
-        await unscheduleIfPresent(supabase, event.cron_job_id ?? null);
-        return new Response(
-          JSON.stringify({
-            error: "Failed to schedule next morning wake",
-            event_id: eventId,
-            event_type: eventType,
-            push_sent: pushSent,
-            next_morning_wake: nextMorningWake,
-          }),
-          { status: 500, headers: { "Content-Type": "application/json" } },
-        );
       }
     }
 
-    const finalize = await supabase.rpc("finalize_event_execution", {
-      p_event_id: eventId,
-      p_last_error: lastError,
-      p_attempted_at: attemptedAt,
-      p_executed: true,
-      p_attempt_count: nextAttemptCount,
-    });
-    if (finalize.error) {
+    if (deliverySucceeded) {
+      const finalize = await supabase.rpc("finalize_event_execution", {
+        p_event_id: eventId,
+        p_last_error: continuationFailed ? "morning_wake_continuation_failed" : null,
+        p_attempted_at: attemptedAt,
+        p_executed: true,
+        p_attempt_count: nextAttemptCount,
+      });
+      if (finalize.error) {
+        return new Response(
+          JSON.stringify({ error: `finalize failed: ${finalize.error.message}` }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      await unscheduleIfPresent(supabase, event.cron_job_id ?? null);
+      await supabase.from("events").update({
+        workflow_state: "succeeded",
+        next_retry_at: null,
+        dead_lettered_at: null,
+        updated_at: new Date().toISOString(),
+      }).eq("id", eventId);
       return new Response(
-        JSON.stringify({ error: `finalize failed: ${finalize.error.message}` }),
-        { status: 500, headers: { "Content-Type": "application/json" } },
+        JSON.stringify({
+          status: "executed",
+          event_id: eventId,
+          event_type: eventType,
+          push_sent: pushSent,
+          attempt_count: nextAttemptCount,
+          next_morning_wake: nextMorningWake,
+          continuation_failed: continuationFailed,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
       );
     }
 
-    await unscheduleIfPresent(supabase, event.cron_job_id ?? null);
+    if (nextAttemptCount >= MAX_DELIVERY_ATTEMPTS) {
+      const finalize = await supabase.rpc("finalize_event_execution", {
+        p_event_id: eventId,
+        p_last_error: lastError,
+        p_attempted_at: attemptedAt,
+        p_executed: false,
+        p_attempt_count: nextAttemptCount,
+      });
+      if (finalize.error) {
+        return new Response(
+          JSON.stringify({ error: `finalize failed: ${finalize.error.message}` }),
+          { status: 500, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      await unscheduleIfPresent(supabase, event.cron_job_id ?? null);
+      await supabase.from("events").update({
+        workflow_state: "dead_letter",
+        dead_lettered_at: new Date().toISOString(),
+        next_retry_at: null,
+        updated_at: new Date().toISOString(),
+      }).eq("id", eventId);
+      return new Response(
+        JSON.stringify({
+          status: "dead_letter",
+          event_id: eventId,
+          event_type: eventType,
+          attempt_count: nextAttemptCount,
+          last_error: lastError,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
 
-    console.info(
-      JSON.stringify({
-        loop_health: true,
-        event_id: eventId,
-        event_type: eventType,
-        seeded: eventType === "morning_wake",
-        scheduled: true,
-        executed: true,
-        push_sent: pushSent,
-        session_ready: sessionReady,
-      }),
-    );
-
+    const retryAt = nextRetryRunAtIso(nextAttemptCount);
+    const retryTimezone = sessionTimezone || "UTC";
+    const retryResult = await supabase.rpc("schedule_event_retry", {
+      p_event_id: eventId,
+      p_next_run_at: retryAt,
+      p_timezone: retryTimezone,
+      p_last_error: lastError || "push_failed_or_missing_token",
+      p_attempted_at: attemptedAt,
+    });
+    if (retryResult.error) {
+      return new Response(
+        JSON.stringify({ error: `retry schedule failed: ${retryResult.error.message}` }),
+        { status: 500, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    await supabase.from("events").update({
+      workflow_state: "retry_scheduled",
+      next_retry_at: retryAt,
+      updated_at: new Date().toISOString(),
+    }).eq("id", eventId);
     return new Response(
       JSON.stringify({
-        status: "executed",
+        status: "retry_scheduled",
         event_id: eventId,
         event_type: eventType,
-        push_sent: pushSent,
         attempt_count: nextAttemptCount,
-        next_morning_wake: nextMorningWake,
+        retry_at: retryAt,
+        last_error: lastError,
       }),
-      { status: 200, headers: { "Content-Type": "application/json" } },
+      { status: 202, headers: { "Content-Type": "application/json" } },
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";

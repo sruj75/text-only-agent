@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from typing import get_args, get_type_hints
 
-from startup_agent.adk import SimpleADK
+from startup_agent.adk import SimpleADK, TaskManagementAction
 
 
 def test_adk_requires_credentials(monkeypatch):
@@ -81,6 +82,21 @@ def test_adk_task_management_parses_json_payload():
 
     assert result["ok"] is True
     assert result["payload"] == {"titles": ["Write PRD"]}
+
+
+def test_adk_task_management_action_contract_is_canonical():
+    hints = get_type_hints(SimpleADK.task_management)
+    action_hint = hints["action"]
+
+    assert action_hint == TaskManagementAction
+    assert set(get_args(action_hint)) == {
+        "capture_tasks",
+        "timebox_task",
+        "set_top_essentials",
+        "update_task_status",
+        "get_tasks",
+        "get_schedule",
+    }
 
 
 def test_adk_cleans_task_write_counter_when_stream_is_interrupted(monkeypatch):

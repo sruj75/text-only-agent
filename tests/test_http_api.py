@@ -289,6 +289,197 @@ def test_agent_run_returns_503_when_adk_fails(app_client):
     assert "model=fake-adk-model" in response.json()["detail"]
 
 
+def test_session_open_generates_startup_message_with_cursor(app_client):
+    client = app_client["client"]
+    completed = client.post(
+        "/agent/onboarding/complete",
+        json={
+            "device_id": "device-session-open",
+            "timezone": "UTC",
+            "wake_time": "07:00",
+            "bedtime": "23:00",
+            "playbook": "Start with one tiny step.",
+            "health_anchors": ["Breakfast"],
+        },
+    )
+    assert completed.status_code == 200
+    bootstrap = client.post(
+        "/agent/bootstrap-device",
+        json={"device_id": "device-session-open", "timezone": "UTC"},
+    )
+    assert bootstrap.status_code == 200
+
+    opened = client.post(
+        "/agent/session/open",
+        json={
+            "device_id": "device-session-open",
+            "timezone": "UTC",
+            "session_id": bootstrap.json()["session_id"],
+            "entry_context": {"source": "manual", "entry_mode": "reactive"},
+            "source": "manual",
+            "cursor": None,
+        },
+    )
+    assert opened.status_code == 200
+    payload = opened.json()
+    assert payload["startup_status"] == "succeeded"
+    assert payload["message_cursor"] is not None
+    assert len(payload["messages_delta"]) == 1
+    assert payload["messages_delta"][0]["role"] == "assistant"
+    assert payload["messages_delta"][0]["metadata"]["startup_turn"] is True
+
+
+def test_session_open_is_idempotent_for_same_start_request(app_client):
+    client = app_client["client"]
+    completed = client.post(
+        "/agent/onboarding/complete",
+        json={
+            "device_id": "device-session-idempotent",
+            "timezone": "UTC",
+            "wake_time": "07:00",
+            "bedtime": "23:00",
+            "playbook": "Start with one tiny step.",
+            "health_anchors": ["Breakfast"],
+        },
+    )
+    assert completed.status_code == 200
+    bootstrap = client.post(
+        "/agent/bootstrap-device",
+        json={"device_id": "device-session-idempotent", "timezone": "UTC"},
+    )
+    session_id = bootstrap.json()["session_id"]
+
+    first = client.post(
+        "/agent/session/open",
+        json={
+            "device_id": "device-session-idempotent",
+            "timezone": "UTC",
+            "session_id": session_id,
+            "entry_context": {"source": "manual", "entry_mode": "reactive"},
+            "source": "manual",
+            "cursor": None,
+        },
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        "/agent/session/open",
+        json={
+            "device_id": "device-session-idempotent",
+            "timezone": "UTC",
+            "session_id": session_id,
+            "entry_context": {"source": "manual", "entry_mode": "reactive"},
+            "source": "manual",
+            "cursor": first.json()["message_cursor"],
+        },
+    )
+    assert second.status_code == 200
+    assert second.json()["messages_delta"] == []
+
+
+def test_session_open_only_marks_missed_events_when_startup_is_generated(app_client):
+    client = app_client["client"]
+    repository = app_client["repository"]
+    fake_agent = app_client["agent"]
+    device_id = "device-session-missed-gating"
+
+    completed = client.post(
+        "/agent/onboarding/complete",
+        json={
+            "device_id": device_id,
+            "timezone": "UTC",
+            "wake_time": "07:00",
+            "bedtime": "23:00",
+            "playbook": "Start with one tiny step.",
+            "health_anchors": ["Breakfast"],
+        },
+    )
+    assert completed.status_code == 200
+
+    bootstrap = client.post(
+        "/agent/bootstrap-device",
+        json={"device_id": device_id, "timezone": "UTC"},
+    )
+    assert bootstrap.status_code == 200
+    session_id = bootstrap.json()["session_id"]
+
+    first_open = client.post(
+        "/agent/session/open",
+        json={
+            "device_id": device_id,
+            "timezone": "UTC",
+            "session_id": session_id,
+            "entry_context": {"source": "manual", "entry_mode": "reactive"},
+            "source": "manual",
+            "cursor": None,
+        },
+    )
+    assert first_open.status_code == 200
+    assert len(fake_agent.run_calls) == 1
+
+    missed_event_id = "event-missed-after-startup"
+    now = main._utc_now()
+    asyncio.run(
+        repository.create_event(
+            main.CheckinEventRecord(
+                id=missed_event_id,
+                user_id=device_id,
+                scheduled_time=main._iso_from_dt(now - main.timedelta(minutes=10)),
+                event_type="checkin",
+                payload={"trigger_type": "before_task", "task_title": "Deep work"},
+                executed=True,
+            )
+        )
+    )
+
+    second_open = client.post(
+        "/agent/session/open",
+        json={
+            "device_id": device_id,
+            "timezone": "UTC",
+            "session_id": session_id,
+            "entry_context": {"source": "manual", "entry_mode": "reactive"},
+            "source": "manual",
+            "cursor": first_open.json()["message_cursor"],
+        },
+    )
+    assert second_open.status_code == 200
+    assert len(fake_agent.run_calls) == 1
+
+    state = repository.sessions[session_id].state
+    assert state.get(main.MISSED_REPORTED_STATE_KEY) in (None, [])
+
+
+def test_thread_messages_support_cursor(app_client):
+    client = app_client["client"]
+    bootstrap = client.post(
+        "/agent/bootstrap-device",
+        json={"device_id": "device-thread-cursor", "timezone": "UTC"},
+    )
+    session_id = bootstrap.json()["session_id"]
+
+    opened = client.post(
+        "/agent/session/open",
+        json={
+            "device_id": "device-thread-cursor",
+            "timezone": "UTC",
+            "session_id": session_id,
+            "entry_context": {"source": "manual", "entry_mode": "reactive"},
+            "source": "manual",
+            "cursor": None,
+        },
+    )
+    cursor = opened.json()["message_cursor"]
+
+    delta = client.get(
+        f"/agent/threads/{session_id}/messages",
+        params={"device_id": "device-thread-cursor", "cursor": cursor},
+    )
+    assert delta.status_code == 200
+    payload = delta.json()
+    assert payload["messages"] == []
+
+
 def test_complete_onboarding_updates_user_and_bootstrap_context(app_client):
     client = app_client["client"]
     repository = app_client["repository"]

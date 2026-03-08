@@ -32,6 +32,8 @@ class FakeADK:
         )
         if prompt == "raise_run_error":
             raise RuntimeError("run exploded")
+        if prompt.startswith("Conversation bootstrap:"):
+            return "hello world"
         return f"assistant::{prompt}"
 
     async def run_stream(

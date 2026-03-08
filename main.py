@@ -158,6 +158,10 @@ TaskManagementAction = Literal[
     "get_schedule",
     "update_task_status",
 ]
+StartupWorkflowState = Literal[
+    "succeeded",
+    "failed",
+]
 TaskStatus = Literal["todo", "in_progress", "done", "blocked"]
 TaskTriggerType = Literal["before_task", "transition", "after_task"]
 TaskEventType = Literal[
@@ -212,6 +216,87 @@ def _normalize_timezone(raw_tz: str | None) -> str | None:
         return raw_tz
     except ZoneInfoNotFoundError:
         return None
+
+
+def _new_correlation_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _message_cursor_for(message: "MessageRecord") -> str:
+    return f"{message.created_at}|{message.id}"
+
+
+def _latest_message_cursor(messages: List["MessageRecord"]) -> str | None:
+    if not messages:
+        return None
+    return _message_cursor_for(messages[-1])
+
+
+def _message_is_after_cursor(message: "MessageRecord", cursor: str | None) -> bool:
+    if not cursor:
+        return True
+    if "|" not in cursor:
+        return True
+    cursor_created_at, cursor_message_id = cursor.split("|", 1)
+    message_key = (message.created_at, message.id)
+    cursor_key = (cursor_created_at, cursor_message_id)
+    return message_key > cursor_key
+
+
+def _messages_after_cursor(messages: List["MessageRecord"], cursor: str | None) -> List["MessageRecord"]:
+    if not cursor:
+        return messages
+    return [message for message in messages if _message_is_after_cursor(message, cursor)]
+
+
+def _conversation_start_idempotency_key(
+    *,
+    user_id: str,
+    session_id: str,
+    entry_context: "EntryContext",
+) -> str:
+    trigger_type = (entry_context.trigger_type or "").strip() or "reactive_open"
+    scheduled_time = (entry_context.scheduled_time or "").strip() or "na"
+    return f"{user_id}|{session_id}|{trigger_type}|{scheduled_time}"
+
+
+def _startup_message_id_for_key(idempotency_key: str) -> str:
+    token = uuid.uuid5(uuid.NAMESPACE_URL, idempotency_key).hex[:24]
+    return f"startup_{token}"
+
+
+def _task_error(code: str, message: str, *, status_code: int = 400) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "code": code,
+            "message": message,
+        },
+    )
+
+
+def _task_error_code_from_http_error(error: HTTPException) -> str:
+    detail = error.detail
+    if isinstance(detail, dict):
+        raw = detail.get("code")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return "TASK_ACTION_FAILED"
+
+
+def _task_error_message_from_http_error(error: HTTPException) -> str:
+    detail = error.detail
+    if isinstance(detail, dict):
+        raw = detail.get("message")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    if isinstance(detail, str) and detail.strip():
+        return detail
+    return "Task action failed"
+
+
+def _normalize_task_action(action: str) -> str:
+    return action.strip()
 
 
 def _timezone_from_user_profile(user_profile: Dict[str, Any] | None) -> str | None:
@@ -352,6 +437,15 @@ class DeviceBootstrapRequest(BaseModel):
     timezone: str | None = Field(default=None)
     session_id: str | None = Field(default=None)
     entry_context: EntryContext | None = Field(default=None)
+
+
+class SessionOpenRequest(BaseModel):
+    device_id: str
+    timezone: str | None = Field(default=None)
+    session_id: str | None = Field(default=None)
+    entry_context: EntryContext | None = Field(default=None)
+    source: Literal["manual", "push"] = "manual"
+    cursor: str | None = Field(default=None)
 
 
 class ThreadCreateRequest(BaseModel):
@@ -521,6 +615,10 @@ class CheckinEventRecord(BaseModel):
     executed: bool = False
     cron_job_id: int | None = None
     last_error: str | None = None
+    last_attempt_at: str | None = None
+    next_retry_at: str | None = None
+    dead_lettered_at: str | None = None
+    workflow_state: str = "requested"
     attempt_count: int = 0
     created_at: str = Field(default_factory=_iso_now)
     updated_at: str = Field(default_factory=_iso_now)
@@ -1232,7 +1330,7 @@ class SupabaseRepository:
             "executed": "eq.false",
             "scheduled_time": f"gte.{from_time_iso}",
             "payload->>schedule_owner": "eq.task_management",
-            "select": "id,user_id,scheduled_time,event_type,payload,executed,cron_job_id,last_error,attempt_count,created_at,updated_at",
+                "select": "id,user_id,scheduled_time,event_type,payload,executed,cron_job_id,last_error,last_attempt_at,next_retry_at,dead_lettered_at,workflow_state,attempt_count,created_at,updated_at",
             "order": "scheduled_time.asc",
             "limit": "500",
         }
@@ -1257,7 +1355,7 @@ class SupabaseRepository:
             "user_id": f"eq.{user_id}",
             "executed": "eq.false",
             "scheduled_time": f"gte.{from_time_iso}",
-            "select": "id,user_id,scheduled_time,event_type,payload,executed,cron_job_id,last_error,attempt_count,created_at,updated_at",
+                "select": "id,user_id,scheduled_time,event_type,payload,executed,cron_job_id,last_error,last_attempt_at,next_retry_at,dead_lettered_at,workflow_state,attempt_count,created_at,updated_at",
             "order": "scheduled_time.asc",
             "limit": "500",
         }
@@ -1283,7 +1381,7 @@ class SupabaseRepository:
             "user_id": f"eq.{user_id}",
             "scheduled_time": f"gte.{start_time_iso}",
             "and": f"(scheduled_time.lt.{end_time_iso})",
-            "select": "id,user_id,scheduled_time,event_type,payload,executed,cron_job_id,last_error,attempt_count,created_at,updated_at",
+            "select": "id,user_id,scheduled_time,event_type,payload,executed,cron_job_id,last_error,last_attempt_at,next_retry_at,dead_lettered_at,workflow_state,attempt_count,created_at,updated_at",
             "order": "scheduled_time.asc",
             "limit": "500",
         }
@@ -1497,6 +1595,8 @@ async def _tool_task_management(
         return {"ok": False, "error": str(error.detail)}
 
     target_session_id = raw_session_id or _daily_session_id(raw_user_id, timezone_name)
+    normalized_action = _normalize_task_action(action)
+    normalized_payload = dict(payload)
 
     try:
         session_record = await _ensure_task_session(
@@ -1516,16 +1616,16 @@ async def _tool_task_management(
                 task_state=task_state,
                 timezone_name=timezone_name,
                 run_status="running",
-                action=action,
-                payload=payload,
+                action=normalized_action,
+                payload=normalized_payload,
             ),
         )
 
         output = await _execute_task_management(
             device_id=raw_user_id,
             timezone_name=timezone_name,
-            action=action,  # runtime-validated in _execute_task_management
-            payload=payload,
+            action=normalized_action,  # runtime-validated in _execute_task_management
+            payload=normalized_payload,
             session_id=target_session_id,
         )
         await _broadcast_task_panel(
@@ -1535,21 +1635,24 @@ async def _tool_task_management(
                 task_state=TaskStateV1(**output["task_state"]),
                 timezone_name=timezone_name,
                 run_status="complete",
-                action=action,
-                payload=payload,
+                action=normalized_action,
+                payload=normalized_payload,
                 result=output.get("result"),
             ),
         )
         return {"ok": True, **output}
     except HTTPException as error:
+        error_code = _task_error_code_from_http_error(error)
+        error_message = _task_error_message_from_http_error(error)
         _log_event(
             logging.WARNING,
             "Task tool action rejected",
             device_id=raw_user_id,
             session_id=target_session_id,
             timezone=timezone_name,
-            action=action,
-            detail=str(error.detail),
+            action=normalized_action,
+            error_code=error_code,
+            detail=error_message,
         )
         if target_session_id:
             error_state = await _load_task_state_for_user(
@@ -1563,12 +1666,18 @@ async def _tool_task_management(
                     task_state=error_state,
                     timezone_name=timezone_name,
                     run_status="error",
-                    action=action,
-                    payload=payload,
-                    error_message=str(error.detail),
+                    action=normalized_action,
+                    payload=normalized_payload,
+                    error_message=error_message,
                 ),
             )
-        return {"ok": False, "error": str(error.detail)}
+        return {
+            "ok": False,
+            "error": {
+                "code": error_code,
+                "message": error_message,
+            },
+        }
     except Exception as error:
         logger.exception(
             "Task tool action failed",
@@ -1576,7 +1685,7 @@ async def _tool_task_management(
                 "device_id": raw_user_id,
                 "session_id": target_session_id,
                 "timezone": timezone_name,
-                "action": action,
+                "action": normalized_action,
                 "error": str(error),
             },
         )
@@ -1592,12 +1701,12 @@ async def _tool_task_management(
                     task_state=error_state,
                     timezone_name=timezone_name,
                     run_status="error",
-                    action=action,
-                    payload=payload,
+                    action=normalized_action,
+                    payload=normalized_payload,
                     error_message=str(error),
                 ),
             )
-        return {"ok": False, "error": str(error)}
+        return {"ok": False, "error": {"code": "TASK_ACTION_FAILED", "message": str(error)}}
 
 
 agent = SimpleADK(
@@ -1727,6 +1836,197 @@ def _build_profile_context(user_profile: Dict[str, Any] | None) -> Dict[str, Any
 def _needs_onboarding(user_profile: Dict[str, Any] | None) -> bool:
     status = str((user_profile or {}).get("onboarding_status") or "pending").strip().lower()
     return status != "completed"
+
+
+def _startup_prompt(entry_context: EntryContext) -> str:
+    trigger_type = (entry_context.trigger_type or "").strip().lower()
+    if trigger_type == "post_onboarding":
+        return (
+            "Conversation bootstrap: first post-onboarding handoff. "
+            "Generate the first assistant message naturally using context. "
+            "Keep it brief, supportive, and action-oriented."
+        )
+    if entry_context.entry_mode == "proactive":
+        return (
+            "Conversation bootstrap: proactive check-in open. "
+            "Generate the first assistant message naturally using trigger context. "
+            "Keep it brief and guide the next concrete step."
+        )
+    return (
+        "Conversation bootstrap: reactive open. "
+        "Generate the first assistant message naturally using context. "
+        "Keep it brief and focused."
+    )
+
+
+def _find_startup_message(messages: List[MessageRecord]) -> MessageRecord | None:
+    for message in messages:
+        if message.role != "assistant":
+            continue
+        metadata = message.metadata if isinstance(message.metadata, dict) else {}
+        if bool(metadata.get("startup_turn")):
+            return message
+    return None
+
+
+async def _build_runtime_context_for_session(
+    *,
+    user_id: str,
+    session_id: str,
+    timezone_name: str,
+    entry_context: EntryContext,
+    missed_proactive_events: List[Dict[str, Any]] | None = None,
+) -> Dict[str, str]:
+    session_record = await repository.get_session(
+        session_id=session_id,
+        user_id=user_id,
+    )
+    session_state = dict(session_record.state) if session_record else {}
+    profile_context = session_state.get("profile_context")
+    if not isinstance(profile_context, dict):
+        user_profile = await repository.get_user_profile(user_id=user_id)
+        profile_context = _build_profile_context(user_profile)
+    context_map = {
+        "session_id": session_id,
+        "user_id": user_id,
+        "timezone": timezone_name,
+        "entry_mode": entry_context.entry_mode,
+        "trigger_type": entry_context.trigger_type or "",
+        "entry_context": json.dumps(entry_context.model_dump(), separators=(",", ":")),
+        "profile_context": json.dumps(profile_context, separators=(",", ":")),
+    }
+    missed_events = missed_proactive_events or []
+    context_map["missed_proactive_count"] = str(len(missed_events))
+    context_map["missed_proactive_events"] = json.dumps(missed_events, separators=(",", ":"))
+
+    if TASK_MGMT_V1_ENABLED:
+        open_tasks = [
+            task
+            for task in await repository.list_tasks(user_id=user_id)
+            if _task_is_open(task)
+        ]
+        due_time = _get_current_time_context(timezone_name)
+        due_schedule = await _build_schedule_for_user(
+            user_id=user_id,
+            timezone_name=timezone_name,
+            raw_date="today",
+        )
+        context_map["due_diligence_time"] = json.dumps(due_time, separators=(",", ":"))
+        context_map["due_diligence_schedule"] = json.dumps(due_schedule, separators=(",", ":"))
+        context_map["due_diligence_tasks"] = json.dumps(
+            [
+                {
+                    "id": task.task_id,
+                    "title": task.title,
+                    "status": task.status,
+                    "is_essential": task.is_essential,
+                    "priority_rank": task.priority_rank,
+                    "timebox_start_at": task.timebox_start_at,
+                    "timebox_end_at": task.timebox_end_at,
+                }
+                for task in open_tasks
+            ],
+            separators=(",", ":"),
+        )
+    return context_map
+
+
+async def _ensure_startup_message_for_session(
+    *,
+    user_id: str,
+    session_id: str,
+    timezone_name: str,
+    entry_context: EntryContext,
+    source: Literal["manual", "push"],
+    missed_proactive_events: List[Dict[str, Any]] | None = None,
+) -> tuple[StartupWorkflowState, str | None, bool]:
+    existing_messages = await repository.list_messages(session_id=session_id)
+    startup_message = _find_startup_message(existing_messages)
+    if startup_message:
+        return "succeeded", startup_message.id, False
+
+    idempotency_key = _conversation_start_idempotency_key(
+        user_id=user_id,
+        session_id=session_id,
+        entry_context=entry_context,
+    )
+    startup_message_id = _startup_message_id_for_key(idempotency_key)
+    generated_at = _iso_now()
+
+    try:
+        inserted_by_this_call = False
+        context_map = await _build_runtime_context_for_session(
+            user_id=user_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            entry_context=entry_context,
+            missed_proactive_events=missed_proactive_events,
+        )
+        output = await agent.run(
+            prompt=_startup_prompt(entry_context),
+            user_id=user_id,
+            session_id=session_id,
+            context=context_map,
+        )
+        assistant_text = output.strip() or "Let's begin."
+        assistant_message = MessageRecord(
+            id=startup_message_id,
+            session_id=session_id,
+            user_id=user_id,
+            role="assistant",
+            content=assistant_text,
+            metadata={
+                "model": "google-adk",
+                "startup_turn": True,
+                "startup_generation_key": idempotency_key,
+                "entry_context": entry_context.model_dump(),
+                "source": source,
+                "correlation_id": _new_correlation_id(),
+            },
+            created_at=generated_at,
+        )
+        try:
+            await repository.insert_message(payload=assistant_message)
+            inserted_by_this_call = True
+        except RuntimeError as error:
+            if "duplicate key" not in str(error).lower():
+                raise
+            _log_event(
+                logging.INFO,
+                "Startup message insert already applied",
+                device_id=user_id,
+                session_id=session_id,
+                startup_message_id=startup_message_id,
+            )
+
+        refreshed_messages = await repository.list_messages(session_id=session_id)
+        startup_after_insert = _find_startup_message(refreshed_messages)
+        if not startup_after_insert:
+            return "failed", None, False
+
+        await _ensure_session(
+            user_id=user_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            entry_context=entry_context,
+            state_patch={
+                "last_message_id": startup_after_insert.id,
+                "last_role": "assistant",
+                "startup_generation_key": idempotency_key,
+                "startup_generated_at": startup_after_insert.created_at,
+            },
+        )
+        return "succeeded", startup_after_insert.id, inserted_by_this_call
+    except Exception as error:
+        _log_event(
+            logging.WARNING,
+            "Session startup generation failed",
+            device_id=user_id,
+            session_id=session_id,
+            startup_state="failed",
+            error=str(error),
+        )
+        return "failed", None, False
 
 
 async def _resolve_timezone_for_user(
@@ -2484,7 +2784,7 @@ async def _run_task_management_action(
     if action == "capture_tasks":
         titles = _extract_titles(payload)
         if not titles:
-            raise HTTPException(status_code=400, detail="capture_tasks requires at least one title")
+            raise _task_error("MISSING_FIELD", "capture_tasks requires at least one title")
 
         created = await repository.create_tasks(user_id=user_id, titles=titles)
         for task in created:
@@ -2511,21 +2811,21 @@ async def _run_task_management_action(
     if action == "set_top_essentials":
         task_ids = payload.get("task_ids")
         if not isinstance(task_ids, list):
-            raise HTTPException(status_code=400, detail="set_top_essentials requires task_ids list")
+            raise _task_error("MISSING_FIELD", "set_top_essentials requires task_ids list")
         cleaned_ids = [str(item) for item in task_ids if str(item).strip()]
         if len(cleaned_ids) > 3:
-            raise HTTPException(status_code=400, detail="set_top_essentials allows max 3 tasks")
+            raise _task_error("INVALID_PAYLOAD", "set_top_essentials allows max 3 tasks")
 
         seen: set[str] = set()
         for task_id in cleaned_ids:
             if task_id in seen:
-                raise HTTPException(status_code=400, detail="task_ids contains duplicates")
+                raise _task_error("INVALID_PAYLOAD", "task_ids contains duplicates")
             seen.add(task_id)
         existing_tasks = await repository.list_tasks(user_id=user_id)
         existing_lookup = {task.task_id: task for task in existing_tasks}
         for task_id in cleaned_ids:
             if task_id not in existing_lookup:
-                raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+                raise _task_error("INVALID_PAYLOAD", f"Task not found: {task_id}", status_code=404)
 
         updated_tasks = await repository.replace_top_essentials(user_id=user_id, task_ids=cleaned_ids)
         for task in updated_tasks:
@@ -2559,30 +2859,27 @@ async def _run_task_management_action(
         end_at = str(payload.get("end_at") or "").strip()
 
         if not task_id or not start_at or not end_at:
-            raise HTTPException(
-                status_code=400,
-                detail="timebox_task requires task_id, start_at, end_at",
-            )
+            raise _task_error("MISSING_FIELD", "timebox_task requires task_id, start_at, end_at")
 
         existing_task = await repository.get_task(task_id=task_id, user_id=user_id)
         if not existing_task:
-            raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+            raise _task_error("INVALID_PAYLOAD", f"Task not found: {task_id}", status_code=404)
 
         try:
             start_dt = _parse_iso(start_at)
             end_dt = _parse_iso(end_at)
         except Exception as error:
-            raise HTTPException(status_code=400, detail=f"Invalid datetime: {error}") from error
+            raise _task_error("INVALID_DATETIME", f"Invalid datetime: {error}") from error
 
         if start_dt >= end_dt:
-            raise HTTPException(status_code=400, detail="timebox_task requires start_at < end_at")
+            raise _task_error("INVALID_PAYLOAD", "timebox_task requires start_at < end_at")
 
         start_date_local = _date_key_for_datetime(start_dt, timezone_name)
         end_date_local = _date_key_for_datetime(end_dt, timezone_name)
         if start_date_local != end_date_local:
-            raise HTTPException(
-                status_code=400,
-                detail="Timebox must stay within one local calendar day in your timezone.",
+            raise _task_error(
+                "INVALID_PAYLOAD",
+                "Timebox must stay within one local calendar day in your timezone.",
             )
 
         normalized_start = _iso_from_dt(start_dt)
@@ -2594,7 +2891,7 @@ async def _run_task_management_action(
             end_at=normalized_end,
         )
         if not updated_task:
-            raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+            raise _task_error("INVALID_PAYLOAD", f"Task not found: {task_id}", status_code=404)
 
         previous_date = _task_date_from_record(existing_task, timezone_name)
         next_date = _task_date_from_record(updated_task, timezone_name)
@@ -2645,17 +2942,17 @@ async def _run_task_management_action(
         task_id = str(payload.get("task_id") or "").strip()
         status = str(payload.get("status") or "").strip()
         if status not in {"todo", "in_progress", "done", "blocked"}:
-            raise HTTPException(status_code=400, detail="Invalid status")
+            raise _task_error("INVALID_PAYLOAD", "Invalid status")
         existing_task = await repository.get_task(task_id=task_id, user_id=user_id)
         if not existing_task:
-            raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+            raise _task_error("INVALID_PAYLOAD", f"Task not found: {task_id}", status_code=404)
         updated_task = await repository.update_task_status(
             task_id=task_id,
             user_id=user_id,
             status=status,  # type: ignore[arg-type]
         )
         if not updated_task:
-            raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+            raise _task_error("INVALID_PAYLOAD", f"Task not found: {task_id}", status_code=404)
         await _append_task_event(
             task_id=task_id,
             user_id=user_id,
@@ -2681,7 +2978,7 @@ async def _run_task_management_action(
             "task": _task_item_from_record(updated_task).model_dump(),
         }
 
-    raise HTTPException(status_code=400, detail=f"Unsupported action: {action}")
+    raise _task_error("INVALID_ACTION", f"Unsupported action: {action}")
 
 
 async def _execute_task_management(
@@ -2701,7 +2998,7 @@ async def _execute_task_management(
         "update_task_status",
     }
     if action not in allowed_actions:
-        raise HTTPException(status_code=400, detail=f"Unsupported action: {action}")
+        raise _task_error("INVALID_ACTION", f"Unsupported action: {action}")
 
     resolved_session_id = session_id or _daily_session_id(device_id, timezone_name)
 
@@ -2866,6 +3163,137 @@ async def bootstrap_device(payload: DeviceBootstrapRequest) -> Dict[str, Any]:
     }
 
 
+@app.post("/agent/session/open")
+async def open_session(payload: SessionOpenRequest) -> Dict[str, Any]:
+    device_id = payload.device_id.strip()
+    if not device_id:
+        raise HTTPException(status_code=400, detail="device_id is required")
+
+    correlation_id = _new_correlation_id()
+    timezone_name = await _resolve_timezone_for_user(
+        user_id=device_id,
+        provided_timezone=payload.timezone,
+    )
+    base_entry_context = payload.entry_context or EntryContext(source=payload.source, entry_mode="reactive")
+    entry_context = base_entry_context.model_copy(
+        update={"source": payload.source or base_entry_context.source}
+    )
+    is_post_onboarding = (entry_context.trigger_type or "").strip().lower() == "post_onboarding"
+    if is_post_onboarding and await repository.has_conversation_history(user_id=device_id):
+        entry_context = entry_context.model_copy(update={"entry_mode": "reactive", "trigger_type": None})
+    session_id = payload.session_id or _daily_session_id(device_id, timezone_name)
+
+    await repository.ensure_user(user_id=device_id, timezone_name=timezone_name)
+    user_profile = await repository.get_user_profile(user_id=device_id)
+    profile_context = _build_profile_context(user_profile)
+    needs_onboarding = _needs_onboarding(user_profile)
+    session_record = await _ensure_session(
+        user_id=device_id,
+        session_id=session_id,
+        timezone_name=timezone_name,
+        entry_context=entry_context,
+        state_patch={
+            "profile_context": profile_context,
+            "lifecycle_state": "needs_onboarding" if needs_onboarding else "active",
+        },
+    )
+    session_state = dict(session_record.state if session_record else {})
+    latest_proactive_ack_ids = _normalize_event_id_list(session_state.get(PROACTIVE_ACK_STATE_KEY))
+    latest_missed_reported_ids = _normalize_event_id_list(session_state.get(MISSED_REPORTED_STATE_KEY))
+
+    current_proactive_event_id: str | None = None
+    if entry_context.entry_mode == "proactive":
+        proactive_event_id = str(entry_context.event_id or "").strip()
+        if proactive_event_id:
+            current_proactive_event_id = proactive_event_id
+            latest_proactive_ack_ids = _append_event_id(latest_proactive_ack_ids, proactive_event_id)
+
+    latest_missed_proactive_events = await _list_missed_proactive_events_for_today(
+        user_id=device_id,
+        timezone_name=timezone_name,
+        current_event_id=current_proactive_event_id,
+        acknowledged_ids=latest_proactive_ack_ids,
+        reported_ids=latest_missed_reported_ids,
+    )
+
+    state_patch: Dict[str, Any] = {}
+    if latest_proactive_ack_ids != _normalize_event_id_list(session_state.get(PROACTIVE_ACK_STATE_KEY)):
+        state_patch[PROACTIVE_ACK_STATE_KEY] = latest_proactive_ack_ids
+    if latest_missed_reported_ids != _normalize_event_id_list(session_state.get(MISSED_REPORTED_STATE_KEY)):
+        state_patch[MISSED_REPORTED_STATE_KEY] = latest_missed_reported_ids
+    if state_patch:
+        await _ensure_session(
+            user_id=device_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            entry_context=entry_context,
+            state_patch=state_patch,
+        )
+
+    startup_status: StartupWorkflowState = "failed"
+    startup_message_id: str | None = None
+    startup_generated = False
+    if not needs_onboarding:
+        startup_status, startup_message_id, startup_generated = await _ensure_startup_message_for_session(
+            user_id=device_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            entry_context=entry_context,
+            source=payload.source,
+            missed_proactive_events=latest_missed_proactive_events,
+        )
+        surfaced_ids = [
+            str(item.get("event_id") or "").strip()
+            for item in latest_missed_proactive_events
+            if str(item.get("event_id") or "").strip()
+        ]
+        if startup_status == "succeeded" and startup_generated and surfaced_ids:
+            for surfaced_id in surfaced_ids:
+                latest_missed_reported_ids = _append_event_id(latest_missed_reported_ids, surfaced_id)
+            await _ensure_session(
+                user_id=device_id,
+                session_id=session_id,
+                timezone_name=timezone_name,
+                entry_context=entry_context,
+                state_patch={MISSED_REPORTED_STATE_KEY: latest_missed_reported_ids},
+            )
+
+    messages = await repository.list_messages(session_id=session_id)
+    message_cursor = _latest_message_cursor(messages)
+    messages_delta = _messages_after_cursor(messages, payload.cursor)
+    task_state = await _load_task_state_for_user(
+        user_id=device_id,
+        timezone_name=timezone_name,
+    )
+    _log_event(
+        logging.INFO,
+        "Session open completed",
+        device_id=device_id,
+        session_id=session_id,
+        timezone=timezone_name,
+        correlation_id=correlation_id,
+        startup_status=startup_status,
+        startup_message_id=startup_message_id,
+        startup_generated=startup_generated,
+        message_cursor=message_cursor,
+        message_count=len(messages),
+        delta_count=len(messages_delta),
+        needs_onboarding=needs_onboarding,
+    )
+    return {
+        "session_id": session_id,
+        "message_cursor": message_cursor,
+        "startup_status": startup_status,
+        "messages_delta": [message.model_dump() for message in messages_delta],
+        "needs_onboarding": needs_onboarding,
+        "profile_context": profile_context,
+        "task_panel_state": _build_task_panel_state(
+            task_state=task_state,
+            timezone_name=timezone_name,
+        ),
+    }
+
+
 @app.post("/agent/push-token")
 async def register_push_token(payload: PushTokenRequest) -> Dict[str, Any]:
     device_id = payload.device_id.strip()
@@ -3010,6 +3438,8 @@ async def task_management(payload: TaskManagementRequest) -> Dict[str, Any]:
         )
         return output
     except HTTPException as error:
+        error_code = _task_error_code_from_http_error(error)
+        error_message = _task_error_message_from_http_error(error)
         _log_event(
             logging.WARNING,
             "Task management action rejected",
@@ -3017,8 +3447,9 @@ async def task_management(payload: TaskManagementRequest) -> Dict[str, Any]:
             session_id=payload.session_id,
             timezone=timezone_name,
             action=payload.action,
+            error_code=error_code,
             status_code=error.status_code,
-            detail=str(error.detail),
+            detail=error_message,
         )
         raise
     except Exception as error:
@@ -3042,12 +3473,20 @@ async def list_threads(device_id: str = Query(...)) -> Dict[str, Any]:
 
 
 @app.get("/agent/threads/{session_id}/messages")
-async def get_thread_messages(session_id: str, device_id: str = Query(...)) -> Dict[str, Any]:
+async def get_thread_messages(
+    session_id: str,
+    device_id: str = Query(...),
+    cursor: str | None = Query(None),
+) -> Dict[str, Any]:
     session = await repository.get_session(session_id=session_id, user_id=device_id)
     if not session:
         raise HTTPException(status_code=404, detail="Thread not found")
     messages = await repository.list_messages(session_id=session_id)
-    return {"messages": [message.model_dump() for message in messages]}
+    delta = _messages_after_cursor(messages, cursor)
+    return {
+        "cursor": _latest_message_cursor(messages),
+        "messages": [message.model_dump() for message in delta],
+    }
 
 
 @app.post("/agent/threads")
@@ -3133,11 +3572,11 @@ async def agent_ws(
     active_session_id = session_id
     unsubscribe_task_panel = None
     initialized = False
-    suppress_startup_on_init = False
     latest_entry_context = EntryContext(entry_mode="proactive" if entry_mode == "proactive" else "reactive")
     latest_missed_proactive_events: List[Dict[str, Any]] = []
     latest_proactive_ack_ids: List[str] = []
     latest_missed_reported_ids: List[str] = []
+    ws_correlation_id = _new_correlation_id()
 
     _log_event(
         logging.INFO,
@@ -3145,83 +3584,17 @@ async def agent_ws(
         device_id=active_user_id,
         session_id=active_session_id,
         timezone=timezone_name,
+        correlation_id=ws_correlation_id,
     )
 
-    def _startup_prompt(entry_context: EntryContext) -> str:
-        trigger_type = (entry_context.trigger_type or "").strip().lower()
-        if trigger_type == "post_onboarding":
-            return (
-                "Conversation bootstrap: first post-onboarding handoff. "
-                "Generate the first assistant message naturally using context. "
-                "Keep it brief, supportive, and action-oriented."
-            )
-        if entry_context.entry_mode == "proactive":
-            return (
-                "Conversation bootstrap: proactive check-in open. "
-                "Generate the first assistant message naturally using trigger context. "
-                "Keep it brief and guide the next concrete step."
-            )
-        return (
-            "Conversation bootstrap: reactive open. "
-            "Generate the first assistant message naturally using context. "
-            "Keep it brief and focused."
-        )
-
     async def _build_runtime_context() -> Dict[str, str]:
-        session_record = await repository.get_session(
-            session_id=active_session_id,
+        return await _build_runtime_context_for_session(
             user_id=active_user_id,
+            session_id=active_session_id,
+            timezone_name=timezone_name,
+            entry_context=latest_entry_context,
+            missed_proactive_events=latest_missed_proactive_events,
         )
-        session_state = dict(session_record.state) if session_record else {}
-        profile_context = session_state.get("profile_context")
-        if not isinstance(profile_context, dict):
-            user_profile = await repository.get_user_profile(user_id=active_user_id)
-            profile_context = _build_profile_context(user_profile)
-            session_state["profile_context"] = profile_context
-        context_map = {
-            "session_id": active_session_id,
-            "user_id": active_user_id,
-            "timezone": timezone_name,
-            "entry_mode": latest_entry_context.entry_mode,
-            "trigger_type": latest_entry_context.trigger_type or "",
-            "entry_context": json.dumps(latest_entry_context.model_dump(), separators=(",", ":")),
-            "profile_context": json.dumps(profile_context, separators=(",", ":")),
-            "missed_proactive_count": str(len(latest_missed_proactive_events)),
-            "missed_proactive_events": json.dumps(
-                latest_missed_proactive_events, separators=(",", ":")
-            ),
-        }
-
-        if TASK_MGMT_V1_ENABLED:
-            open_tasks = [
-                task
-                for task in await repository.list_tasks(user_id=active_user_id)
-                if _task_is_open(task)
-            ]
-            due_time = _get_current_time_context(timezone_name)
-            due_schedule = await _build_schedule_for_user(
-                user_id=active_user_id,
-                timezone_name=timezone_name,
-                raw_date="today",
-            )
-            context_map["due_diligence_time"] = json.dumps(due_time, separators=(",", ":"))
-            context_map["due_diligence_schedule"] = json.dumps(due_schedule, separators=(",", ":"))
-            context_map["due_diligence_tasks"] = json.dumps(
-                [
-                    {
-                        "id": task.task_id,
-                        "title": task.title,
-                        "status": task.status,
-                        "is_essential": task.is_essential,
-                        "priority_rank": task.priority_rank,
-                        "timebox_start_at": task.timebox_start_at,
-                        "timebox_end_at": task.timebox_end_at,
-                    }
-                    for task in open_tasks
-                ],
-                separators=(",", ":"),
-            )
-        return context_map
 
     async def _run_assistant_turn(
         *,
@@ -3290,6 +3663,12 @@ async def agent_ws(
             except Exception:
                 task_write_count = 0
         task_written = task_write_count > 0
+        assistant_claimed_task_action = _looks_like_task_claim(assistant_text)
+        if (user_task_intent or assistant_claimed_task_action) and not task_written and not startup_turn:
+            assistant_text = (
+                "I could not safely apply that task change yet. "
+                "Please confirm the task details and I will retry."
+            )
 
         assistant_message = MessageRecord(
             id=assistant_message_id,
@@ -3310,7 +3689,6 @@ async def agent_ws(
             state_patch={"last_message_id": assistant_message_id, "last_role": "assistant"},
         )
 
-        assistant_claimed_task_action = _looks_like_task_claim(assistant_text)
         if (user_task_intent or assistant_claimed_task_action) and not task_written and not startup_turn:
             _log_event(
                 logging.WARNING,
@@ -3337,6 +3715,8 @@ async def agent_ws(
                 "type": "assistant_done",
                 "message_id": assistant_message_id,
                 "text": assistant_text,
+                "created_at": assistant_message.created_at,
+                "cursor": _message_cursor_for(assistant_message),
             }
         )
 
@@ -3361,7 +3741,7 @@ async def agent_ws(
             if frame_type == "init":
                 active_user_id = str(frame.get("device_id") or active_user_id)
                 active_session_id = str(frame.get("session_id") or active_session_id)
-                suppress_startup_on_init = bool(frame.get("suppress_startup_on_init"))
+                init_cursor = str(frame.get("cursor") or "").strip() or None
                 entry_payload = frame.get("entry_context") or {}
                 try:
                     latest_entry_context = EntryContext(**entry_payload)
@@ -3445,6 +3825,8 @@ async def agent_ws(
                     except HTTPException:
                         pass
                 history = await repository.list_messages(session_id=active_session_id)
+                history_delta = _messages_after_cursor(history, init_cursor)
+                current_cursor = _latest_message_cursor(history)
                 current_task_state = await _load_task_state_for_user(
                     user_id=active_user_id,
                     timezone_name=timezone_name,
@@ -3464,7 +3846,8 @@ async def agent_ws(
                     {
                         "type": "session_ready",
                         "session_id": active_session_id,
-                        "messages": [message.model_dump() for message in history],
+                        "cursor": current_cursor,
+                        "history_delta": [message.model_dump() for message in history_delta],
                     }
                 ):
                     break
@@ -3484,53 +3867,14 @@ async def agent_ws(
                     "WebSocket session initialized",
                     device_id=active_user_id,
                     session_id=active_session_id,
+                    correlation_id=ws_correlation_id,
                     ws_init=True,
-                    startup_suppressed=suppress_startup_on_init,
                     message_count=len(history),
+                    delta_count=len(history_delta),
+                    cursor=current_cursor,
                     entry_mode=latest_entry_context.entry_mode,
                     trigger_type=latest_entry_context.trigger_type or "",
                 )
-
-                startup_needed = not suppress_startup_on_init
-                if startup_needed:
-                    startup_sent = await _run_assistant_turn(
-                        prompt=_startup_prompt(latest_entry_context),
-                        metadata={
-                            "startup_turn": True,
-                            "entry_context": latest_entry_context.model_dump(),
-                        },
-                    )
-                    surfaced_ids = [
-                        str(item.get("event_id") or "").strip()
-                        for item in latest_missed_proactive_events
-                        if str(item.get("event_id") or "").strip()
-                    ]
-                    if startup_sent and surfaced_ids:
-                        for surfaced_id in surfaced_ids:
-                            latest_missed_reported_ids = _append_event_id(
-                                latest_missed_reported_ids, surfaced_id
-                            )
-                        try:
-                            await _ensure_session(
-                                user_id=active_user_id,
-                                session_id=active_session_id,
-                                timezone_name=timezone_name,
-                                entry_context=latest_entry_context,
-                                state_patch={
-                                    MISSED_REPORTED_STATE_KEY: latest_missed_reported_ids
-                                },
-                            )
-                        except HTTPException:
-                            pass
-                        latest_missed_proactive_events = []
-                    _log_event(
-                        logging.INFO,
-                        "Startup turn evaluated",
-                        device_id=active_user_id,
-                        session_id=active_session_id,
-                        ws_init=True,
-                        startup_sent=startup_sent,
-                    )
                 continue
 
             if frame_type != "user_message":

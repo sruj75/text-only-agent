@@ -130,7 +130,7 @@ def test_timebox_is_editable_for_persistent_tasks(app_client):
     task_id = captured["result"]["created_task_ids"][0]
 
     now = datetime.now(timezone.utc)
-    start = (now + timedelta(hours=2)).replace(microsecond=0)
+    start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
     end = (start + timedelta(minutes=25)).replace(microsecond=0)
 
     first = client.post(
@@ -259,7 +259,9 @@ def test_timebox_must_stay_within_one_local_calendar_day(app_client):
     )
 
     assert response.status_code == 400
-    assert "Timebox must stay within one local calendar day" in response.json()["detail"]
+    detail = response.json()["detail"]
+    assert detail["code"] == "INVALID_PAYLOAD"
+    assert "Timebox must stay within one local calendar day" in detail["message"]
 
 
 def test_task_panel_uses_requested_day_for_schedule_snapshot():
@@ -313,7 +315,7 @@ def test_done_task_unschedules_and_reopen_rebuilds_future_events(app_client):
     task_id = captured["result"]["created_task_ids"][0]
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
-    start = now + timedelta(hours=2)
+    start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
     end = start + timedelta(minutes=30)
 
     timeboxed = client.post(
@@ -492,3 +494,31 @@ def test_rebuild_keeps_existing_events_when_new_schedule_fails(app_client):
 
     assert failed.status_code == 500
     assert old_event_ids.issubset(set(repository.events.keys()))
+
+
+def test_tool_task_management_invalid_action_fails_fast(app_client):
+    client = app_client["client"]
+
+    bootstrap = client.post(
+        "/agent/bootstrap-device",
+        json={"device_id": "device-invalid-action", "timezone": "UTC"},
+    )
+    assert bootstrap.status_code == 200
+    session_id = bootstrap.json()["session_id"]
+
+    result = asyncio.run(
+        main._tool_task_management(
+            "invalid_action",
+            {},
+            session_id,
+            "UTC",
+            {
+                "user_id": "device-invalid-action",
+                "session_id": session_id,
+                "timezone": "UTC",
+            },
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "INVALID_ACTION"

@@ -3,12 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def test_execute_event_does_not_schedule_retry_attempts():
+def test_execute_event_schedules_retry_attempts_for_delivery_failures():
     source = Path("supabase/functions/execute-event/index.ts").read_text(encoding="utf-8")
 
-    assert 'supabase.rpc("schedule_event_retry"' not in source
-    assert 'status: "retry_scheduled"' not in source
-    assert "MAX_DELIVERY_ATTEMPTS" not in source
+    assert 'supabase.rpc("schedule_event_retry"' in source
+    assert 'status: "retry_scheduled"' in source
+    assert "MAX_DELIVERY_ATTEMPTS" in source
 
 
 def test_execute_event_records_failure_metadata_in_single_attempt_flow():
@@ -38,8 +38,8 @@ def test_execute_event_merges_existing_proactive_session_state():
     assert "existingSessionResult.data?.date ?? dateKey" in source
 
 
-def test_execute_event_finalizes_execution_without_retry_branch():
+def test_execute_event_tracks_dead_letter_terminal_state():
     source = Path("supabase/functions/execute-event/index.ts").read_text(encoding="utf-8")
 
-    assert "const finalize = await supabase.rpc(\"finalize_event_execution\"" in source
-    assert "await unscheduleIfPresent(supabase, event.cron_job_id ?? null);" in source
+    assert 'workflow_state: "dead_letter"' in source
+    assert 'status: "dead_letter"' in source

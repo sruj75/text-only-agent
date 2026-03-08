@@ -2,7 +2,7 @@ import logging
 import os
 import json
 from contextlib import aclosing
-from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Tuple
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Literal, Tuple
 
 from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
@@ -56,8 +56,16 @@ Reminder policy:
 """
 
 GetCurrentTimeToolHandler = Callable[[str | None, Dict[str, str]], Awaitable[Dict[str, Any]]]
+TaskManagementAction = Literal[
+    "capture_tasks",
+    "timebox_task",
+    "set_top_essentials",
+    "update_task_status",
+    "get_tasks",
+    "get_schedule",
+]
 TaskManagementToolHandler = Callable[
-    [str, Dict[str, Any], str | None, str | None, Dict[str, str]],
+    [TaskManagementAction, Dict[str, Any], str | None, str | None, Dict[str, str]],
     Awaitable[Dict[str, Any]],
 ]
 
@@ -134,7 +142,7 @@ class SimpleADK:
 
     async def task_management(
         self,
-        action: str,
+        action: TaskManagementAction,
         payload_json: str | None = None,
         session_id: str | None = None,
         timezone: str | None = None,

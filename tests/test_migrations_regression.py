@@ -87,3 +87,11 @@ def test_gcloudignore_keeps_migrations_in_build_context():
     ignore_text = Path(".gcloudignore").read_text(encoding="utf-8")
 
     assert "\nmigrations\n" not in f"\n{ignore_text}\n"
+
+
+def test_hybrid_workflow_migration_adds_event_workflow_columns():
+    sql = Path("migrations/20260309090000_hybrid_durable_workflow.sql").read_text(encoding="utf-8").lower()
+
+    assert "add column if not exists workflow_state text not null default 'requested'" in sql
+    assert "add column if not exists next_retry_at timestamptz" in sql
+    assert "add column if not exists dead_lettered_at timestamptz" in sql

@@ -15,6 +15,22 @@ def _bootstrap(client, device_id: str = "device-ws"):
     return response.json()
 
 
+def _complete_onboarding(client, *, device_id: str, timezone: str):
+    response = client.post(
+        "/agent/onboarding/complete",
+        json={
+            "device_id": device_id,
+            "timezone": timezone,
+            "wake_time": "07:00",
+            "bedtime": "23:00",
+            "playbook": "Start with one tiny step.",
+            "health_anchors": ["Breakfast"],
+        },
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
 def _drain_until_done(ws):
     frames = []
     while True:
@@ -67,21 +83,38 @@ def _init_session(
     device_id: str,
     session_id: str,
     entry_context: dict,
-    suppress_startup_on_init: bool = False,
+    cursor: str | None = None,
 ):
-    ws.send_json(
-        {
-            "type": "init",
-            "device_id": device_id,
-            "session_id": session_id,
-            "entry_context": entry_context,
-            "suppress_startup_on_init": suppress_startup_on_init,
-        }
-    )
+    payload = {
+        "type": "init",
+        "device_id": device_id,
+        "session_id": session_id,
+        "entry_context": entry_context,
+    }
+    if cursor is not None:
+        payload["cursor"] = cursor
+    ws.send_json(payload)
     ready = ws.receive_json()
     assert ready["type"] == "session_ready"
-    startup_frames = _drain_until_done(ws)
-    return ready, startup_frames
+    task_panel = ws.receive_json()
+    assert task_panel["type"] == "task_panel_state"
+    return ready
+
+
+def _open_session(client, *, device_id: str, timezone: str, session_id: str, entry_context: dict):
+    response = client.post(
+        "/agent/session/open",
+        json={
+            "device_id": device_id,
+            "timezone": timezone,
+            "session_id": session_id,
+            "entry_context": entry_context,
+            "source": entry_context.get("source", "manual"),
+            "cursor": None,
+        },
+    )
+    assert response.status_code == 200
+    return response.json()
 
 
 def test_ws_requires_init_before_user_message(app_client):
@@ -133,12 +166,27 @@ def test_ws_init_rejects_foreign_session_id(app_client):
 def test_ws_streams_and_persists_messages(app_client):
     client = app_client["client"]
     fake_agent = app_client["agent"]
+    _complete_onboarding(client, device_id="device-ws", timezone="Asia/Kolkata")
     bootstrap = _bootstrap(client)
+    _open_session(
+        client,
+        device_id=bootstrap["device_id"],
+        timezone="Asia/Kolkata",
+        session_id=bootstrap["session_id"],
+        entry_context={
+            "source": "push",
+            "event_id": "event-22",
+            "trigger_type": "checkin",
+            "scheduled_time": "2026-03-04T05:30:00Z",
+            "calendar_event_id": None,
+            "entry_mode": "proactive",
+        },
+    )
 
     with client.websocket_connect(
         f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=Asia/Kolkata&entry_mode=proactive"
     ) as ws:
-        _, startup_frames = _init_session(
+        _init_session(
             ws,
             device_id=bootstrap["device_id"],
             session_id=bootstrap["session_id"],
@@ -151,8 +199,6 @@ def test_ws_streams_and_persists_messages(app_client):
                 "entry_mode": "proactive",
             },
         )
-        startup_done = [f for f in startup_frames if f.get("type") == "assistant_done"][0]
-        assert startup_done["text"] == "hello world"
 
         ws.send_json({"type": "user_message", "message_id": "m2", "text": "what now"})
         frames = _drain_until_done(ws)
@@ -236,7 +282,6 @@ def test_ws_handles_back_to_back_user_messages(app_client):
     assert messages.status_code == 200
     payload = messages.json()["messages"]
     assert [msg["role"] for msg in payload] == [
-        "assistant",
         "user",
         "assistant",
         "user",
@@ -277,7 +322,7 @@ def test_ws_returns_adk_error_without_followup_assistant_message(app_client):
     )
     assert messages.status_code == 200
     payload = messages.json()["messages"]
-    assert [msg["role"] for msg in payload] == ["assistant", "user"]
+    assert [msg["role"] for msg in payload] == ["user"]
 
 
 def test_ws_includes_due_diligence_for_post_onboarding(app_client):
@@ -386,29 +431,27 @@ def test_ws_includes_profile_context_from_onboarding(app_client):
     assert profile_context["bedtime"] == "23:00"
 
 
-def test_ws_init_starts_with_assistant_on_empty_reactive_thread(app_client):
+def test_session_open_creates_startup_message_for_empty_reactive_thread(app_client):
     client = app_client["client"]
     fake_agent = app_client["agent"]
+    _complete_onboarding(client, device_id="device-init-starter", timezone="UTC")
     bootstrap = _bootstrap(client, device_id="device-init-starter")
+    opened = _open_session(
+        client,
+        device_id=bootstrap["device_id"],
+        timezone="UTC",
+        session_id=bootstrap["session_id"],
+        entry_context={"source": "manual", "entry_mode": "reactive"},
+    )
 
-    with client.websocket_connect(
-        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
-    ) as ws:
-        _, startup_frames = _init_session(
-            ws,
-            device_id=bootstrap["device_id"],
-            session_id=bootstrap["session_id"],
-            entry_context={"source": "manual", "entry_mode": "reactive"},
-        )
-
-    startup_done = [frame for frame in startup_frames if frame.get("type") == "assistant_done"][0]
-    assert startup_done["text"] == "hello world"
-    startup_context = fake_agent.stream_calls[0]["context"]
+    assert opened["startup_status"] == "succeeded"
+    assert opened["messages_delta"][0]["content"] == "hello world"
+    startup_context = fake_agent.run_calls[0]["context"]
     assert startup_context["entry_mode"] == "reactive"
     assert "due_diligence_time" in startup_context
     assert "due_diligence_schedule" in startup_context
     assert "due_diligence_tasks" in startup_context
-    assert fake_agent.stream_calls[0]["prompt"].startswith("Conversation bootstrap:")
+    assert fake_agent.run_calls[0]["prompt"].startswith("Conversation bootstrap:")
 
     messages = client.get(
         f"/agent/threads/{bootstrap['session_id']}/messages",
@@ -419,10 +462,19 @@ def test_ws_init_starts_with_assistant_on_empty_reactive_thread(app_client):
     assert [msg["role"] for msg in payload] == ["assistant"]
 
 
-def test_ws_init_starts_with_assistant_even_when_history_exists(app_client):
+def test_session_open_is_idempotent_when_history_exists(app_client):
     client = app_client["client"]
     fake_agent = app_client["agent"]
+    _complete_onboarding(client, device_id="device-repeat-startup", timezone="UTC")
     bootstrap = _bootstrap(client, device_id="device-repeat-startup")
+    first = _open_session(
+        client,
+        device_id=bootstrap["device_id"],
+        timezone="UTC",
+        session_id=bootstrap["session_id"],
+        entry_context={"source": "manual", "entry_mode": "reactive"},
+    )
+    assert first["startup_status"] == "succeeded"
 
     with client.websocket_connect(
         f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
@@ -436,25 +488,38 @@ def test_ws_init_starts_with_assistant_even_when_history_exists(app_client):
         ws.send_json({"type": "user_message", "message_id": "m-repeat", "text": "help me"})
         _drain_until_done(ws)
 
-    with client.websocket_connect(
-        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
-    ) as ws:
-        _, startup_frames = _init_session(
-            ws,
-            device_id=bootstrap["device_id"],
-            session_id=bootstrap["session_id"],
-            entry_context={"source": "manual", "entry_mode": "reactive"},
-        )
+    second = _open_session(
+        client,
+        device_id=bootstrap["device_id"],
+        timezone="UTC",
+        session_id=bootstrap["session_id"],
+        entry_context={"source": "manual", "entry_mode": "reactive"},
+    )
+    assert second["startup_status"] == "succeeded"
+    thread_messages = client.get(
+        f"/agent/threads/{bootstrap['session_id']}/messages",
+        params={"device_id": bootstrap["device_id"]},
+    ).json()["messages"]
+    startup_messages = [
+        message
+        for message in thread_messages
+        if bool((message.get("metadata") or {}).get("startup_turn"))
+    ]
+    assert len(startup_messages) == 1
+    assert len(fake_agent.run_calls) == 1
 
-    done = [frame for frame in startup_frames if frame.get("type") == "assistant_done"]
-    assert len(done) == 1
-    assert fake_agent.stream_calls[0]["prompt"].startswith("Conversation bootstrap:")
-    assert fake_agent.stream_calls[2]["prompt"].startswith("Conversation bootstrap:")
 
-
-def test_ws_init_can_suppress_startup_until_user_message(app_client):
+def test_ws_init_syncs_history_from_cursor_without_startup_generation(app_client):
     client = app_client["client"]
-    bootstrap = _bootstrap(client, device_id="device-suppress-startup")
+    bootstrap = _bootstrap(client, device_id="device-cursor-sync")
+    opened = _open_session(
+        client,
+        device_id=bootstrap["device_id"],
+        timezone="UTC",
+        session_id=bootstrap["session_id"],
+        entry_context={"source": "manual", "entry_mode": "reactive"},
+    )
+    cursor = opened["message_cursor"]
 
     with client.websocket_connect(
         f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
@@ -465,20 +530,21 @@ def test_ws_init_can_suppress_startup_until_user_message(app_client):
                 "device_id": bootstrap["device_id"],
                 "session_id": bootstrap["session_id"],
                 "entry_context": {"source": "manual", "entry_mode": "reactive"},
-                "suppress_startup_on_init": True,
+                "cursor": cursor,
             }
         )
         ready = ws.receive_json()
         assert ready["type"] == "session_ready"
+        assert ready["history_delta"] == []
         ws.receive_json()  # task_panel_state
-        ws.send_json({"type": "user_message", "message_id": "m-suppress", "text": "hello"})
+        ws.send_json({"type": "user_message", "message_id": "m-cursor", "text": "hello"})
         frames = _drain_until_done(ws)
 
     done = [frame for frame in frames if frame.get("type") == "assistant_done"]
     assert len(done) == 1
 
 
-def test_ws_post_onboarding_handoff_runs_once_per_lifetime(app_client):
+def test_session_open_post_onboarding_handoff_runs_once_per_lifetime(app_client):
     client = app_client["client"]
     fake_agent = app_client["agent"]
     device_id = "device-post-onboarding-once"
@@ -498,21 +564,18 @@ def test_ws_post_onboarding_handoff_runs_once_per_lifetime(app_client):
     bootstrap = _bootstrap(client, device_id=device_id)
     daily_session_id = bootstrap["session_id"]
 
-    with client.websocket_connect(
-        f"/agent/ws?device_id={device_id}&session_id={daily_session_id}&timezone=UTC"
-    ) as ws:
-        _init_session(
-            ws,
-            device_id=device_id,
-            session_id=daily_session_id,
-            entry_context={
-                "source": "push",
-                "entry_mode": "proactive",
-                "trigger_type": "post_onboarding",
-            },
-        )
-
-    assert fake_agent.stream_calls[0]["context"]["trigger_type"] == "post_onboarding"
+    _open_session(
+        client,
+        device_id=device_id,
+        timezone="UTC",
+        session_id=daily_session_id,
+        entry_context={
+            "source": "push",
+            "entry_mode": "proactive",
+            "trigger_type": "post_onboarding",
+        },
+    )
+    assert fake_agent.run_calls[0]["context"]["trigger_type"] == "post_onboarding"
 
     created = client.post(
         "/agent/threads",
@@ -521,29 +584,27 @@ def test_ws_post_onboarding_handoff_runs_once_per_lifetime(app_client):
     assert created.status_code == 200
     second_session_id = created.json()["thread"]["session_id"]
 
-    with client.websocket_connect(
-        f"/agent/ws?device_id={device_id}&session_id={second_session_id}&timezone=UTC"
-    ) as ws:
-        _init_session(
-            ws,
-            device_id=device_id,
-            session_id=second_session_id,
-            entry_context={
-                "source": "push",
-                "entry_mode": "proactive",
-                "trigger_type": "post_onboarding",
-            },
-        )
-
-    second_context = fake_agent.stream_calls[1]["context"]
+    _open_session(
+        client,
+        device_id=device_id,
+        timezone="UTC",
+        session_id=second_session_id,
+        entry_context={
+            "source": "push",
+            "entry_mode": "proactive",
+            "trigger_type": "post_onboarding",
+        },
+    )
+    second_context = fake_agent.run_calls[1]["context"]
     assert second_context["entry_mode"] == "reactive"
     assert second_context["trigger_type"] == ""
 
 
-def test_ws_proactive_ack_tracks_only_current_event_and_surfaces_missed_today_once(app_client):
+def test_session_open_proactive_ack_tracks_only_current_event_and_surfaces_missed_today_once(app_client):
     client = app_client["client"]
     repository = app_client["repository"]
     fake_agent = app_client["agent"]
+    _complete_onboarding(client, device_id="device-missed-ack", timezone="UTC")
     bootstrap = _bootstrap(client, device_id="device-missed-ack")
     session_id = bootstrap["session_id"]
     device_id = bootstrap["device_id"]
@@ -568,23 +629,21 @@ def test_ws_proactive_ack_tracks_only_current_event_and_surfaces_missed_today_on
         task_title="Current task",
     )
 
-    with client.websocket_connect(
-        f"/agent/ws?device_id={device_id}&session_id={session_id}&timezone=UTC&entry_mode=proactive"
-    ) as ws:
-        _init_session(
-            ws,
-            device_id=device_id,
-            session_id=session_id,
-            entry_context={
-                "source": "push",
-                "entry_mode": "proactive",
-                "event_id": current_event_id,
-                "trigger_type": "before_task",
-                "scheduled_time": main._iso_from_dt(now - main.timedelta(minutes=5)),
-            },
-        )
+    _open_session(
+        client,
+        device_id=device_id,
+        timezone="UTC",
+        session_id=session_id,
+        entry_context={
+            "source": "push",
+            "entry_mode": "proactive",
+            "event_id": current_event_id,
+            "trigger_type": "before_task",
+            "scheduled_time": main._iso_from_dt(now - main.timedelta(minutes=5)),
+        },
+    )
 
-    startup_context = fake_agent.stream_calls[0]["context"]
+    startup_context = fake_agent.run_calls[0]["context"]
     assert startup_context["missed_proactive_count"] == "1"
     missed_events = json.loads(startup_context["missed_proactive_events"])
     assert [event["event_id"] for event in missed_events] == [missed_event_id]
@@ -594,10 +653,11 @@ def test_ws_proactive_ack_tracks_only_current_event_and_surfaces_missed_today_on
     assert state[main.MISSED_REPORTED_STATE_KEY] == [missed_event_id]
 
 
-def test_ws_missed_proactive_is_reported_once_and_reactive_open_stays_reactive(app_client):
+def test_session_open_missed_proactive_is_reported_once_and_reactive_open_stays_reactive(app_client):
     client = app_client["client"]
     repository = app_client["repository"]
     fake_agent = app_client["agent"]
+    _complete_onboarding(client, device_id="device-missed-once", timezone="UTC")
     bootstrap = _bootstrap(client, device_id="device-missed-once")
     session_id = bootstrap["session_id"]
     device_id = bootstrap["device_id"]
@@ -613,31 +673,25 @@ def test_ws_missed_proactive_is_reported_once_and_reactive_open_stays_reactive(a
         task_title="Write notes",
     )
 
-    with client.websocket_connect(
-        f"/agent/ws?device_id={device_id}&session_id={session_id}&timezone=UTC"
-    ) as ws:
-        _init_session(
-            ws,
-            device_id=device_id,
-            session_id=session_id,
-            entry_context={"source": "manual", "entry_mode": "reactive"},
-        )
-
-    first_startup_context = fake_agent.stream_calls[0]["context"]
+    _open_session(
+        client,
+        device_id=device_id,
+        timezone="UTC",
+        session_id=session_id,
+        entry_context={"source": "manual", "entry_mode": "reactive"},
+    )
+    first_startup_context = fake_agent.run_calls[0]["context"]
     assert first_startup_context["entry_mode"] == "reactive"
     assert first_startup_context["missed_proactive_count"] == "1"
 
-    with client.websocket_connect(
-        f"/agent/ws?device_id={device_id}&session_id={session_id}&timezone=UTC"
-    ) as ws:
-        _init_session(
-            ws,
-            device_id=device_id,
-            session_id=session_id,
-            entry_context={"source": "manual", "entry_mode": "reactive"},
-        )
-
-    second_startup_context = fake_agent.stream_calls[1]["context"]
-    assert second_startup_context["entry_mode"] == "reactive"
-    assert second_startup_context["missed_proactive_count"] == "0"
-    assert json.loads(second_startup_context["missed_proactive_events"]) == []
+    # idempotency guard: second open does not regenerate startup and does not duplicate reported ids.
+    _open_session(
+        client,
+        device_id=device_id,
+        timezone="UTC",
+        session_id=session_id,
+        entry_context={"source": "manual", "entry_mode": "reactive"},
+    )
+    assert len(fake_agent.run_calls) == 1
+    state = repository.sessions[session_id].state
+    assert state[main.MISSED_REPORTED_STATE_KEY] == [missed_event_id]
