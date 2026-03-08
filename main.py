@@ -200,8 +200,6 @@ class PreparedSessionState:
     proactive_ack_ids: List[str]
     missed_reported_ids: List[str]
     messages: List["MessageRecord"]
-    message_cursor: str | None
-    messages_delta: List["MessageRecord"]
     task_panel_state: Dict[str, Any]
 
 
@@ -245,29 +243,6 @@ def _message_cursor_for(message: "MessageRecord") -> str:
     return f"{message.created_at}|{message.id}"
 
 
-def _latest_message_cursor(messages: List["MessageRecord"]) -> str | None:
-    if not messages:
-        return None
-    return _message_cursor_for(messages[-1])
-
-
-def _message_is_after_cursor(message: "MessageRecord", cursor: str | None) -> bool:
-    if not cursor:
-        return True
-    if "|" not in cursor:
-        return True
-    cursor_created_at, cursor_message_id = cursor.split("|", 1)
-    message_key = (message.created_at, message.id)
-    cursor_key = (cursor_created_at, cursor_message_id)
-    return message_key > cursor_key
-
-
-def _messages_after_cursor(messages: List["MessageRecord"], cursor: str | None) -> List["MessageRecord"]:
-    if not cursor:
-        return messages
-    return [message for message in messages if _message_is_after_cursor(message, cursor)]
-
-
 def _conversation_start_idempotency_key(
     *,
     user_id: str,
@@ -285,6 +260,16 @@ def _startup_message_id_for_key(idempotency_key: str) -> str:
 
 
 def _task_error(code: str, message: str, *, status_code: int = 400) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail={
+            "code": code,
+            "message": message,
+        },
+    )
+
+
+def _http_error(status_code: int, code: str, message: str) -> HTTPException:
     return HTTPException(
         status_code=status_code,
         detail={
@@ -363,34 +348,6 @@ def _date_key_for_datetime(value: datetime, timezone_name: str) -> str:
 
 def _daily_session_id(device_id: str, timezone_name: str) -> str:
     return f"session_{device_id}_{_local_date_key(timezone_name)}"
-
-
-def _session_thread_type(
-    *,
-    user_id: str,
-    session_id: str,
-    timezone_name: str,
-    entry_context: "EntryContext",
-    state: Dict[str, Any] | None = None,
-) -> str:
-    existing = state or {}
-    configured = existing.get("thread_type")
-    if isinstance(configured, str) and configured.strip():
-        return configured.strip()
-    if session_id == _daily_session_id(user_id, timezone_name):
-        return "daily"
-    if entry_context.entry_mode == "proactive":
-        return "daily"
-    return "manual"
-
-
-def _session_title(session_id: str, date_key: str, state: Dict[str, Any]) -> str:
-    configured = state.get("title")
-    if isinstance(configured, str) and configured.strip():
-        return configured.strip()
-    if session_id.endswith(date_key):
-        return f"Daily Plan ({date_key})"
-    return f"Thread {session_id[-8:]}"
 
 
 def _target_date_key(raw_date: str | None, timezone_name: str) -> str:
@@ -477,26 +434,12 @@ class AgentRunRequest(BaseModel):
     )
 
 
-class DeviceBootstrapRequest(BaseModel):
-    device_id: str | None = Field(default=None)
-    timezone: str | None = Field(default=None)
-    session_id: str | None = Field(default=None)
-    entry_context: EntryContext | None = Field(default=None)
-
-
 class SessionOpenRequest(BaseModel):
     device_id: str
     timezone: str | None = Field(default=None)
     session_id: str | None = Field(default=None)
     entry_context: EntryContext | None = Field(default=None)
     source: Literal["manual", "push"] = "manual"
-    cursor: str | None = Field(default=None)
-
-
-class ThreadCreateRequest(BaseModel):
-    device_id: str
-    timezone: str | None = Field(default=None)
-    title: str | None = Field(default=None)
 
 
 class PushTokenRequest(BaseModel):
@@ -633,16 +576,13 @@ def _task_sort_key(task: TaskRecord) -> tuple[int, int, int, str, str]:
 def _day_window_bounds(raw_date: str | None, timezone_name: str) -> tuple[str, str, str]:
     target_date = _target_date_key(raw_date, timezone_name)
     if not re.match(r"^\d{4}-\d{2}-\d{2}$", target_date):
-        raise HTTPException(status_code=400, detail="date must be 'today' or YYYY-MM-DD")
+        raise _http_error(400, "INVALID_DATE", "date must be 'today' or YYYY-MM-DD")
     try:
         start_local = datetime.strptime(target_date, "%Y-%m-%d").replace(
             tzinfo=ZoneInfo(timezone_name)
         )
     except ValueError as error:
-        raise HTTPException(
-            status_code=400,
-            detail="date must be 'today' or YYYY-MM-DD",
-        ) from error
+        raise _http_error(400, "INVALID_DATE", "date must be 'today' or YYYY-MM-DD") from error
     end_local = start_local + timedelta(days=1)
     return (
         target_date,
@@ -1611,7 +1551,8 @@ async def _tool_get_current_time(
             provided_timezone=timezone or runtime_context.get("timezone"),
         )
     except HTTPException as error:
-        return {"ok": False, "error": str(error.detail)}
+        error_message = _error_envelope(status_code=error.status_code, detail=error.detail)["error"]["message"]
+        return {"ok": False, "error": error_message}
 
     return {"ok": True, "current_time": _get_current_time_context(timezone_name)}
 
@@ -1637,7 +1578,8 @@ async def _tool_task_management(
             provided_timezone=timezone or runtime_context.get("timezone"),
         )
     except HTTPException as error:
-        return {"ok": False, "error": str(error.detail)}
+        error_message = _error_envelope(status_code=error.status_code, detail=error.detail)["error"]["message"]
+        return {"ok": False, "error": error_message}
 
     target_session_id = raw_session_id or _daily_session_id(raw_user_id, timezone_name)
     normalized_action = _normalize_task_action(action)
@@ -2115,15 +2057,16 @@ async def _resolve_timezone_for_user(
     if stored:
         return stored
 
-    raise HTTPException(
-        status_code=400,
-        detail="A valid IANA timezone is required (example: Asia/Kolkata).",
+    raise _http_error(
+        400,
+        "INVALID_TIMEZONE",
+        "A valid IANA timezone is required (example: Asia/Kolkata).",
     )
 
 
 def _next_wake_run_at_utc(*, timezone_name: str, wake_time_hhmm: str) -> datetime:
     if not _is_valid_hhmm(wake_time_hhmm):
-        raise HTTPException(status_code=400, detail="wake_time must be HH:MM (24h)")
+        raise _http_error(400, "INVALID_WAKE_TIME", "wake_time must be HH:MM (24h)")
     wake_hour, wake_minute = [int(part) for part in wake_time_hhmm.split(":")]
     now_local = datetime.now(ZoneInfo(timezone_name))
     target_local = now_local.replace(
@@ -2324,7 +2267,7 @@ async def _ensure_session(
 ) -> SessionRecord:
     existing = await repository.get_session_by_id(session_id=session_id)
     if existing and existing.user_id != user_id:
-        raise HTTPException(status_code=403, detail="Session does not belong to device")
+        raise _http_error(403, "SESSION_FORBIDDEN", "Session does not belong to device")
     existing_state = dict(existing.state if existing else {})
     existing_state["user_timezone"] = timezone_name
     existing_state["entry_context"] = entry_context.model_dump()
@@ -2350,7 +2293,6 @@ async def _prepare_session_state(
     session_id: str,
     timezone_name: str,
     entry_context: EntryContext,
-    cursor: str | None,
     persist_event_state: bool,
 ) -> PreparedSessionState:
     await repository.ensure_user(user_id=user_id, timezone_name=timezone_name)
@@ -2402,8 +2344,6 @@ async def _prepare_session_state(
             )
 
     messages = await repository.list_messages(session_id=session_id)
-    message_cursor = _latest_message_cursor(messages)
-    messages_delta = _messages_after_cursor(messages, cursor)
     task_state = await _load_task_state_for_user(
         user_id=user_id,
         timezone_name=timezone_name,
@@ -2419,29 +2359,11 @@ async def _prepare_session_state(
         proactive_ack_ids=proactive_ack_ids,
         missed_reported_ids=missed_reported_ids,
         messages=messages,
-        message_cursor=message_cursor,
-        messages_delta=messages_delta,
         task_panel_state=_build_task_panel_state(
             task_state=task_state,
             timezone_name=timezone_name,
         ),
     )
-
-
-async def _thread_summaries(user_id: str) -> List[Dict[str, Any]]:
-    rows = await repository.list_sessions(user_id=user_id)
-    output: List[Dict[str, Any]] = []
-    for row in rows:
-        output.append(
-            {
-                "session_id": row.session_id,
-                "date": row.date,
-                "title": _session_title(row.session_id, row.date, row.state),
-                "updated_at": row.updated_at,
-                "state": row.state,
-            }
-        )
-    return output
 
 
 def _extract_titles(payload: Dict[str, Any]) -> List[str]:
@@ -3220,105 +3142,19 @@ async def run_agent(payload: AgentRunRequest) -> Dict[str, str]:
                 "error": str(error),
             },
         )
-        raise HTTPException(
-            status_code=503,
-            detail=f"Google ADK unavailable (model={model_name}): {error}",
+        raise _http_error(
+            503,
+            "ADK_UNAVAILABLE",
+            f"Google ADK unavailable (model={model_name}): {error}",
         ) from error
     return {"output": output}
-
-
-@app.post("/agent/bootstrap-device")
-async def bootstrap_device(payload: DeviceBootstrapRequest) -> Dict[str, Any]:
-    _log_event(
-        logging.WARNING,
-        "Deprecated endpoint invoked",
-        endpoint="/agent/bootstrap-device",
-        remove_after="next_release",
-    )
-    device_id = payload.device_id.strip() if payload.device_id else str(uuid.uuid4())
-    timezone_name = await _resolve_timezone_for_user(
-        user_id=device_id,
-        provided_timezone=payload.timezone,
-    )
-    entry_context = payload.entry_context or EntryContext()
-    session_id = payload.session_id or _daily_session_id(device_id, timezone_name)
-
-    prepared = await _prepare_session_state(
-        user_id=device_id,
-        session_id=session_id,
-        timezone_name=timezone_name,
-        entry_context=entry_context,
-        cursor=None,
-        persist_event_state=False,
-    )
-    profile_context = prepared.profile_context
-    needs_onboarding = prepared.needs_onboarding
-    morning_seed: Dict[str, Any] | None = None
-    wake_time = str(profile_context.get("wake_time") or "").strip()
-    if not needs_onboarding and wake_time:
-        try:
-            morning_seed = await _seed_next_morning_wake_event(
-                user_id=device_id,
-                timezone_name=timezone_name,
-                wake_time=wake_time,
-            )
-        except Exception as error:
-            _log_event(
-                logging.WARNING,
-                "Morning wake seed skipped during bootstrap",
-                device_id=device_id,
-                timezone=timezone_name,
-                error=str(error),
-            )
-    existing_session = await repository.get_session_by_id(session_id=session_id)
-    thread_type = _session_thread_type(
-        user_id=device_id,
-        session_id=session_id,
-        timezone_name=timezone_name,
-        entry_context=entry_context,
-        state=existing_session.state if existing_session else None,
-    )
-    await _ensure_session(
-        user_id=device_id,
-        session_id=session_id,
-        timezone_name=timezone_name,
-        entry_context=entry_context,
-        state_patch={
-            "thread_type": thread_type,
-            "profile_context": profile_context,
-            "lifecycle_state": "needs_onboarding" if needs_onboarding else "active",
-        },
-    )
-
-    threads = await _thread_summaries(user_id=device_id)
-    _log_event(
-        logging.INFO,
-        "Device bootstrap completed",
-        device_id=device_id,
-        session_id=session_id,
-        timezone=timezone_name,
-        needs_onboarding=needs_onboarding,
-        thread_type=thread_type,
-        seeded=morning_seed.get("seeded") if morning_seed else None,
-        scheduled=bool(morning_seed.get("cron_job_id")) if morning_seed else None,
-    )
-    return {
-        "device_id": device_id,
-        "user_id": device_id,
-        "timezone": timezone_name,
-        "session_id": session_id,
-        "threads": threads,
-        "messages": [message.model_dump() for message in prepared.messages],
-        "needs_onboarding": needs_onboarding,
-        "profile_context": profile_context,
-    }
 
 
 @app.post("/agent/session/open")
 async def open_session(payload: SessionOpenRequest) -> Dict[str, Any]:
     device_id = payload.device_id.strip()
     if not device_id:
-        raise HTTPException(status_code=400, detail="device_id is required")
+        raise _http_error(400, "INVALID_DEVICE_ID", "device_id is required")
 
     correlation_id = _new_correlation_id()
     timezone_name = await _resolve_timezone_for_user(
@@ -3339,14 +3175,30 @@ async def open_session(payload: SessionOpenRequest) -> Dict[str, Any]:
         session_id=session_id,
         timezone_name=timezone_name,
         entry_context=entry_context,
-        cursor=payload.cursor,
         persist_event_state=True,
     )
 
     startup_status: StartupWorkflowState = "failed"
     startup_message_id: str | None = None
     startup_generated = False
+    morning_seed: Dict[str, Any] | None = None
     if not prepared.needs_onboarding:
+        wake_time = str(prepared.profile_context.get("wake_time") or "").strip()
+        if wake_time:
+            try:
+                morning_seed = await _seed_next_morning_wake_event(
+                    user_id=device_id,
+                    timezone_name=timezone_name,
+                    wake_time=wake_time,
+                )
+            except Exception as error:
+                _log_event(
+                    logging.WARNING,
+                    "Morning wake seed skipped during session open",
+                    device_id=device_id,
+                    timezone=timezone_name,
+                    error=str(error),
+                )
         startup_status, startup_message_id, startup_generated = await _ensure_startup_message_for_session(
             user_id=device_id,
             session_id=session_id,
@@ -3372,9 +3224,9 @@ async def open_session(payload: SessionOpenRequest) -> Dict[str, Any]:
                 state_patch={MISSED_REPORTED_STATE_KEY: latest_missed_reported_ids},
             )
 
-    messages = await repository.list_messages(session_id=session_id)
-    message_cursor = _latest_message_cursor(messages)
-    messages_delta = _messages_after_cursor(messages, payload.cursor)
+    messages = list(prepared.messages)
+    if startup_generated:
+        messages = await repository.list_messages(session_id=session_id)
     _log_event(
         logging.INFO,
         "Session open completed",
@@ -3385,16 +3237,15 @@ async def open_session(payload: SessionOpenRequest) -> Dict[str, Any]:
         startup_status=startup_status,
         startup_message_id=startup_message_id,
         startup_generated=startup_generated,
-        message_cursor=message_cursor,
+        morning_seeded=morning_seed.get("seeded") if morning_seed else None,
+        morning_seed_reason=morning_seed.get("reason") if morning_seed else None,
         message_count=len(messages),
-        delta_count=len(messages_delta),
         needs_onboarding=prepared.needs_onboarding,
     )
     return {
         "session_id": session_id,
-        "message_cursor": message_cursor,
         "startup_status": startup_status,
-        "messages_delta": [message.model_dump() for message in messages_delta],
+        "messages": [message.model_dump() for message in messages],
         "needs_onboarding": prepared.needs_onboarding,
         "profile_context": prepared.profile_context,
         "task_panel_state": prepared.task_panel_state,
@@ -3406,7 +3257,11 @@ async def register_push_token(payload: PushTokenRequest) -> Dict[str, Any]:
     device_id = payload.device_id.strip()
     token = payload.expo_push_token.strip()
     if not device_id or not token:
-        raise HTTPException(status_code=400, detail="device_id and expo_push_token are required")
+        raise _http_error(
+            400,
+            "INVALID_PUSH_TOKEN_REQUEST",
+            "device_id and expo_push_token are required",
+        )
 
     timezone_name = await _resolve_timezone_for_user(
         user_id=device_id,
@@ -3436,13 +3291,13 @@ async def complete_onboarding(payload: OnboardingCompleteRequest) -> Dict[str, A
     health_anchors = _normalize_text_list(payload.health_anchors)
 
     if not device_id:
-        raise HTTPException(status_code=400, detail="device_id is required")
+        raise _http_error(400, "INVALID_DEVICE_ID", "device_id is required")
     if not _is_valid_hhmm(wake_time):
-        raise HTTPException(status_code=400, detail="wake_time must be HH:MM (24h)")
+        raise _http_error(400, "INVALID_WAKE_TIME", "wake_time must be HH:MM (24h)")
     if not _is_valid_hhmm(bedtime):
-        raise HTTPException(status_code=400, detail="bedtime must be HH:MM (24h)")
+        raise _http_error(400, "INVALID_BEDTIME", "bedtime must be HH:MM (24h)")
     if len(playbook_text) < 3:
-        raise HTTPException(status_code=400, detail="playbook must have at least 3 characters")
+        raise _http_error(400, "INVALID_PLAYBOOK", "playbook must have at least 3 characters")
     if not health_anchors:
         health_anchors = _default_health_anchors(wake_time, bedtime)
 
@@ -3514,11 +3369,11 @@ async def complete_onboarding(payload: OnboardingCompleteRequest) -> Dict[str, A
 @app.post("/agent/task-management")
 async def task_management(payload: TaskManagementRequest) -> Dict[str, Any]:
     if not TASK_MGMT_V1_ENABLED:
-        raise HTTPException(status_code=404, detail="Task management v1 disabled")
+        raise _http_error(404, "TASK_MGMT_DISABLED", "Task management v1 disabled")
 
     device_id = payload.device_id.strip()
     if not device_id:
-        raise HTTPException(status_code=400, detail="device_id is required")
+        raise _http_error(400, "INVALID_DEVICE_ID", "device_id is required")
 
     timezone_name = await _resolve_timezone_for_user(
         user_id=device_id,
@@ -3569,93 +3424,13 @@ async def task_management(payload: TaskManagementRequest) -> Dict[str, Any]:
                 "error": str(error),
             },
         )
-        raise HTTPException(status_code=500, detail=f"Task management failed: {error}") from error
-
-
-@app.get("/agent/threads")
-async def list_threads(device_id: str = Query(...)) -> Dict[str, Any]:
-    _log_event(
-        logging.WARNING,
-        "Deprecated endpoint invoked",
-        endpoint="/agent/threads",
-        remove_after="next_release",
-    )
-    threads = await _thread_summaries(user_id=device_id)
-    return {"threads": threads}
-
-
-@app.get("/agent/threads/{session_id}/messages")
-async def get_thread_messages(
-    session_id: str,
-    device_id: str = Query(...),
-    cursor: str | None = Query(None),
-) -> Dict[str, Any]:
-    _log_event(
-        logging.WARNING,
-        "Deprecated endpoint invoked",
-        endpoint="/agent/threads/{session_id}/messages",
-        remove_after="next_release",
-    )
-    session = await repository.get_session(session_id=session_id, user_id=device_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    messages = await repository.list_messages(session_id=session_id)
-    delta = _messages_after_cursor(messages, cursor)
-    return {
-        "cursor": _latest_message_cursor(messages),
-        "messages": [message.model_dump() for message in delta],
-    }
-
-
-@app.post("/agent/threads")
-async def create_thread(payload: ThreadCreateRequest) -> Dict[str, Any]:
-    _log_event(
-        logging.WARNING,
-        "Deprecated endpoint invoked",
-        endpoint="/agent/threads (POST)",
-        remove_after="next_release",
-    )
-    timezone_name = await _resolve_timezone_for_user(
-        user_id=payload.device_id,
-        provided_timezone=payload.timezone,
-    )
-    suffix = uuid.uuid4().hex[:8]
-    date_key = _local_date_key(timezone_name)
-    session_id = f"session_{payload.device_id}_{date_key}_{suffix}"
-
-    await repository.ensure_user(user_id=payload.device_id, timezone_name=timezone_name)
-    user_profile = await repository.get_user_profile(user_id=payload.device_id)
-    profile_context = _build_profile_context(user_profile)
-    entry_context = EntryContext(source="manual", entry_mode="reactive")
-    state_patch = {
-        "thread_type": "manual",
-        "title": payload.title.strip() if payload.title else f"Thread {suffix}",
-        "profile_context": profile_context,
-        "lifecycle_state": "needs_onboarding" if _needs_onboarding(user_profile) else "active",
-    }
-    created = await _ensure_session(
-        user_id=payload.device_id,
-        session_id=session_id,
-        timezone_name=timezone_name,
-        entry_context=entry_context,
-        state_patch=state_patch,
-    )
-    return {
-        "thread": {
-            "session_id": created.session_id,
-            "date": created.date,
-            "title": _session_title(created.session_id, created.date, created.state),
-            "updated_at": created.updated_at,
-            "state": created.state,
-        }
-    }
+        raise _http_error(500, "TASK_MANAGEMENT_FAILED", f"Task management failed: {error}") from error
 
 
 @app.websocket("/agent/ws")
 async def agent_ws(
     websocket: WebSocket,
     device_id: str = Query(...),
-    session_id: str = Query(...),
     timezone: str | None = Query(None),
 ) -> None:
     await websocket.accept()
@@ -3684,7 +3459,7 @@ async def agent_ws(
             provided_timezone=timezone,
         )
     except HTTPException as error:
-        detail = error.detail if isinstance(error.detail, str) else "Invalid timezone"
+        detail = _error_envelope(status_code=error.status_code, detail=error.detail)["error"]["message"]
         await _safe_send_json({"type": "error", "code": "invalid_timezone", "detail": detail})
         try:
             await websocket.close()
@@ -3692,7 +3467,7 @@ async def agent_ws(
             pass
         return
     active_user_id = device_id
-    active_session_id = session_id
+    active_session_id: str | None = None
     unsubscribe_task_panel = None
     initialized = False
     latest_entry_context = EntryContext()
@@ -3703,12 +3478,14 @@ async def agent_ws(
         logging.INFO,
         "WebSocket connected",
         device_id=active_user_id,
-        session_id=active_session_id,
+        session_id="",
         timezone=timezone_name,
         correlation_id=ws_correlation_id,
     )
 
     async def _build_runtime_context() -> Dict[str, str]:
+        if not active_session_id:
+            raise RuntimeError("Session not initialized")
         return await _build_runtime_context_for_session(
             user_id=active_user_id,
             session_id=active_session_id,
@@ -3723,6 +3500,8 @@ async def agent_ws(
         metadata: Dict[str, Any] | None = None,
         user_task_intent: bool = False,
     ) -> bool:
+        if not active_session_id:
+            return False
         assistant_message_id = str(uuid.uuid4())
         context_map = await _build_runtime_context()
 
@@ -3860,15 +3639,22 @@ async def agent_ws(
                 continue
 
             if frame_type == "init":
-                active_session_id = str(frame.get("session_id") or active_session_id)
-                init_cursor_raw = frame.get("cursor")
-                init_cursor = (
-                    init_cursor_raw.strip() if isinstance(init_cursor_raw, str) and init_cursor_raw.strip() else None
-                )
+                next_session_id = str(frame.get("session_id") or "").strip()
+                if not next_session_id:
+                    if not await _safe_send_json(
+                        {
+                            "type": "error",
+                            "code": "invalid_init",
+                            "detail": "session_id is required",
+                        }
+                    ):
+                        break
+                    continue
+                active_session_id = next_session_id
                 try:
                     existing_session = await repository.get_session_by_id(session_id=active_session_id)
                     if existing_session and existing_session.user_id != active_user_id:
-                        raise HTTPException(status_code=403, detail="Session does not belong to device")
+                        raise _http_error(403, "SESSION_FORBIDDEN", "Session does not belong to device")
                     session_entry_context = _entry_context_from_state(
                         existing_session.state if existing_session else {}
                     )
@@ -3877,11 +3663,12 @@ async def agent_ws(
                         session_id=active_session_id,
                         timezone_name=timezone_name,
                         entry_context=session_entry_context,
-                        cursor=init_cursor,
                         persist_event_state=False,
                     )
                 except HTTPException as error:
-                    detail = error.detail if isinstance(error.detail, str) else "Session init failed"
+                    detail = _error_envelope(status_code=error.status_code, detail=error.detail)["error"][
+                        "message"
+                    ]
                     code = "session_forbidden" if error.status_code == 403 else "session_init_failed"
                     if not await _safe_send_json({"type": "error", "code": code, "detail": detail}):
                         break
@@ -3903,8 +3690,6 @@ async def agent_ws(
                     {
                         "type": "session_ready",
                         "session_id": active_session_id,
-                        "cursor": prepared.message_cursor,
-                        "history_delta": [message.model_dump() for message in prepared.messages_delta],
                     }
                 ):
                     break
@@ -3924,8 +3709,6 @@ async def agent_ws(
                     correlation_id=ws_correlation_id,
                     ws_init=True,
                     message_count=len(prepared.messages),
-                    delta_count=len(prepared.messages_delta),
-                    cursor=prepared.message_cursor,
                     entry_mode=latest_entry_context.entry_mode,
                     trigger_type=latest_entry_context.trigger_type or "",
                 )

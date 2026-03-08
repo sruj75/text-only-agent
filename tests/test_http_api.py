@@ -59,18 +59,18 @@ def test_runtime_validation_allows_local_fallback(monkeypatch):
     ]
 
 
-def test_bootstrap_creates_daily_session_and_reuses_it(app_client):
+def test_session_open_creates_daily_session_and_reuses_it(app_client):
     client = app_client["client"]
     timezone_name = "Asia/Kolkata"
     date_key = datetime.now(ZoneInfo(timezone_name)).strftime("%Y-%m-%d")
 
     first = client.post(
-        "/agent/bootstrap-device",
-        json={"device_id": "device-alpha", "timezone": timezone_name},
+        "/agent/session/open",
+        json={"device_id": "device-alpha", "timezone": timezone_name, "source": "manual"},
     )
     second = client.post(
-        "/agent/bootstrap-device",
-        json={"device_id": "device-alpha", "timezone": timezone_name},
+        "/agent/session/open",
+        json={"device_id": "device-alpha", "timezone": timezone_name, "source": "manual"},
     )
 
     assert first.status_code == 200
@@ -80,16 +80,15 @@ def test_bootstrap_creates_daily_session_and_reuses_it(app_client):
 
     assert first_payload["session_id"] == f"session_device-alpha_{date_key}"
     assert second_payload["session_id"] == first_payload["session_id"]
-    assert len(first_payload["threads"]) == 1
     assert first_payload["messages"] == []
     assert first_payload["needs_onboarding"] is True
 
 
-def test_bootstrap_accepts_explicit_session_id(app_client):
+def test_session_open_accepts_explicit_session_id(app_client):
     client = app_client["client"]
 
     response = client.post(
-        "/agent/bootstrap-device",
+        "/agent/session/open",
         json={
             "device_id": "device-beta",
             "timezone": "UTC",
@@ -102,6 +101,7 @@ def test_bootstrap_accepts_explicit_session_id(app_client):
                 "calendar_event_id": None,
                 "entry_mode": "proactive",
             },
+            "source": "push",
         },
     )
 
@@ -110,148 +110,64 @@ def test_bootstrap_accepts_explicit_session_id(app_client):
     assert payload["session_id"] == "session_device-beta_custom_1"
 
 
-def test_bootstrap_preserves_proactive_thread_titles(app_client):
-    client = app_client["client"]
-    repository = app_client["repository"]
-
-    proactive_session_id = "session_device-proactive_proactive_event-1"
-    repository.sessions[proactive_session_id] = main.SessionRecord(
-        session_id=proactive_session_id,
-        user_id="device-proactive",
-        date="2026-03-06",
-        state={
-            "title": "Good morning",
-            "thread_type": "proactive",
-            "entry_context": {
-                "source": "push",
-                "event_id": "event-1",
-                "trigger_type": "morning_wake",
-                "scheduled_time": "2026-03-06T01:30:00Z",
-                "calendar_event_id": None,
-                "entry_mode": "proactive",
-            },
-        },
-    )
-
-    response = client.post(
-        "/agent/bootstrap-device",
-        json={
-            "device_id": "device-proactive",
-            "timezone": "UTC",
-            "session_id": proactive_session_id,
-            "entry_context": {
-                "source": "push",
-                "event_id": "event-1",
-                "trigger_type": "morning_wake",
-                "scheduled_time": "2026-03-06T01:30:00Z",
-                "calendar_event_id": None,
-                "entry_mode": "proactive",
-            },
-        },
-    )
-
-    assert response.status_code == 200
-    payload = response.json()
-    thread = next(
-        item for item in payload["threads"] if item["session_id"] == proactive_session_id
-    )
-
-    assert payload["session_id"] == proactive_session_id
-    assert thread["title"] == "Good morning"
-    assert thread["state"]["thread_type"] == "proactive"
-
-
-def test_bootstrap_requires_timezone_when_user_has_none(app_client):
+def test_session_open_requires_timezone_when_user_has_none(app_client):
     client = app_client["client"]
 
     response = client.post(
-        "/agent/bootstrap-device",
-        json={"device_id": "device-no-tz"},
+        "/agent/session/open",
+        json={"device_id": "device-no-tz", "source": "manual"},
     )
 
     assert response.status_code == 400
-    assert "timezone is required" in response.json()["error"]["message"].lower()
+    assert "valid iana timezone is required" in response.json()["error"]["message"].lower()
 
 
-def test_bootstrap_uses_stored_timezone_when_missing_in_request(app_client):
+def test_session_open_uses_stored_timezone_when_missing_in_request(app_client):
     client = app_client["client"]
+    repository = app_client["repository"]
 
     first = client.post(
-        "/agent/bootstrap-device",
-        json={"device_id": "device-stored-tz", "timezone": "Asia/Kolkata"},
+        "/agent/session/open",
+        json={"device_id": "device-stored-tz", "timezone": "Asia/Kolkata", "source": "manual"},
     )
     assert first.status_code == 200
 
     second = client.post(
-        "/agent/bootstrap-device",
-        json={"device_id": "device-stored-tz"},
+        "/agent/session/open",
+        json={"device_id": "device-stored-tz", "source": "manual"},
     )
     assert second.status_code == 200
-    assert second.json()["timezone"] == "Asia/Kolkata"
+    assert repository.users["device-stored-tz"]["timezone"] == "Asia/Kolkata"
 
 
-def test_bootstrap_rejects_foreign_session_id(app_client):
+def test_session_open_rejects_foreign_session_id(app_client):
     client = app_client["client"]
     repository = app_client["repository"]
 
     first = client.post(
-        "/agent/bootstrap-device",
+        "/agent/session/open",
         json={
             "device_id": "device-owner",
             "timezone": "UTC",
             "session_id": "session_shared_forbidden",
+            "source": "manual",
         },
     )
     assert first.status_code == 200
 
     second = client.post(
-        "/agent/bootstrap-device",
+        "/agent/session/open",
         json={
             "device_id": "device-attacker",
             "timezone": "UTC",
             "session_id": "session_shared_forbidden",
+            "source": "manual",
         },
     )
 
     assert second.status_code == 403
     assert second.json()["error"]["message"] == "Session does not belong to device"
     assert repository.sessions["session_shared_forbidden"].user_id == "device-owner"
-
-
-def test_thread_creation_and_listing(app_client):
-    client = app_client["client"]
-
-    bootstrap = client.post(
-        "/agent/bootstrap-device",
-        json={"device_id": "device-gamma", "timezone": "UTC"},
-    )
-    assert bootstrap.status_code == 200
-
-    created = client.post(
-        "/agent/threads",
-        json={"device_id": "device-gamma", "timezone": "UTC", "title": "Sprint"},
-    )
-    assert created.status_code == 200
-    created_payload = created.json()["thread"]
-
-    listed = client.get("/agent/threads", params={"device_id": "device-gamma"})
-    assert listed.status_code == 200
-    session_ids = [thread["session_id"] for thread in listed.json()["threads"]]
-
-    assert created_payload["session_id"] in session_ids
-    assert any(thread["title"] == "Sprint" for thread in listed.json()["threads"])
-
-
-def test_get_thread_messages_returns_404_for_unknown_thread(app_client):
-    client = app_client["client"]
-
-    response = client.get(
-        "/agent/threads/unknown/messages",
-        params={"device_id": "device-missing"},
-    )
-
-    assert response.status_code == 404
-    assert response.json()["error"]["message"] == "Thread not found"
 
 
 def test_agent_run_uses_real_context(app_client):
@@ -289,7 +205,7 @@ def test_agent_run_returns_503_when_adk_fails(app_client):
     assert "model=fake-adk-model" in response.json()["error"]["message"]
 
 
-def test_session_open_generates_startup_message_with_cursor(app_client):
+def test_session_open_generates_startup_message_with_full_history(app_client):
     client = app_client["client"]
     completed = client.post(
         "/agent/onboarding/complete",
@@ -303,30 +219,21 @@ def test_session_open_generates_startup_message_with_cursor(app_client):
         },
     )
     assert completed.status_code == 200
-    bootstrap = client.post(
-        "/agent/bootstrap-device",
-        json={"device_id": "device-session-open", "timezone": "UTC"},
-    )
-    assert bootstrap.status_code == 200
-
     opened = client.post(
         "/agent/session/open",
         json={
             "device_id": "device-session-open",
             "timezone": "UTC",
-            "session_id": bootstrap.json()["session_id"],
             "entry_context": {"source": "manual", "entry_mode": "reactive"},
             "source": "manual",
-            "cursor": None,
         },
     )
     assert opened.status_code == 200
     payload = opened.json()
     assert payload["startup_status"] == "succeeded"
-    assert payload["message_cursor"] is not None
-    assert len(payload["messages_delta"]) == 1
-    assert payload["messages_delta"][0]["role"] == "assistant"
-    assert payload["messages_delta"][0]["metadata"]["startup_turn"] is True
+    assert len(payload["messages"]) == 1
+    assert payload["messages"][0]["role"] == "assistant"
+    assert payload["messages"][0]["metadata"]["startup_turn"] is True
 
 
 def test_session_open_is_idempotent_for_same_start_request(app_client):
@@ -343,21 +250,13 @@ def test_session_open_is_idempotent_for_same_start_request(app_client):
         },
     )
     assert completed.status_code == 200
-    bootstrap = client.post(
-        "/agent/bootstrap-device",
-        json={"device_id": "device-session-idempotent", "timezone": "UTC"},
-    )
-    session_id = bootstrap.json()["session_id"]
-
     first = client.post(
         "/agent/session/open",
         json={
             "device_id": "device-session-idempotent",
             "timezone": "UTC",
-            "session_id": session_id,
             "entry_context": {"source": "manual", "entry_mode": "reactive"},
             "source": "manual",
-            "cursor": None,
         },
     )
     assert first.status_code == 200
@@ -367,14 +266,18 @@ def test_session_open_is_idempotent_for_same_start_request(app_client):
         json={
             "device_id": "device-session-idempotent",
             "timezone": "UTC",
-            "session_id": session_id,
+            "session_id": first.json()["session_id"],
             "entry_context": {"source": "manual", "entry_mode": "reactive"},
             "source": "manual",
-            "cursor": first.json()["message_cursor"],
         },
     )
     assert second.status_code == 200
-    assert second.json()["messages_delta"] == []
+    startup_messages = [
+        message
+        for message in second.json()["messages"]
+        if bool((message.get("metadata") or {}).get("startup_turn"))
+    ]
+    assert len(startup_messages) == 1
 
 
 def test_session_open_only_marks_missed_events_when_startup_is_generated(app_client):
@@ -396,22 +299,13 @@ def test_session_open_only_marks_missed_events_when_startup_is_generated(app_cli
     )
     assert completed.status_code == 200
 
-    bootstrap = client.post(
-        "/agent/bootstrap-device",
-        json={"device_id": device_id, "timezone": "UTC"},
-    )
-    assert bootstrap.status_code == 200
-    session_id = bootstrap.json()["session_id"]
-
     first_open = client.post(
         "/agent/session/open",
         json={
             "device_id": device_id,
             "timezone": "UTC",
-            "session_id": session_id,
             "entry_context": {"source": "manual", "entry_mode": "reactive"},
             "source": "manual",
-            "cursor": None,
         },
     )
     assert first_open.status_code == 200
@@ -437,59 +331,28 @@ def test_session_open_only_marks_missed_events_when_startup_is_generated(app_cli
         json={
             "device_id": device_id,
             "timezone": "UTC",
-            "session_id": session_id,
+            "session_id": first_open.json()["session_id"],
             "entry_context": {"source": "manual", "entry_mode": "reactive"},
             "source": "manual",
-            "cursor": first_open.json()["message_cursor"],
         },
     )
     assert second_open.status_code == 200
     assert len(fake_agent.run_calls) == 1
 
-    state = repository.sessions[session_id].state
+    state = repository.sessions[first_open.json()["session_id"]].state
     assert state.get(main.MISSED_REPORTED_STATE_KEY) in (None, [])
 
 
-def test_thread_messages_support_cursor(app_client):
-    client = app_client["client"]
-    bootstrap = client.post(
-        "/agent/bootstrap-device",
-        json={"device_id": "device-thread-cursor", "timezone": "UTC"},
-    )
-    session_id = bootstrap.json()["session_id"]
-
-    opened = client.post(
-        "/agent/session/open",
-        json={
-            "device_id": "device-thread-cursor",
-            "timezone": "UTC",
-            "session_id": session_id,
-            "entry_context": {"source": "manual", "entry_mode": "reactive"},
-            "source": "manual",
-            "cursor": None,
-        },
-    )
-    cursor = opened.json()["message_cursor"]
-
-    delta = client.get(
-        f"/agent/threads/{session_id}/messages",
-        params={"device_id": "device-thread-cursor", "cursor": cursor},
-    )
-    assert delta.status_code == 200
-    payload = delta.json()
-    assert payload["messages"] == []
-
-
-def test_complete_onboarding_updates_user_and_bootstrap_context(app_client):
+def test_complete_onboarding_updates_user_and_session_open_context(app_client):
     client = app_client["client"]
     repository = app_client["repository"]
 
-    bootstrap_before = client.post(
-        "/agent/bootstrap-device",
-        json={"device_id": "device-onboard", "timezone": "Asia/Kolkata"},
+    opened_before = client.post(
+        "/agent/session/open",
+        json={"device_id": "device-onboard", "timezone": "Asia/Kolkata", "source": "manual"},
     )
-    assert bootstrap_before.status_code == 200
-    assert bootstrap_before.json()["needs_onboarding"] is True
+    assert opened_before.status_code == 200
+    assert opened_before.json()["needs_onboarding"] is True
 
     completed = client.post(
         "/agent/onboarding/complete",
@@ -514,50 +377,18 @@ def test_complete_onboarding_updates_user_and_bootstrap_context(app_client):
     assert len(morning_events) == 1
     assert morning_events[0].cron_job_id is not None
 
-    bootstrap_after = client.post(
-        "/agent/bootstrap-device",
-        json={"device_id": "device-onboard", "timezone": "Asia/Kolkata"},
+    opened_after = client.post(
+        "/agent/session/open",
+        json={"device_id": "device-onboard", "timezone": "Asia/Kolkata", "source": "manual"},
     )
-    assert bootstrap_after.status_code == 200
-    after_payload = bootstrap_after.json()
+    assert opened_after.status_code == 200
+    after_payload = opened_after.json()
     assert after_payload["needs_onboarding"] is False
     assert after_payload["profile_context"]["wake_time"] == "07:30"
     assert after_payload["profile_context"]["health_anchors"] == [
         "Breakfast",
         "Medication",
     ]
-
-
-def test_bootstrap_backfills_missing_morning_seed_for_completed_user(app_client):
-    client = app_client["client"]
-    repository = app_client["repository"]
-
-    completed = client.post(
-        "/agent/onboarding/complete",
-        json={
-            "device_id": "device-bootstrap-seed",
-            "timezone": "UTC",
-            "wake_time": "07:30",
-            "bedtime": "23:15",
-            "playbook": "One tiny step first.",
-            "health_anchors": ["Breakfast"],
-        },
-    )
-    assert completed.status_code == 200
-    repository.events.clear()
-
-    bootstrap_after = client.post(
-        "/agent/bootstrap-device",
-        json={"device_id": "device-bootstrap-seed", "timezone": "UTC"},
-    )
-    assert bootstrap_after.status_code == 200
-    seeded_events = [
-        event
-        for event in repository.events.values()
-        if event.user_id == "device-bootstrap-seed" and event.event_type == "morning_wake"
-    ]
-    assert len(seeded_events) == 1
-    assert seeded_events[0].cron_job_id is not None
 
 
 def test_complete_onboarding_succeeds_when_morning_seed_fails(app_client, monkeypatch):

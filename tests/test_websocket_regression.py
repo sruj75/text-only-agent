@@ -1,18 +1,35 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 
 import main
 
 
-def _bootstrap(client, device_id: str = "device-ws"):
-    response = client.post(
-        "/agent/bootstrap-device",
-        json={"device_id": device_id, "timezone": "Asia/Kolkata"},
+def _bootstrap(
+    app_client,
+    *,
+    device_id: str = "device-ws",
+    timezone: str = "Asia/Kolkata",
+    session_id: str | None = None,
+):
+    repository = app_client["repository"]
+    target_session_id = session_id or main._daily_session_id(device_id, timezone)
+    asyncio.run(repository.ensure_user(user_id=device_id, timezone_name=timezone))
+    asyncio.run(
+        main._ensure_session(
+            user_id=device_id,
+            session_id=target_session_id,
+            timezone_name=timezone,
+            entry_context=main.EntryContext(source="manual", entry_mode="reactive"),
+            state_patch={"thread_type": "daily"},
+        )
     )
-    assert response.status_code == 200
-    return response.json()
+    return {
+        "device_id": device_id,
+        "session_id": target_session_id,
+    }
 
 
 def _complete_onboarding(client, *, device_id: str, timezone: str):
@@ -81,14 +98,11 @@ def _init_session(
     ws,
     *,
     session_id: str,
-    cursor: str | None = None,
 ):
     payload = {
         "type": "init",
         "session_id": session_id,
     }
-    if cursor is not None:
-        payload["cursor"] = cursor
     ws.send_json(payload)
     ready = ws.receive_json()
     assert ready["type"] == "session_ready"
@@ -106,19 +120,25 @@ def _open_session(client, *, device_id: str, timezone: str, session_id: str, ent
             "session_id": session_id,
             "entry_context": entry_context,
             "source": entry_context.get("source", "manual"),
-            "cursor": None,
         },
     )
     assert response.status_code == 200
     return response.json()
 
 
+def _list_messages(repository, session_id: str):
+    return [
+        message.model_dump()
+        for message in asyncio.run(repository.list_messages(session_id=session_id))
+    ]
+
+
 def test_ws_requires_init_before_user_message(app_client):
     client = app_client["client"]
-    bootstrap = _bootstrap(client)
+    bootstrap = _bootstrap(app_client)
 
     with client.websocket_connect(
-        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=Asia/Kolkata"
+        f"/agent/ws?device_id={bootstrap['device_id']}&timezone=Asia/Kolkata"
     ) as ws:
         ws.send_json({"type": "user_message", "message_id": "m1", "text": "hello"})
         frame = ws.receive_json()
@@ -131,18 +151,16 @@ def test_ws_init_rejects_foreign_session_id(app_client):
     client = app_client["client"]
     repository = app_client["repository"]
 
-    owner = client.post(
-        "/agent/bootstrap-device",
-        json={
-            "device_id": "ws-owner",
-            "timezone": "UTC",
-            "session_id": "ws_shared_forbidden",
-        },
+    owner = _bootstrap(
+        app_client,
+        device_id="ws-owner",
+        timezone="UTC",
+        session_id="ws_shared_forbidden",
     )
-    assert owner.status_code == 200
+    assert owner["session_id"] == "ws_shared_forbidden"
 
     with client.websocket_connect(
-        "/agent/ws?device_id=ws-attacker&session_id=ws_shared_forbidden&timezone=UTC"
+        "/agent/ws?device_id=ws-attacker&timezone=UTC"
     ) as ws:
         ws.send_json(
             {
@@ -161,7 +179,7 @@ def test_ws_streams_and_persists_messages(app_client):
     client = app_client["client"]
     fake_agent = app_client["agent"]
     _complete_onboarding(client, device_id="device-ws", timezone="Asia/Kolkata")
-    bootstrap = _bootstrap(client)
+    bootstrap = _bootstrap(app_client)
     _open_session(
         client,
         device_id=bootstrap["device_id"],
@@ -178,7 +196,7 @@ def test_ws_streams_and_persists_messages(app_client):
     )
 
     with client.websocket_connect(
-        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=Asia/Kolkata"
+        f"/agent/ws?device_id={bootstrap['device_id']}&timezone=Asia/Kolkata"
     ) as ws:
         _init_session(
             ws,
@@ -194,12 +212,7 @@ def test_ws_streams_and_persists_messages(app_client):
     assert deltas == ["hello", " world"]
     assert done["text"] == "hello world"
 
-    messages = client.get(
-        f"/agent/threads/{bootstrap['session_id']}/messages",
-        params={"device_id": bootstrap["device_id"]},
-    )
-    assert messages.status_code == 200
-    payload = messages.json()["messages"]
+    payload = _list_messages(app_client["repository"], bootstrap["session_id"])
     assert [msg["role"] for msg in payload] == ["assistant", "user", "assistant"]
     assert payload[0]["metadata"]["startup_turn"] is True
     assert payload[2]["content"] == "hello world"
@@ -214,10 +227,10 @@ def test_ws_streams_and_persists_messages(app_client):
 
 def test_ws_blocks_duplicate_message_ids(app_client):
     client = app_client["client"]
-    bootstrap = _bootstrap(client, device_id="device-dup")
+    bootstrap = _bootstrap(app_client, device_id="device-dup")
 
     with client.websocket_connect(
-        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
+        f"/agent/ws?device_id={bootstrap['device_id']}&timezone=UTC"
     ) as ws:
         _init_session(
             ws,
@@ -236,10 +249,10 @@ def test_ws_blocks_duplicate_message_ids(app_client):
 
 def test_ws_handles_back_to_back_user_messages(app_client):
     client = app_client["client"]
-    bootstrap = _bootstrap(client, device_id="device-burst")
+    bootstrap = _bootstrap(app_client, device_id="device-burst")
 
     with client.websocket_connect(
-        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
+        f"/agent/ws?device_id={bootstrap['device_id']}&timezone=UTC"
     ) as ws:
         _init_session(
             ws,
@@ -256,12 +269,7 @@ def test_ws_handles_back_to_back_user_messages(app_client):
     assert error_frames == []
     assert len(done_frames) == 2
 
-    messages = client.get(
-        f"/agent/threads/{bootstrap['session_id']}/messages",
-        params={"device_id": bootstrap["device_id"]},
-    )
-    assert messages.status_code == 200
-    payload = messages.json()["messages"]
+    payload = _list_messages(app_client["repository"], bootstrap["session_id"])
     assert [msg["role"] for msg in payload] == [
         "user",
         "assistant",
@@ -272,10 +280,10 @@ def test_ws_handles_back_to_back_user_messages(app_client):
 
 def test_ws_returns_adk_error_without_followup_assistant_message(app_client):
     client = app_client["client"]
-    bootstrap = _bootstrap(client, device_id="device-error")
+    bootstrap = _bootstrap(app_client, device_id="device-error")
 
     with client.websocket_connect(
-        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
+        f"/agent/ws?device_id={bootstrap['device_id']}&timezone=UTC"
     ) as ws:
         _init_session(
             ws,
@@ -295,19 +303,14 @@ def test_ws_returns_adk_error_without_followup_assistant_message(app_client):
     assert frame["code"] == "adk_error"
     assert "model=fake-adk-model" in frame["detail"]
 
-    messages = client.get(
-        f"/agent/threads/{bootstrap['session_id']}/messages",
-        params={"device_id": bootstrap["device_id"]},
-    )
-    assert messages.status_code == 200
-    payload = messages.json()["messages"]
+    payload = _list_messages(app_client["repository"], bootstrap["session_id"])
     assert [msg["role"] for msg in payload] == ["user"]
 
 
 def test_ws_includes_due_diligence_for_post_onboarding(app_client):
     client = app_client["client"]
     fake_agent = app_client["agent"]
-    bootstrap = _bootstrap(client, device_id="device-post-onboarding")
+    bootstrap = _bootstrap(app_client, device_id="device-post-onboarding")
     _open_session(
         client,
         device_id=bootstrap["device_id"],
@@ -321,7 +324,7 @@ def test_ws_includes_due_diligence_for_post_onboarding(app_client):
     )
 
     with client.websocket_connect(
-        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
+        f"/agent/ws?device_id={bootstrap['device_id']}&timezone=UTC"
     ) as ws:
         _init_session(
             ws,
@@ -348,7 +351,7 @@ def test_ws_includes_due_diligence_for_post_onboarding(app_client):
 def test_ws_skips_task_repository_reads_when_task_mgmt_disabled(app_client, monkeypatch):
     client = app_client["client"]
     repository = app_client["repository"]
-    bootstrap = _bootstrap(client, device_id="device-task-flag-off")
+    bootstrap = _bootstrap(app_client, device_id="device-task-flag-off")
     list_task_calls = {"count": 0}
     original_list_tasks = repository.list_tasks
 
@@ -360,7 +363,7 @@ def test_ws_skips_task_repository_reads_when_task_mgmt_disabled(app_client, monk
     repository.list_tasks = tracking_list_tasks  # type: ignore[assignment]
 
     with client.websocket_connect(
-        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
+        f"/agent/ws?device_id={bootstrap['device_id']}&timezone=UTC"
     ) as ws:
         _init_session(
             ws,
@@ -387,9 +390,9 @@ def test_ws_includes_profile_context_from_onboarding(app_client):
     )
     assert completed.status_code == 200
 
-    bootstrap = _bootstrap(client, device_id="device-profile")
+    bootstrap = _bootstrap(app_client, device_id="device-profile")
     with client.websocket_connect(
-        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
+        f"/agent/ws?device_id={bootstrap['device_id']}&timezone=UTC"
     ) as ws:
         _init_session(
             ws,
@@ -415,7 +418,7 @@ def test_session_open_creates_startup_message_for_empty_reactive_thread(app_clie
     client = app_client["client"]
     fake_agent = app_client["agent"]
     _complete_onboarding(client, device_id="device-init-starter", timezone="UTC")
-    bootstrap = _bootstrap(client, device_id="device-init-starter")
+    bootstrap = _bootstrap(app_client, device_id="device-init-starter")
     opened = _open_session(
         client,
         device_id=bootstrap["device_id"],
@@ -425,7 +428,7 @@ def test_session_open_creates_startup_message_for_empty_reactive_thread(app_clie
     )
 
     assert opened["startup_status"] == "succeeded"
-    assert opened["messages_delta"][0]["content"] == "hello world"
+    assert opened["messages"][0]["content"] == "hello world"
     startup_context = fake_agent.run_calls[0]["context"]
     assert startup_context["entry_mode"] == "reactive"
     assert "due_diligence_time" in startup_context
@@ -433,12 +436,7 @@ def test_session_open_creates_startup_message_for_empty_reactive_thread(app_clie
     assert "due_diligence_tasks" in startup_context
     assert fake_agent.run_calls[0]["prompt"].startswith("Conversation bootstrap:")
 
-    messages = client.get(
-        f"/agent/threads/{bootstrap['session_id']}/messages",
-        params={"device_id": bootstrap["device_id"]},
-    )
-    assert messages.status_code == 200
-    payload = messages.json()["messages"]
+    payload = _list_messages(app_client["repository"], bootstrap["session_id"])
     assert [msg["role"] for msg in payload] == ["assistant"]
 
 
@@ -446,7 +444,7 @@ def test_session_open_is_idempotent_when_history_exists(app_client):
     client = app_client["client"]
     fake_agent = app_client["agent"]
     _complete_onboarding(client, device_id="device-repeat-startup", timezone="UTC")
-    bootstrap = _bootstrap(client, device_id="device-repeat-startup")
+    bootstrap = _bootstrap(app_client, device_id="device-repeat-startup")
     first = _open_session(
         client,
         device_id=bootstrap["device_id"],
@@ -457,7 +455,7 @@ def test_session_open_is_idempotent_when_history_exists(app_client):
     assert first["startup_status"] == "succeeded"
 
     with client.websocket_connect(
-        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
+        f"/agent/ws?device_id={bootstrap['device_id']}&timezone=UTC"
     ) as ws:
         _init_session(
             ws,
@@ -474,10 +472,7 @@ def test_session_open_is_idempotent_when_history_exists(app_client):
         entry_context={"source": "manual", "entry_mode": "reactive"},
     )
     assert second["startup_status"] == "succeeded"
-    thread_messages = client.get(
-        f"/agent/threads/{bootstrap['session_id']}/messages",
-        params={"device_id": bootstrap["device_id"]},
-    ).json()["messages"]
+    thread_messages = _list_messages(app_client["repository"], bootstrap["session_id"])
     startup_messages = [
         message
         for message in thread_messages
@@ -487,9 +482,9 @@ def test_session_open_is_idempotent_when_history_exists(app_client):
     assert len(fake_agent.run_calls) == 1
 
 
-def test_ws_init_syncs_history_from_cursor_without_startup_generation(app_client):
+def test_ws_init_acks_session_without_history_sync(app_client):
     client = app_client["client"]
-    bootstrap = _bootstrap(client, device_id="device-cursor-sync")
+    bootstrap = _bootstrap(app_client, device_id="device-cursor-sync")
     opened = _open_session(
         client,
         device_id=bootstrap["device_id"],
@@ -497,23 +492,19 @@ def test_ws_init_syncs_history_from_cursor_without_startup_generation(app_client
         session_id=bootstrap["session_id"],
         entry_context={"source": "manual", "entry_mode": "reactive"},
     )
-    cursor = opened["message_cursor"]
-
     with client.websocket_connect(
-        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
+        f"/agent/ws?device_id={bootstrap['device_id']}&timezone=UTC"
     ) as ws:
         ws.send_json(
             {
                 "type": "init",
                 "session_id": bootstrap["session_id"],
-                "cursor": cursor,
             }
         )
         ready = ws.receive_json()
         assert ready["type"] == "session_ready"
-        assert ready["history_delta"] == []
         ws.receive_json()  # task_panel_state
-        ws.send_json({"type": "user_message", "message_id": "m-cursor", "text": "hello"})
+        ws.send_json({"type": "user_message", "message_id": "m-init-ack", "text": "hello"})
         frames = _drain_until_done(ws)
 
     done = [frame for frame in frames if frame.get("type") == "assistant_done"]
@@ -537,7 +528,7 @@ def test_session_open_post_onboarding_handoff_runs_once_per_lifetime(app_client)
         },
     )
     assert completed.status_code == 200
-    bootstrap = _bootstrap(client, device_id=device_id)
+    bootstrap = _bootstrap(app_client, device_id=device_id)
     daily_session_id = bootstrap["session_id"]
 
     _open_session(
@@ -553,12 +544,7 @@ def test_session_open_post_onboarding_handoff_runs_once_per_lifetime(app_client)
     )
     assert fake_agent.run_calls[0]["context"]["trigger_type"] == "post_onboarding"
 
-    created = client.post(
-        "/agent/threads",
-        json={"device_id": device_id, "timezone": "UTC", "title": "Second thread"},
-    )
-    assert created.status_code == 200
-    second_session_id = created.json()["thread"]["session_id"]
+    second_session_id = "session_device-post-onboarding-once_secondary"
 
     _open_session(
         client,
@@ -581,7 +567,7 @@ def test_session_open_proactive_ack_tracks_only_current_event_and_surfaces_misse
     repository = app_client["repository"]
     fake_agent = app_client["agent"]
     _complete_onboarding(client, device_id="device-missed-ack", timezone="UTC")
-    bootstrap = _bootstrap(client, device_id="device-missed-ack")
+    bootstrap = _bootstrap(app_client, device_id="device-missed-ack")
     session_id = bootstrap["session_id"]
     device_id = bootstrap["device_id"]
 
@@ -634,7 +620,7 @@ def test_session_open_missed_proactive_is_reported_once_and_reactive_open_stays_
     repository = app_client["repository"]
     fake_agent = app_client["agent"]
     _complete_onboarding(client, device_id="device-missed-once", timezone="UTC")
-    bootstrap = _bootstrap(client, device_id="device-missed-once")
+    bootstrap = _bootstrap(app_client, device_id="device-missed-once")
     session_id = bootstrap["session_id"]
     device_id = bootstrap["device_id"]
 

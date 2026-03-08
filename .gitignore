@@ -1,5 +1,6 @@
 # OS / filesystem junk
 .DS_Store
+**/.DS_Store
 Thumbs.db
 Desktop.ini
 

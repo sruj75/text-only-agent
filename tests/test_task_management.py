@@ -74,7 +74,9 @@ def test_task_management_happy_path(app_client):
     assert ranked[1]["priority_rank"] == 2
 
     now = datetime.now(timezone.utc)
-    start = (now + timedelta(hours=1)).replace(microsecond=0)
+    start = (now + timedelta(minutes=10)).replace(second=0, microsecond=0)
+    if start.date() != now.date():
+        start = now.replace(hour=20, minute=0, second=0, microsecond=0)
     end = (start + timedelta(minutes=45)).replace(microsecond=0)
 
     timeboxed = client.post(
@@ -504,12 +506,12 @@ def test_rebuild_keeps_existing_events_when_new_schedule_fails(app_client):
 def test_tool_task_management_invalid_action_fails_fast(app_client):
     client = app_client["client"]
 
-    bootstrap = client.post(
-        "/agent/bootstrap-device",
-        json={"device_id": "device-invalid-action", "timezone": "UTC"},
+    opened = client.post(
+        "/agent/session/open",
+        json={"device_id": "device-invalid-action", "timezone": "UTC", "source": "manual"},
     )
-    assert bootstrap.status_code == 200
-    session_id = bootstrap.json()["session_id"]
+    assert opened.status_code == 200
+    session_id = opened.json()["session_id"]
 
     result = asyncio.run(
         main._tool_task_management(

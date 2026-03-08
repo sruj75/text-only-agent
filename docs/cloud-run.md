@@ -47,7 +47,7 @@ If a secret already exists, add a new version instead:
 
 ## Smoke test checklist
 - `GET /health` returns `status=ok`, `repository_mode=supabase`, and `strict_startup_validation=true`
-- `POST /agent/bootstrap-device` works
+- `POST /agent/session/open` works
 - `POST /agent/onboarding/complete` works
 - `POST /agent/task-management` works
 - WebSocket `/agent/ws` can connect, stream, and reconnect
