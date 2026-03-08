@@ -259,7 +259,7 @@ def test_timebox_must_stay_within_one_local_calendar_day(app_client):
     )
 
     assert response.status_code == 400
-    detail = response.json()["detail"]
+    detail = response.json()["error"]
     assert detail["code"] == "INVALID_PAYLOAD"
     assert "Timebox must stay within one local calendar day" in detail["message"]
 
@@ -377,7 +377,7 @@ def test_get_schedule_rejects_invalid_date_format(app_client):
     )
 
     assert response.status_code == 400
-    assert response.json()["detail"] == "date must be 'today' or YYYY-MM-DD"
+    assert response.json()["error"]["message"] == "date must be 'today' or YYYY-MM-DD"
 
 
 def test_supabase_task_list_paginates_past_500_rows():
@@ -441,8 +441,13 @@ def test_rebuild_keeps_existing_events_when_new_schedule_fails(app_client):
     captured = _capture(client, "device-rebuild-safe", "UTC", ["Task A", "Task B"])
     task_a, task_b = captured["result"]["created_task_ids"]
 
-    now = datetime.now(timezone.utc).replace(microsecond=0)
-    a_start = now + timedelta(hours=1)
+    now = (datetime.now(timezone.utc) + timedelta(days=1)).replace(
+        hour=9,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    a_start = now
     a_end = a_start + timedelta(minutes=30)
 
     first = client.post(

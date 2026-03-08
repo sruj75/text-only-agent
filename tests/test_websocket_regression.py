@@ -80,16 +80,12 @@ def _seed_executed_proactive_event(
 def _init_session(
     ws,
     *,
-    device_id: str,
     session_id: str,
-    entry_context: dict,
     cursor: str | None = None,
 ):
     payload = {
         "type": "init",
-        "device_id": device_id,
         "session_id": session_id,
-        "entry_context": entry_context,
     }
     if cursor is not None:
         payload["cursor"] = cursor
@@ -151,9 +147,7 @@ def test_ws_init_rejects_foreign_session_id(app_client):
         ws.send_json(
             {
                 "type": "init",
-                "device_id": "ws-attacker",
                 "session_id": "ws_shared_forbidden",
-                "entry_context": {"source": "manual", "entry_mode": "reactive"},
             }
         )
         frame = ws.receive_json()
@@ -184,20 +178,11 @@ def test_ws_streams_and_persists_messages(app_client):
     )
 
     with client.websocket_connect(
-        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=Asia/Kolkata&entry_mode=proactive"
+        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=Asia/Kolkata"
     ) as ws:
         _init_session(
             ws,
-            device_id=bootstrap["device_id"],
             session_id=bootstrap["session_id"],
-            entry_context={
-                "source": "push",
-                "event_id": "event-22",
-                "trigger_type": "checkin",
-                "scheduled_time": "2026-03-04T05:30:00Z",
-                "calendar_event_id": None,
-                "entry_mode": "proactive",
-            },
         )
 
         ws.send_json({"type": "user_message", "message_id": "m2", "text": "what now"})
@@ -236,9 +221,7 @@ def test_ws_blocks_duplicate_message_ids(app_client):
     ) as ws:
         _init_session(
             ws,
-            device_id=bootstrap["device_id"],
             session_id=bootstrap["session_id"],
-            entry_context={"source": "manual", "entry_mode": "reactive"},
         )
 
         ws.send_json({"type": "user_message", "message_id": "m-dup", "text": "hello"})
@@ -260,9 +243,7 @@ def test_ws_handles_back_to_back_user_messages(app_client):
     ) as ws:
         _init_session(
             ws,
-            device_id=bootstrap["device_id"],
             session_id=bootstrap["session_id"],
-            entry_context={"source": "manual", "entry_mode": "reactive"},
         )
 
         ws.send_json({"type": "user_message", "message_id": "m-burst-1", "text": "first"})
@@ -298,9 +279,7 @@ def test_ws_returns_adk_error_without_followup_assistant_message(app_client):
     ) as ws:
         _init_session(
             ws,
-            device_id=bootstrap["device_id"],
             session_id=bootstrap["session_id"],
-            entry_context={"source": "manual", "entry_mode": "reactive"},
         )
 
         ws.send_json(
@@ -329,19 +308,24 @@ def test_ws_includes_due_diligence_for_post_onboarding(app_client):
     client = app_client["client"]
     fake_agent = app_client["agent"]
     bootstrap = _bootstrap(client, device_id="device-post-onboarding")
+    _open_session(
+        client,
+        device_id=bootstrap["device_id"],
+        timezone="UTC",
+        session_id=bootstrap["session_id"],
+        entry_context={
+            "source": "push",
+            "entry_mode": "proactive",
+            "trigger_type": "post_onboarding",
+        },
+    )
 
     with client.websocket_connect(
-        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC&entry_mode=proactive"
+        f"/agent/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
     ) as ws:
         _init_session(
             ws,
-            device_id=bootstrap["device_id"],
             session_id=bootstrap["session_id"],
-            entry_context={
-                "source": "push",
-                "entry_mode": "proactive",
-                "trigger_type": "post_onboarding",
-            },
         )
 
         ws.send_json(
@@ -380,9 +364,7 @@ def test_ws_skips_task_repository_reads_when_task_mgmt_disabled(app_client, monk
     ) as ws:
         _init_session(
             ws,
-            device_id=bootstrap["device_id"],
             session_id=bootstrap["session_id"],
-            entry_context={"source": "manual", "entry_mode": "reactive"},
         )
 
     assert list_task_calls["count"] == 0
@@ -411,9 +393,7 @@ def test_ws_includes_profile_context_from_onboarding(app_client):
     ) as ws:
         _init_session(
             ws,
-            device_id=bootstrap["device_id"],
             session_id=bootstrap["session_id"],
-            entry_context={"source": "manual", "entry_mode": "reactive"},
         )
 
         ws.send_json(
@@ -481,9 +461,7 @@ def test_session_open_is_idempotent_when_history_exists(app_client):
     ) as ws:
         _init_session(
             ws,
-            device_id=bootstrap["device_id"],
             session_id=bootstrap["session_id"],
-            entry_context={"source": "manual", "entry_mode": "reactive"},
         )
         ws.send_json({"type": "user_message", "message_id": "m-repeat", "text": "help me"})
         _drain_until_done(ws)
@@ -527,9 +505,7 @@ def test_ws_init_syncs_history_from_cursor_without_startup_generation(app_client
         ws.send_json(
             {
                 "type": "init",
-                "device_id": bootstrap["device_id"],
                 "session_id": bootstrap["session_id"],
-                "entry_context": {"source": "manual", "entry_mode": "reactive"},
                 "cursor": cursor,
             }
         )

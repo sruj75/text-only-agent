@@ -2,13 +2,15 @@ import logging
 import os
 import json
 from contextlib import aclosing
-from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Literal, Tuple
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Tuple
 
 from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.adk.tools import FunctionTool, ToolContext
 from google.genai import types
+
+from startup_agent.task_actions import TASK_WRITE_ACTIONS, TaskManagementAction
 
 
 logger = logging.getLogger(__name__)
@@ -56,14 +58,6 @@ Reminder policy:
 """
 
 GetCurrentTimeToolHandler = Callable[[str | None, Dict[str, str]], Awaitable[Dict[str, Any]]]
-TaskManagementAction = Literal[
-    "capture_tasks",
-    "timebox_task",
-    "set_top_essentials",
-    "update_task_status",
-    "get_tasks",
-    "get_schedule",
-]
 TaskManagementToolHandler = Callable[
     [TaskManagementAction, Dict[str, Any], str | None, str | None, Dict[str, str]],
     Awaitable[Dict[str, Any]],
@@ -183,7 +177,7 @@ class SimpleADK:
         if (
             context_key
             and output.get("ok") is True
-            and action in {"capture_tasks", "set_top_essentials", "timebox_task", "update_task_status"}
+            and action in TASK_WRITE_ACTIONS
         ):
             self._task_write_counts[context_key] = self._task_write_counts.get(context_key, 0) + 1
         return output

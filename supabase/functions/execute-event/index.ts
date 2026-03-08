@@ -274,15 +274,341 @@ async function ensureProactiveSession(
   return true;
 }
 
+type ResolvedEventContext = {
+  event: EventRow;
+  eventId: string;
+  eventType: string;
+  eventUserId: string;
+  eventPayload: Record<string, unknown>;
+  calendarTimezone: string | null;
+  sessionTimezone: string | null;
+  sessionId: string;
+  triggerType: string;
+  calendarEventId: string | null;
+  title: string;
+  body: string;
+  notificationData: Record<string, unknown>;
+  attemptedAt: string;
+  nextAttemptCount: number;
+};
+
+type DeliveryAttemptResult = {
+  pushSent: boolean;
+  sessionReady: boolean;
+  deliverySucceeded: boolean;
+  lastError: string | null;
+  nextMorningWake: { ok: boolean; detail?: unknown; error?: string } | null;
+  continuationFailed: boolean;
+};
+
+const JSON_HEADERS = { "Content-Type": "application/json" };
+
+function jsonResponse(payload: Record<string, unknown>, status = 200): Response {
+  return new Response(JSON.stringify(payload), { status, headers: JSON_HEADERS });
+}
+
+async function resolveEventContext(
+  supabase: ReturnType<typeof createClient>,
+  event: EventRow,
+  eventId: string,
+  eventUserId: string,
+): Promise<ResolvedEventContext> {
+  const eventType = asString(event.event_type) ?? "checkin";
+  const rawPayload =
+    event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
+      ? event.payload
+      : {};
+  const eventPayload = { ...rawPayload };
+
+  let calendarTimezone: string | null = null;
+  if (eventType === "calendar_reminder") {
+    calendarTimezone = asString(eventPayload.timezone);
+    if (!calendarTimezone) {
+      const tzResult = await supabase.rpc("get_user_timezone_for_execution", {
+        p_user_id: eventUserId,
+      });
+      if (!tzResult.error) {
+        calendarTimezone = asString(tzResult.data);
+      }
+    }
+    if (calendarTimezone) {
+      eventPayload.timezone = calendarTimezone;
+    }
+  }
+
+  const sessionTimezone = await resolveSessionTimezone(
+    supabase,
+    eventUserId,
+    eventPayload,
+    calendarTimezone,
+  );
+  const reason = asString(eventPayload.reason) ?? "scheduled_checkin";
+  const triggerType = asString(eventPayload.trigger_type) ?? eventType;
+  const calendarEventId = asString(eventPayload.calendar_event_id);
+
+  let title = "Check-in";
+  let body = "You have a scheduled check-in.";
+  if (eventType === "morning_wake") {
+    title = "Good morning";
+    body = "Ready to plan your day?";
+  } else if (eventType === "calendar_reminder") {
+    title = `Upcoming: ${asString(eventPayload.event_title) ?? "Event"}`;
+    body = calendarTimezone
+      ? formatCalendarReminderBody(eventPayload, calendarTimezone)
+      : "Reminder unavailable: missing timezone.";
+  } else if (eventType === "checkin") {
+    body = `It is time for your check-in (${reason}).`;
+  }
+
+  const sessionId = sessionTimezone
+    ? getDailySessionId(eventUserId, sessionTimezone, asString(event.scheduled_time))
+    : "";
+
+  const notificationData: Record<string, unknown> = {
+    session_id: sessionId,
+    type: eventType,
+    trigger_type: triggerType,
+    event_id: eventId,
+    user_id: eventUserId,
+    source: "push",
+    entry_mode: "proactive",
+    scheduled_time: asString(event.scheduled_time),
+  };
+  if (calendarEventId) notificationData.calendar_event_id = calendarEventId;
+
+  const attemptedAt = new Date().toISOString();
+  const existingAttemptCount = Math.max(0, asNumber(event.attempt_count) ?? 0);
+
+  return {
+    event,
+    eventId,
+    eventType,
+    eventUserId,
+    eventPayload,
+    calendarTimezone,
+    sessionTimezone,
+    sessionId,
+    triggerType,
+    calendarEventId,
+    title,
+    body,
+    notificationData,
+    attemptedAt,
+    nextAttemptCount: existingAttemptCount + 1,
+  };
+}
+
+async function attemptDelivery(
+  supabase: ReturnType<typeof createClient>,
+  context: ResolvedEventContext,
+): Promise<DeliveryAttemptResult> {
+  let pushSent = false;
+  let sessionReady = false;
+  if (!context.sessionTimezone || !context.sessionId) {
+    pushSent = false;
+  } else if (!(context.eventType === "calendar_reminder" && !context.calendarTimezone)) {
+    sessionReady = await ensureProactiveSession(supabase, {
+      userId: context.eventUserId,
+      sessionId: context.sessionId,
+      timezoneName: context.sessionTimezone,
+      scheduledTime: asString(context.event.scheduled_time),
+      title: context.title,
+      entryContext: {
+        source: "push",
+        event_id: context.eventId,
+        trigger_type: context.triggerType,
+        scheduled_time: asString(context.event.scheduled_time),
+        calendar_event_id: context.calendarEventId,
+        entry_mode: "proactive",
+      },
+    });
+    if (sessionReady) {
+      pushSent = await sendPushNotification(
+        supabase,
+        context.eventUserId,
+        context.title,
+        context.body,
+        context.notificationData,
+      );
+    }
+  }
+
+  let lastError: string | null = pushSent ? null : "push_failed_or_missing_token";
+  if (!context.sessionTimezone || !context.sessionId) {
+    lastError = "missing_timezone";
+  } else if (!sessionReady) {
+    lastError = "session_persist_failed";
+  } else if (context.eventType === "calendar_reminder" && !context.calendarTimezone) {
+    lastError = "missing_timezone";
+  }
+  const deliverySucceeded = pushSent && !!sessionReady && !!context.sessionTimezone && !!context.sessionId;
+
+  let nextMorningWake: { ok: boolean; detail?: unknown; error?: string } | null = null;
+  let continuationFailed = false;
+  if (context.eventType === "morning_wake") {
+    nextMorningWake = await ensureNextMorningWake(supabase, context.eventId);
+    if (!nextMorningWake.ok) {
+      continuationFailed = true;
+      if (!pushSent) {
+        lastError = "morning_wake_continuation_failed";
+      }
+    }
+  }
+
+  return {
+    pushSent,
+    sessionReady,
+    deliverySucceeded,
+    lastError,
+    nextMorningWake,
+    continuationFailed,
+  };
+}
+
+async function writeAttemptState(
+  supabase: ReturnType<typeof createClient>,
+  {
+    eventId,
+    attemptCount,
+    attemptedAt,
+    lastError,
+    nextRetryAt,
+    workflowState,
+  }: {
+    eventId: string;
+    attemptCount: number;
+    attemptedAt: string;
+    lastError: string | null;
+    nextRetryAt: string | null;
+    workflowState: "succeeded" | "retry_scheduled" | "dead_letter";
+  },
+): Promise<string | null> {
+  const updatePayload: Record<string, unknown> = {
+    attempt_count: attemptCount,
+    last_error: lastError,
+    last_attempt_at: attemptedAt,
+    next_retry_at: nextRetryAt,
+    workflow_state: workflowState,
+    dead_lettered_at: workflowState === "dead_letter" ? new Date().toISOString() : null,
+    updated_at: new Date().toISOString(),
+  };
+  const result = await supabase.from("events").update(updatePayload).eq("id", eventId);
+  return result.error ? result.error.message : null;
+}
+
+async function finalizeAttempt(
+  supabase: ReturnType<typeof createClient>,
+  context: ResolvedEventContext,
+  attempt: DeliveryAttemptResult,
+): Promise<Response> {
+  if (attempt.deliverySucceeded) {
+    const finalize = await supabase.rpc("finalize_event_execution", {
+      p_event_id: context.eventId,
+      p_last_error: attempt.continuationFailed ? "morning_wake_continuation_failed" : null,
+      p_attempted_at: context.attemptedAt,
+      p_executed: true,
+      p_attempt_count: context.nextAttemptCount,
+    });
+    if (finalize.error) {
+      return jsonResponse({ error: `finalize failed: ${finalize.error.message}` }, 500);
+    }
+    await unscheduleIfPresent(supabase, context.event.cron_job_id ?? null);
+    const stateWriteError = await writeAttemptState(supabase, {
+      eventId: context.eventId,
+      attemptCount: context.nextAttemptCount,
+      attemptedAt: context.attemptedAt,
+      lastError: attempt.continuationFailed ? "morning_wake_continuation_failed" : null,
+      nextRetryAt: null,
+      workflowState: "succeeded",
+    });
+    if (stateWriteError) {
+      return jsonResponse({ error: `state update failed: ${stateWriteError}` }, 500);
+    }
+    return jsonResponse({
+      status: "executed",
+      event_id: context.eventId,
+      event_type: context.eventType,
+      push_sent: attempt.pushSent,
+      attempt_count: context.nextAttemptCount,
+      next_morning_wake: attempt.nextMorningWake,
+      continuation_failed: attempt.continuationFailed,
+    });
+  }
+
+  if (context.nextAttemptCount >= MAX_DELIVERY_ATTEMPTS) {
+    const finalize = await supabase.rpc("finalize_event_execution", {
+      p_event_id: context.eventId,
+      p_last_error: attempt.lastError,
+      p_attempted_at: context.attemptedAt,
+      p_executed: false,
+      p_attempt_count: context.nextAttemptCount,
+    });
+    if (finalize.error) {
+      return jsonResponse({ error: `finalize failed: ${finalize.error.message}` }, 500);
+    }
+    await unscheduleIfPresent(supabase, context.event.cron_job_id ?? null);
+    const stateWriteError = await writeAttemptState(supabase, {
+      eventId: context.eventId,
+      attemptCount: context.nextAttemptCount,
+      attemptedAt: context.attemptedAt,
+      lastError: attempt.lastError,
+      nextRetryAt: null,
+      workflowState: "dead_letter",
+    });
+    if (stateWriteError) {
+      return jsonResponse({ error: `state update failed: ${stateWriteError}` }, 500);
+    }
+    return jsonResponse({
+      status: "dead_letter",
+      event_id: context.eventId,
+      event_type: context.eventType,
+      attempt_count: context.nextAttemptCount,
+      last_error: attempt.lastError,
+    });
+  }
+
+  const retryAt = nextRetryRunAtIso(context.nextAttemptCount);
+  const retryError = attempt.lastError || "push_failed_or_missing_token";
+  const retryResult = await supabase.rpc("schedule_event_retry", {
+    p_event_id: context.eventId,
+    p_next_run_at: retryAt,
+    p_timezone: context.sessionTimezone || "UTC",
+    p_last_error: retryError,
+    p_attempted_at: context.attemptedAt,
+  });
+  if (retryResult.error) {
+    return jsonResponse({ error: `retry schedule failed: ${retryResult.error.message}` }, 500);
+  }
+  const stateWriteError = await writeAttemptState(supabase, {
+    eventId: context.eventId,
+    attemptCount: context.nextAttemptCount,
+    attemptedAt: context.attemptedAt,
+    lastError: retryError,
+    nextRetryAt: retryAt,
+    workflowState: "retry_scheduled",
+  });
+  if (stateWriteError) {
+    return jsonResponse({ error: `state update failed: ${stateWriteError}` }, 500);
+  }
+  return jsonResponse(
+    {
+      status: "retry_scheduled",
+      event_id: context.eventId,
+      event_type: context.eventType,
+      attempt_count: context.nextAttemptCount,
+      retry_at: retryAt,
+      last_error: retryError,
+    },
+    202,
+  );
+}
+
 Deno.serve(async (req: Request): Promise<Response> => {
   try {
     const supabaseUrl = Deno.env.get("SUPABASE_URL");
     const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
     if (!supabaseUrl || !serviceRoleKey) {
-      return new Response(
-        JSON.stringify({ error: "Missing Supabase runtime env" }),
-        { status: 500, headers: { "Content-Type": "application/json" } },
-      );
+      return jsonResponse({ error: "Missing Supabase runtime env" }, 500);
     }
 
     const supabase = createClient(supabaseUrl, serviceRoleKey, {
@@ -293,10 +619,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
     const expectedSecret = asString(secretResult.data);
     const providedSecret = asString(req.headers.get("x-scheduler-secret"));
     if (secretResult.error || !expectedSecret || providedSecret !== expectedSecret) {
-      return new Response(
-        JSON.stringify({ error: "Unauthorized" }),
-        { status: 401, headers: { "Content-Type": "application/json" } },
-      );
+      return jsonResponse({ error: "Unauthorized" }, 401);
     }
 
     let payload: Record<string, unknown>;
@@ -304,271 +627,38 @@ Deno.serve(async (req: Request): Promise<Response> => {
       payload = await req.json();
     } catch (error) {
       const message = error instanceof Error ? error.message : "Invalid JSON body";
-      return new Response(
-        JSON.stringify({ error: `Malformed JSON body: ${message}` }),
-        { status: 400, headers: { "Content-Type": "application/json" } },
-      );
+      return jsonResponse({ error: `Malformed JSON body: ${message}` }, 400);
     }
     const eventId = asString(payload?.event_id);
     if (!eventId) {
-      return new Response(
-        JSON.stringify({ error: "event_id is required" }),
-        { status: 400, headers: { "Content-Type": "application/json" } },
-      );
+      return jsonResponse({ error: "event_id is required" }, 400);
     }
 
     const eventResult = await supabase.rpc("get_event_for_execution", { p_event_id: eventId });
     if (eventResult.error) {
-      return new Response(
-        JSON.stringify({ error: `event fetch failed: ${eventResult.error.message}` }),
-        { status: 500, headers: { "Content-Type": "application/json" } },
-      );
+      return jsonResponse({ error: `event fetch failed: ${eventResult.error.message}` }, 500);
     }
 
     const event = eventResult.data as EventRow | null;
     if (!event) {
-      return new Response(
-        JSON.stringify({ error: "Event not found" }),
-        { status: 404, headers: { "Content-Type": "application/json" } },
-      );
+      return jsonResponse({ error: "Event not found" }, 404);
     }
 
     if (event.executed) {
       await unscheduleIfPresent(supabase, event.cron_job_id ?? null);
-      return new Response(
-        JSON.stringify({ status: "already_executed", event_id: eventId }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
+      return jsonResponse({ status: "already_executed", event_id: eventId });
     }
 
-    const eventType = asString(event.event_type) ?? "checkin";
     const eventUserId = asString(event.user_id);
     if (!eventUserId) {
-      return new Response(
-        JSON.stringify({ error: "Event missing user_id" }),
-        { status: 500, headers: { "Content-Type": "application/json" } },
-      );
+      return jsonResponse({ error: "Event missing user_id" }, 500);
     }
 
-    const rawPayload =
-      event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
-        ? event.payload
-        : {};
-    const eventPayload = { ...rawPayload };
-
-    let calendarTimezone: string | null = null;
-    if (eventType === "calendar_reminder") {
-      calendarTimezone = asString(eventPayload.timezone);
-      if (!calendarTimezone) {
-        const tzResult = await supabase.rpc("get_user_timezone_for_execution", {
-          p_user_id: eventUserId,
-        });
-        if (!tzResult.error) {
-          calendarTimezone = asString(tzResult.data);
-        }
-      }
-      if (calendarTimezone) {
-        eventPayload.timezone = calendarTimezone;
-      }
-    }
-
-    const sessionTimezone = await resolveSessionTimezone(
-      supabase,
-      eventUserId,
-      eventPayload,
-      calendarTimezone,
-    );
-    const reason = asString(eventPayload.reason) ?? "scheduled_checkin";
-    const triggerType = asString(eventPayload.trigger_type) ?? eventType;
-    const calendarEventId = asString(eventPayload.calendar_event_id);
-
-    let title = "Check-in";
-    let body = "You have a scheduled check-in.";
-    if (eventType === "morning_wake") {
-      title = "Good morning";
-      body = "Ready to plan your day?";
-    } else if (eventType === "calendar_reminder") {
-      title = `Upcoming: ${asString(eventPayload.event_title) ?? "Event"}`;
-      body = calendarTimezone
-        ? formatCalendarReminderBody(eventPayload, calendarTimezone)
-        : "Reminder unavailable: missing timezone.";
-    } else if (eventType === "checkin") {
-      body = `It is time for your check-in (${reason}).`;
-    }
-
-    const sessionId = sessionTimezone
-      ? getDailySessionId(eventUserId, sessionTimezone, asString(event.scheduled_time))
-      : "";
-
-    const notificationData: Record<string, unknown> = {
-      session_id: sessionId,
-      type: eventType,
-      trigger_type: triggerType,
-      event_id: eventId,
-      user_id: eventUserId,
-      source: "push",
-      entry_mode: "proactive",
-      scheduled_time: asString(event.scheduled_time),
-    };
-    if (calendarEventId) notificationData.calendar_event_id = calendarEventId;
-
-    const attemptedAt = new Date().toISOString();
-    const existingAttemptCount = Math.max(0, asNumber(event.attempt_count) ?? 0);
-    const nextAttemptCount = existingAttemptCount + 1;
-
-    let pushSent = false;
-    let sessionReady = false;
-    if (!sessionTimezone || !sessionId) {
-      pushSent = false;
-    } else if (!(eventType === "calendar_reminder" && !calendarTimezone)) {
-      sessionReady = await ensureProactiveSession(supabase, {
-        userId: eventUserId,
-        sessionId,
-        timezoneName: sessionTimezone,
-        scheduledTime: asString(event.scheduled_time),
-        title,
-        entryContext: {
-          source: "push",
-          event_id: eventId,
-          trigger_type: triggerType,
-          scheduled_time: asString(event.scheduled_time),
-          calendar_event_id: calendarEventId,
-          entry_mode: "proactive",
-        },
-      });
-      if (!sessionReady) {
-        pushSent = false;
-      } else {
-        pushSent = await sendPushNotification(supabase, eventUserId, title, body, notificationData);
-      }
-    }
-
-    let lastError: string | null = pushSent ? null : "push_failed_or_missing_token";
-    if (!sessionTimezone || !sessionId) {
-      lastError = "missing_timezone";
-    } else if (!sessionReady) {
-      lastError = "session_persist_failed";
-    } else if (eventType === "calendar_reminder" && !calendarTimezone) {
-      lastError = "missing_timezone";
-    }
-    let deliverySucceeded = pushSent && !!sessionReady && !!sessionTimezone && !!sessionId;
-
-    let nextMorningWake: { ok: boolean; detail?: unknown; error?: string } | null = null;
-    let continuationFailed = false;
-    if (eventType === "morning_wake") {
-      nextMorningWake = await ensureNextMorningWake(supabase, eventId);
-      if (!nextMorningWake.ok) {
-        continuationFailed = true;
-        if (!pushSent) {
-          lastError = "morning_wake_continuation_failed";
-        }
-      }
-    }
-
-    if (deliverySucceeded) {
-      const finalize = await supabase.rpc("finalize_event_execution", {
-        p_event_id: eventId,
-        p_last_error: continuationFailed ? "morning_wake_continuation_failed" : null,
-        p_attempted_at: attemptedAt,
-        p_executed: true,
-        p_attempt_count: nextAttemptCount,
-      });
-      if (finalize.error) {
-        return new Response(
-          JSON.stringify({ error: `finalize failed: ${finalize.error.message}` }),
-          { status: 500, headers: { "Content-Type": "application/json" } },
-        );
-      }
-      await unscheduleIfPresent(supabase, event.cron_job_id ?? null);
-      await supabase.from("events").update({
-        workflow_state: "succeeded",
-        next_retry_at: null,
-        dead_lettered_at: null,
-        updated_at: new Date().toISOString(),
-      }).eq("id", eventId);
-      return new Response(
-        JSON.stringify({
-          status: "executed",
-          event_id: eventId,
-          event_type: eventType,
-          push_sent: pushSent,
-          attempt_count: nextAttemptCount,
-          next_morning_wake: nextMorningWake,
-          continuation_failed: continuationFailed,
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
-    }
-
-    if (nextAttemptCount >= MAX_DELIVERY_ATTEMPTS) {
-      const finalize = await supabase.rpc("finalize_event_execution", {
-        p_event_id: eventId,
-        p_last_error: lastError,
-        p_attempted_at: attemptedAt,
-        p_executed: false,
-        p_attempt_count: nextAttemptCount,
-      });
-      if (finalize.error) {
-        return new Response(
-          JSON.stringify({ error: `finalize failed: ${finalize.error.message}` }),
-          { status: 500, headers: { "Content-Type": "application/json" } },
-        );
-      }
-      await unscheduleIfPresent(supabase, event.cron_job_id ?? null);
-      await supabase.from("events").update({
-        workflow_state: "dead_letter",
-        dead_lettered_at: new Date().toISOString(),
-        next_retry_at: null,
-        updated_at: new Date().toISOString(),
-      }).eq("id", eventId);
-      return new Response(
-        JSON.stringify({
-          status: "dead_letter",
-          event_id: eventId,
-          event_type: eventType,
-          attempt_count: nextAttemptCount,
-          last_error: lastError,
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
-    }
-
-    const retryAt = nextRetryRunAtIso(nextAttemptCount);
-    const retryTimezone = sessionTimezone || "UTC";
-    const retryResult = await supabase.rpc("schedule_event_retry", {
-      p_event_id: eventId,
-      p_next_run_at: retryAt,
-      p_timezone: retryTimezone,
-      p_last_error: lastError || "push_failed_or_missing_token",
-      p_attempted_at: attemptedAt,
-    });
-    if (retryResult.error) {
-      return new Response(
-        JSON.stringify({ error: `retry schedule failed: ${retryResult.error.message}` }),
-        { status: 500, headers: { "Content-Type": "application/json" } },
-      );
-    }
-    await supabase.from("events").update({
-      workflow_state: "retry_scheduled",
-      next_retry_at: retryAt,
-      updated_at: new Date().toISOString(),
-    }).eq("id", eventId);
-    return new Response(
-      JSON.stringify({
-        status: "retry_scheduled",
-        event_id: eventId,
-        event_type: eventType,
-        attempt_count: nextAttemptCount,
-        retry_at: retryAt,
-        last_error: lastError,
-      }),
-      { status: 202, headers: { "Content-Type": "application/json" } },
-    );
+    const context = await resolveEventContext(supabase, event, eventId, eventUserId);
+    const attempt = await attemptDelivery(supabase, context);
+    return await finalizeAttempt(supabase, context, attempt);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
-    return new Response(
-      JSON.stringify({ error: message }),
-      { status: 500, headers: { "Content-Type": "application/json" } },
-    );
+    return jsonResponse({ error: message }, 500);
   }
 });

@@ -16,8 +16,12 @@ def test_execute_event_records_failure_metadata_in_single_attempt_flow():
 
     assert '"push_failed_or_missing_token"' in source
     assert '"session_persist_failed"' in source
-    assert "p_last_error: lastError" in source
-    assert "p_attempt_count: nextAttemptCount" in source
+    assert "function writeAttemptState" in source
+    assert "attempt_count" in source
+    assert "last_error" in source
+    assert "last_attempt_at" in source
+    assert "next_retry_at" in source
+    assert "workflow_state" in source
 
 
 def test_execute_event_routes_to_daily_thread():
@@ -41,5 +45,13 @@ def test_execute_event_merges_existing_proactive_session_state():
 def test_execute_event_tracks_dead_letter_terminal_state():
     source = Path("supabase/functions/execute-event/index.ts").read_text(encoding="utf-8")
 
-    assert 'workflow_state: "dead_letter"' in source
+    assert 'workflowState: "dead_letter"' in source
     assert 'status: "dead_letter"' in source
+
+
+def test_execute_event_is_split_into_three_internal_steps():
+    source = Path("supabase/functions/execute-event/index.ts").read_text(encoding="utf-8")
+
+    assert "async function resolveEventContext" in source
+    assert "async function attemptDelivery" in source
+    assert "async function finalizeAttempt" in source

@@ -170,7 +170,7 @@ def test_bootstrap_requires_timezone_when_user_has_none(app_client):
     )
 
     assert response.status_code == 400
-    assert "timezone is required" in response.json()["detail"].lower()
+    assert "timezone is required" in response.json()["error"]["message"].lower()
 
 
 def test_bootstrap_uses_stored_timezone_when_missing_in_request(app_client):
@@ -214,7 +214,7 @@ def test_bootstrap_rejects_foreign_session_id(app_client):
     )
 
     assert second.status_code == 403
-    assert second.json()["detail"] == "Session does not belong to device"
+    assert second.json()["error"]["message"] == "Session does not belong to device"
     assert repository.sessions["session_shared_forbidden"].user_id == "device-owner"
 
 
@@ -251,7 +251,7 @@ def test_get_thread_messages_returns_404_for_unknown_thread(app_client):
     )
 
     assert response.status_code == 404
-    assert response.json()["detail"] == "Thread not found"
+    assert response.json()["error"]["message"] == "Thread not found"
 
 
 def test_agent_run_uses_real_context(app_client):
@@ -285,8 +285,8 @@ def test_agent_run_returns_503_when_adk_fails(app_client):
     )
 
     assert response.status_code == 503
-    assert "Google ADK unavailable" in response.json()["detail"]
-    assert "model=fake-adk-model" in response.json()["detail"]
+    assert "Google ADK unavailable" in response.json()["error"]["message"]
+    assert "model=fake-adk-model" in response.json()["error"]["message"]
 
 
 def test_session_open_generates_startup_message_with_cursor(app_client):
@@ -675,4 +675,4 @@ def test_complete_onboarding_validates_required_fields(app_client):
     )
 
     assert response.status_code == 400
-    assert "wake_time must be HH:MM" in response.json()["detail"]
+    assert "wake_time must be HH:MM" in response.json()["error"]["message"]
