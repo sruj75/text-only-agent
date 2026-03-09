@@ -309,6 +309,50 @@ def test_idle_task_panel_state_omits_placeholder_headline():
     assert snapshot["active_action"] is None
 
 
+def test_task_panel_now_is_strictly_time_derived(monkeypatch):
+    task_state = main.TaskStateV1(
+        date="2026-03-04",
+        timezone="UTC",
+        tasks=[
+            main.TaskItem(
+                task_id="task-early",
+                title="Work on FRAU app",
+                timebox=main.TaskTimebox(
+                    start_at="2026-03-04T13:42:00Z",
+                    end_at="2026-03-04T13:45:00Z",
+                ),
+            ),
+            main.TaskItem(
+                task_id="task-late",
+                title="Start working",
+                timebox=main.TaskTimebox(
+                    start_at="2026-03-04T13:45:00Z",
+                    end_at="2026-03-04T14:00:00Z",
+                ),
+            ),
+        ],
+    )
+
+    monkeypatch.setattr(main, "_utc_now", lambda: main._parse_iso("2026-03-04T13:42:30Z"))
+    first = main._build_task_panel_state(task_state=task_state, timezone_name="UTC")
+    first_active = [task["id"] for task in first["tasks"] if task["is_active"]]
+    assert first_active == ["task-early"]
+
+    monkeypatch.setattr(main, "_utc_now", lambda: main._parse_iso("2026-03-04T13:45:00Z"))
+    boundary = main._build_task_panel_state(task_state=task_state, timezone_name="UTC")
+    boundary_active = [task["id"] for task in boundary["tasks"] if task["is_active"]]
+    assert boundary_active == ["task-late"]
+
+    monkeypatch.setattr(main, "_utc_now", lambda: main._parse_iso("2026-03-04T13:40:00Z"))
+    upcoming = main._build_task_panel_state(task_state=task_state, timezone_name="UTC")
+    upcoming_active = [task["id"] for task in upcoming["tasks"] if task["is_active"]]
+    assert upcoming_active == ["task-early"]
+
+    monkeypatch.setattr(main, "_utc_now", lambda: main._parse_iso("2026-03-04T14:05:00Z"))
+    none_active = main._build_task_panel_state(task_state=task_state, timezone_name="UTC")
+    assert [task["id"] for task in none_active["tasks"] if task["is_active"]] == []
+
+
 def test_done_task_unschedules_and_reopen_rebuilds_future_events(app_client):
     client = app_client["client"]
     repository = app_client["repository"]
@@ -436,6 +480,109 @@ def test_supabase_task_list_paginates_past_500_rows():
     assert rows[-1].task_id == "task-500"
 
 
+def test_supabase_morning_wake_continuation_enqueues_cloud_task_when_missing():
+    repository = main.SupabaseRepository(
+        project_url="https://example.supabase.co",
+        service_role_key="service-role-key",
+    )
+    captured: dict[str, str | None] = {"event_id": None, "run_at": None, "timezone_name": None}
+    updated: dict[str, str | None] = {"event_id": None, "cloud_task_name": None}
+
+    async def fake_rpc(name: str, payload: dict):
+        assert name == "ensure_next_morning_wake_event"
+        assert payload == {"p_event_id": "event-current"}
+        return {"status": "ok", "action": "created", "event_id": "event-next"}
+
+    async def fake_get_event_for_execution(event_id: str):
+        assert event_id == "event-next"
+        return main.CheckinEventRecord(
+            id="event-next",
+            user_id="device-next",
+            scheduled_time="2026-03-10T01:00:00Z",
+            event_type="morning_wake",
+            payload={"timezone": "Asia/Kolkata"},
+            executed=False,
+            cloud_task_name=None,
+        )
+
+    async def fake_schedule_event_job(*, event_id: str, run_at: str, timezone_name: str) -> str:
+        captured["event_id"] = event_id
+        captured["run_at"] = run_at
+        captured["timezone_name"] = timezone_name
+        return "projects/p/locations/l/queues/q/tasks/42"
+
+    async def fake_update_event_cloud_task_name(event_id: str, cloud_task_name: str | None) -> None:
+        updated["event_id"] = event_id
+        updated["cloud_task_name"] = cloud_task_name
+
+    repository._rpc = fake_rpc  # type: ignore[assignment]
+    repository.get_event_for_execution = fake_get_event_for_execution  # type: ignore[assignment]
+    repository.schedule_event_job = fake_schedule_event_job  # type: ignore[assignment]
+    repository.update_event_cloud_task_name = fake_update_event_cloud_task_name  # type: ignore[assignment]
+
+    try:
+        result = asyncio.run(repository.ensure_next_morning_wake_event("event-current"))
+    finally:
+        asyncio.run(repository.close())
+
+    assert result["status"] == "ok"
+    assert result["event_id"] == "event-next"
+    assert result["cloud_task_name"] == "projects/p/locations/l/queues/q/tasks/42"
+    assert captured == {
+        "event_id": "event-next",
+        "run_at": "2026-03-10T01:00:00Z",
+        "timezone_name": "Asia/Kolkata",
+    }
+    assert updated == {
+        "event_id": "event-next",
+        "cloud_task_name": "projects/p/locations/l/queues/q/tasks/42",
+    }
+
+
+def test_supabase_morning_wake_continuation_reuses_existing_cloud_task():
+    repository = main.SupabaseRepository(
+        project_url="https://example.supabase.co",
+        service_role_key="service-role-key",
+    )
+
+    async def fake_rpc(name: str, payload: dict):
+        assert name == "ensure_next_morning_wake_event"
+        assert payload == {"p_event_id": "event-current"}
+        return {"status": "ok", "action": "rescheduled_existing", "event_id": "event-next"}
+
+    async def fake_get_event_for_execution(event_id: str):
+        assert event_id == "event-next"
+        return main.CheckinEventRecord(
+            id="event-next",
+            user_id="device-next",
+            scheduled_time="2026-03-10T01:00:00Z",
+            event_type="morning_wake",
+            payload={"timezone": "Asia/Kolkata"},
+            executed=False,
+            cloud_task_name="projects/p/locations/l/queues/q/tasks/existing",
+        )
+
+    async def fail_schedule_event_job(*, event_id: str, run_at: str, timezone_name: str) -> str:
+        raise AssertionError("schedule_event_job should not be called when cloud_task_name exists")
+
+    async def fail_update_event_cloud_task_name(event_id: str, cloud_task_name: str | None) -> None:
+        raise AssertionError("update_event_cloud_task_name should not be called when cloud_task_name exists")
+
+    repository._rpc = fake_rpc  # type: ignore[assignment]
+    repository.get_event_for_execution = fake_get_event_for_execution  # type: ignore[assignment]
+    repository.schedule_event_job = fail_schedule_event_job  # type: ignore[assignment]
+    repository.update_event_cloud_task_name = fail_update_event_cloud_task_name  # type: ignore[assignment]
+
+    try:
+        result = asyncio.run(repository.ensure_next_morning_wake_event("event-current"))
+    finally:
+        asyncio.run(repository.close())
+
+    assert result["status"] == "ok"
+    assert result["event_id"] == "event-next"
+    assert result["cloud_task_name"] == "projects/p/locations/l/queues/q/tasks/existing"
+
+
 def test_rebuild_keeps_existing_events_when_new_schedule_fails(app_client):
     client = app_client["client"]
     repository = app_client["repository"]
@@ -508,7 +655,14 @@ def test_tool_task_management_invalid_action_fails_fast(app_client):
 
     opened = client.post(
         "/agent/session/open",
-        json={"device_id": "device-invalid-action", "timezone": "UTC", "source": "manual"},
+        json={
+            "device_id": "device-invalid-action",
+            "timezone": "UTC",
+            "source": "manual",
+            "open_id": "open-invalid-action",
+            "client_version": main.RELEASE_ID,
+            "contract_version": main.CONTRACT_VERSION,
+        },
     )
     assert opened.status_code == 200
     session_id = opened.json()["session_id"]

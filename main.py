@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import asyncio
+import base64
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -121,6 +122,8 @@ def _runtime_config_snapshot() -> Dict[str, Any]:
         "runtime_env": _runtime_env(),
         "cloud_run_service": os.getenv("K_SERVICE", ""),
         "strict_startup_validation": _strict_startup_validation_enabled(),
+        "release_id": RELEASE_ID,
+        "contract_version": CONTRACT_VERSION,
         "missing_required_env_vars": missing,
     }
 
@@ -159,6 +162,13 @@ TASK_TOOL_CALLING_V1_ENABLED = os.getenv("TASK_TOOL_CALLING_V1", "true").lower()
     "yes",
     "on",
 }
+CONTRACT_VERSION = "2026-03-09"
+RELEASE_ID = (os.getenv("K_REVISION") or "dev-local").strip() or "dev-local"
+SCHEDULER_SECRET_HEADER = "x-scheduler-secret"
+EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
+MAX_DELIVERY_ATTEMPTS = 4
+RETRY_BASE_SECONDS = 60
+RETRY_MAX_SECONDS = 30 * 60
 
 StartupWorkflowState = Literal[
     "succeeded",
@@ -203,6 +213,43 @@ class PreparedSessionState:
     task_panel_state: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class SessionOpenContract:
+    open_id: str
+    client_version: str
+    contract_version: str
+    contract_match: bool
+
+
+@dataclass(frozen=True)
+class ResolvedEventExecutionContext:
+    event: "CheckinEventRecord"
+    event_id: str
+    event_type: str
+    event_user_id: str
+    event_payload: Dict[str, Any]
+    calendar_timezone: str | None
+    session_timezone: str | None
+    session_id: str
+    trigger_type: str
+    calendar_event_id: str | None
+    title: str
+    body: str
+    notification_data: Dict[str, Any]
+    attempted_at: str
+    next_attempt_count: int
+
+
+@dataclass(frozen=True)
+class DeliveryAttemptResult:
+    push_sent: bool
+    session_ready: bool
+    delivery_succeeded: bool
+    last_error: str | None
+    next_morning_wake: Dict[str, Any] | None
+    continuation_failed: bool
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -239,24 +286,151 @@ def _new_correlation_id() -> str:
     return uuid.uuid4().hex
 
 
+def _new_open_id() -> str:
+    return f"open_{uuid.uuid4().hex}"
+
+
 def _message_cursor_for(message: "MessageRecord") -> str:
     return f"{message.created_at}|{message.id}"
 
 
 def _conversation_start_idempotency_key(
     *,
-    user_id: str,
     session_id: str,
-    entry_context: "EntryContext",
+    open_id: str,
 ) -> str:
-    trigger_type = (entry_context.trigger_type or "").strip() or "reactive_open"
-    scheduled_time = (entry_context.scheduled_time or "").strip() or "na"
-    return f"{user_id}|{session_id}|{trigger_type}|{scheduled_time}"
+    return f"{session_id}|{open_id}"
 
 
 def _startup_message_id_for_key(idempotency_key: str) -> str:
     token = uuid.uuid5(uuid.NAMESPACE_URL, idempotency_key).hex[:24]
     return f"startup_{token}"
+
+
+def _normalize_version_token(raw_value: str | None, fallback: str) -> str:
+    value = str(raw_value or "").strip()
+    return value or fallback
+
+
+def _cloud_tasks_parent_path() -> str:
+    project_id = (
+        os.getenv("CLOUD_TASKS_PROJECT_ID")
+        or os.getenv("GOOGLE_CLOUD_PROJECT")
+        or os.getenv("GCP_PROJECT")
+        or ""
+    ).strip()
+    location = (os.getenv("CLOUD_TASKS_LOCATION") or "").strip()
+    queue = (os.getenv("CLOUD_TASKS_QUEUE") or "").strip()
+    if not project_id or not location or not queue:
+        raise RuntimeError(
+            "Cloud Tasks configuration missing: set CLOUD_TASKS_PROJECT_ID (or GOOGLE_CLOUD_PROJECT), "
+            "CLOUD_TASKS_LOCATION, and CLOUD_TASKS_QUEUE"
+        )
+    return f"projects/{project_id}/locations/{location}/queues/{queue}"
+
+
+def _cloud_tasks_dispatch_url() -> str:
+    direct = (os.getenv("CLOUD_TASKS_DISPATCH_URL") or "").strip()
+    if direct:
+        return direct
+    cloud_run_url = (os.getenv("CLOUD_RUN_URL") or "").strip().rstrip("/")
+    if cloud_run_url:
+        return f"{cloud_run_url}/agent/events/execute"
+    raise RuntimeError("Cloud Tasks dispatch URL missing: set CLOUD_TASKS_DISPATCH_URL or CLOUD_RUN_URL")
+
+
+def _scheduler_shared_secret() -> str:
+    value = str(os.getenv("SCHEDULER_SECRET") or os.getenv("SCHEDULER_EXECUTION_SECRET") or "").strip()
+    if not value:
+        raise RuntimeError("Scheduler secret missing: set SCHEDULER_SECRET")
+    return value
+
+
+async def _cloud_tasks_access_token() -> str:
+    explicit = (os.getenv("CLOUD_TASKS_ACCESS_TOKEN") or "").strip()
+    if explicit:
+        return explicit
+    metadata_url = (
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(
+                metadata_url,
+                headers={"Metadata-Flavor": "Google"},
+            )
+    except Exception as error:
+        raise RuntimeError(f"Unable to fetch Cloud Tasks access token from metadata server: {error}") from error
+    if response.status_code >= 400:
+        raise RuntimeError(f"Metadata token endpoint failed: {response.status_code} {response.text}")
+    try:
+        payload = response.json()
+    except Exception as error:
+        raise RuntimeError(f"Invalid metadata token payload: {error}") from error
+    token = str(payload.get("access_token") or "").strip()
+    if not token:
+        raise RuntimeError("Metadata token payload missing access_token")
+    return token
+
+
+async def _create_cloud_task_for_event(*, event_id: str, run_at: str) -> str:
+    parent = _cloud_tasks_parent_path()
+    dispatch_url = _cloud_tasks_dispatch_url()
+    scheduler_secret = _scheduler_shared_secret()
+    token = await _cloud_tasks_access_token()
+    schedule_time = _iso_from_dt(_parse_iso(run_at))
+    request_body = {
+        "task": {
+            "scheduleTime": schedule_time,
+            "httpRequest": {
+                "httpMethod": "POST",
+                "url": dispatch_url,
+                "headers": {
+                    "Content-Type": "application/json",
+                    SCHEDULER_SECRET_HEADER: scheduler_secret,
+                },
+                "body": base64.b64encode(
+                    json.dumps({"event_id": event_id}, separators=(",", ":")).encode("utf-8")
+                ).decode("ascii"),
+            },
+        }
+    }
+    endpoint = f"https://cloudtasks.googleapis.com/v2/{parent}/tasks"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            endpoint,
+            json=request_body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Cloud Tasks create failed: {response.status_code} {response.text}")
+    try:
+        payload = response.json()
+    except Exception as error:
+        raise RuntimeError(f"Cloud Tasks create returned invalid JSON: {error}") from error
+    task_name = str(payload.get("name") or "").strip()
+    if not task_name:
+        raise RuntimeError("Cloud Tasks create response missing task name")
+    return task_name
+
+
+async def _delete_cloud_task(task_name: str) -> bool:
+    cleaned = str(task_name or "").strip()
+    if not cleaned:
+        return True
+    token = await _cloud_tasks_access_token()
+    endpoint = f"https://cloudtasks.googleapis.com/v2/{cleaned}"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.delete(
+            endpoint,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    if response.status_code in {200, 204, 404}:
+        return True
+    raise RuntimeError(f"Cloud Tasks delete failed: {response.status_code} {response.text}")
 
 
 def _task_error(code: str, message: str, *, status_code: int = 400) -> HTTPException:
@@ -286,6 +460,7 @@ def _error_code_for_status(status_code: int) -> str:
         403: "FORBIDDEN",
         404: "NOT_FOUND",
         409: "CONFLICT",
+        426: "UPGRADE_REQUIRED",
         422: "INVALID_REQUEST",
         500: "INTERNAL_ERROR",
         503: "SERVICE_UNAVAILABLE",
@@ -440,6 +615,9 @@ class SessionOpenRequest(BaseModel):
     session_id: str | None = Field(default=None)
     entry_context: EntryContext | None = Field(default=None)
     source: Literal["manual", "push"] = "manual"
+    open_id: str = Field(..., min_length=1)
+    client_version: str = Field(..., min_length=1)
+    contract_version: str = Field(..., min_length=1)
 
 
 class PushTokenRequest(BaseModel):
@@ -599,6 +777,7 @@ class CheckinEventRecord(BaseModel):
     payload: Dict[str, Any] = Field(default_factory=dict)
     executed: bool = False
     cron_job_id: int | None = None
+    cloud_task_name: str | None = None
     last_error: str | None = None
     last_attempt_at: str | None = None
     next_retry_at: str | None = None
@@ -607,6 +786,10 @@ class CheckinEventRecord(BaseModel):
     attempt_count: int = 0
     created_at: str = Field(default_factory=_iso_now)
     updated_at: str = Field(default_factory=_iso_now)
+
+
+class EventExecuteRequest(BaseModel):
+    event_id: str = Field(..., min_length=1)
 
 
 class InMemoryRepository:
@@ -901,25 +1084,163 @@ class InMemoryRepository:
         )
         self.events[event_id] = updated
 
+    async def update_event_cloud_task_name(self, event_id: str, cloud_task_name: str | None) -> None:
+        existing = self.events.get(event_id)
+        if not existing:
+            return
+        updated = existing.model_copy(
+            update={"cloud_task_name": cloud_task_name, "updated_at": _iso_now()}
+        )
+        self.events[event_id] = updated
+
     async def schedule_event_job(
         self,
         *,
         event_id: str,
         run_at: str,
         timezone_name: str,
-    ) -> int:
+    ) -> str:
         _ = event_id
         _ = run_at
         _ = timezone_name
         self.next_job_id += 1
-        return self.next_job_id
+        return f"projects/local/locations/local/queues/default/tasks/{self.next_job_id}"
 
-    async def unschedule_event_job(self, cron_job_id: int) -> bool:
+    async def unschedule_event_job(self, cron_job_id: int | str) -> bool:
         _ = cron_job_id
         return True
 
     async def delete_event(self, event_id: str) -> None:
         self.events.pop(event_id, None)
+
+    async def get_event_for_execution(self, event_id: str) -> CheckinEventRecord | None:
+        event = self.events.get(event_id)
+        if not event:
+            return None
+        return event.model_copy()
+
+    async def finalize_event_execution(
+        self,
+        *,
+        event_id: str,
+        last_error: str | None,
+        attempted_at: str,
+        executed: bool,
+        attempt_count: int | None = None,
+    ) -> bool:
+        existing = self.events.get(event_id)
+        if not existing:
+            return False
+        next_attempt_count = (
+            int(attempt_count)
+            if attempt_count is not None
+            else int(existing.attempt_count or 0) + 1
+        )
+        self.events[event_id] = existing.model_copy(
+            update={
+                "executed": executed,
+                "last_error": last_error,
+                "last_attempt_at": attempted_at,
+                "attempt_count": next_attempt_count,
+                "updated_at": _iso_now(),
+            }
+        )
+        return True
+
+    async def schedule_event_retry(
+        self,
+        *,
+        event_id: str,
+        next_run_at: str,
+        timezone_name: str,
+        last_error: str,
+        attempted_at: str,
+    ) -> str:
+        existing = self.events.get(event_id)
+        if not existing:
+            raise RuntimeError(f"Event not found: {event_id}")
+        if existing.cloud_task_name:
+            await self.unschedule_event_job(existing.cloud_task_name)
+        task_name = await self.schedule_event_job(
+            event_id=event_id,
+            run_at=next_run_at,
+            timezone_name=timezone_name,
+        )
+        self.events[event_id] = existing.model_copy(
+            update={
+                "executed": False,
+                "scheduled_time": next_run_at,
+                "cron_job_id": None,
+                "cloud_task_name": task_name,
+                "last_error": last_error,
+                "last_attempt_at": attempted_at,
+                "updated_at": _iso_now(),
+            }
+        )
+        return task_name
+
+    async def update_event_execution_state(
+        self,
+        *,
+        event_id: str,
+        attempt_count: int,
+        attempted_at: str,
+        last_error: str | None,
+        next_retry_at: str | None,
+        workflow_state: Literal["succeeded", "retry_scheduled", "dead_letter"],
+    ) -> None:
+        existing = self.events.get(event_id)
+        if not existing:
+            raise RuntimeError(f"Event not found: {event_id}")
+        self.events[event_id] = existing.model_copy(
+            update={
+                "attempt_count": int(attempt_count),
+                "last_attempt_at": attempted_at,
+                "last_error": last_error,
+                "next_retry_at": next_retry_at,
+                "workflow_state": workflow_state,
+                "dead_lettered_at": _iso_now() if workflow_state == "dead_letter" else None,
+                "updated_at": _iso_now(),
+            }
+        )
+
+    async def get_scheduler_secret_for_execution(self) -> str | None:
+        raw = os.getenv("SCHEDULER_SECRET") or os.getenv("SCHEDULER_EXECUTION_SECRET")
+        value = str(raw or "").strip()
+        return value or None
+
+    async def get_user_timezone_for_execution(self, user_id: str) -> str | None:
+        user = self.users.get(user_id)
+        if not isinstance(user, dict):
+            return None
+        timezone_name = _normalize_timezone(str(user.get("timezone") or "").strip())
+        return timezone_name
+
+    async def get_push_token_for_execution(self, user_id: str) -> str | None:
+        token = str(self.push_tokens.get(user_id) or "").strip()
+        return token or None
+
+    async def delete_push_token_for_execution(self, user_id: str) -> bool:
+        self.push_tokens.pop(user_id, None)
+        return True
+
+    async def ensure_next_morning_wake_event(self, event_id: str) -> Dict[str, Any]:
+        event = self.events.get(event_id)
+        if not event:
+            return {"status": "skipped", "reason": "event_not_found"}
+        if event.event_type != "morning_wake":
+            return {"status": "skipped", "reason": "not_morning_wake"}
+        timezone_name = await self.get_user_timezone_for_execution(event.user_id)
+        user = self.users.get(event.user_id, {})
+        wake_time = str(user.get("wake_time") or "").strip()
+        if not timezone_name or not _is_valid_hhmm(wake_time):
+            return {"status": "skipped", "reason": "invalid_user_profile"}
+        seed = await _seed_next_morning_wake_event(
+            user_id=event.user_id,
+            timezone_name=timezone_name,
+            wake_time=wake_time,
+        )
+        return {"status": "ok", "detail": seed}
 
 
 class SupabaseRepository:
@@ -963,6 +1284,65 @@ class SupabaseRepository:
 
     async def _rpc(self, name: str, payload: Dict[str, Any]) -> Any:
         return await self._request("POST", f"rpc/{name}", json_body=payload)
+
+    @staticmethod
+    def _rpc_int(output: Any, key: str) -> int | None:
+        if isinstance(output, int):
+            return output
+        if isinstance(output, float):
+            return int(output)
+        if isinstance(output, str) and output.strip().isdigit():
+            return int(output)
+        if isinstance(output, list) and output:
+            first = output[0]
+            if isinstance(first, dict):
+                value = first.get(key)
+                if isinstance(value, int):
+                    return value
+                if isinstance(value, float):
+                    return int(value)
+        if isinstance(output, dict):
+            value = output.get(key)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+        return None
+
+    @staticmethod
+    def _rpc_bool(output: Any, key: str) -> bool:
+        if isinstance(output, bool):
+            return output
+        if isinstance(output, list) and output:
+            first = output[0]
+            if isinstance(first, dict):
+                value = first.get(key)
+                if isinstance(value, bool):
+                    return value
+        if isinstance(output, dict):
+            value = output.get(key)
+            if isinstance(value, bool):
+                return value
+        return False
+
+    @staticmethod
+    def _rpc_text(output: Any, key: str | None = None) -> str | None:
+        if isinstance(output, str):
+            value = output.strip()
+            return value or None
+        if isinstance(output, list) and output:
+            first = output[0]
+            if isinstance(first, dict) and key:
+                value = str(first.get(key) or "").strip()
+                return value or None
+        if isinstance(output, dict):
+            if key:
+                value = str(output.get(key) or "").strip()
+                return value or None
+            for candidate in output.values():
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+        return None
 
     async def ensure_user(self, user_id: str, timezone_name: str) -> None:
         payload = [{"user_id": user_id, "timezone": timezone_name}]
@@ -1315,7 +1695,11 @@ class SupabaseRepository:
             "executed": "eq.false",
             "scheduled_time": f"gte.{from_time_iso}",
             "payload->>schedule_owner": "eq.task_management",
-                "select": "id,user_id,scheduled_time,event_type,payload,executed,cron_job_id,last_error,last_attempt_at,next_retry_at,dead_lettered_at,workflow_state,attempt_count,created_at,updated_at",
+            "select": (
+                "id,user_id,scheduled_time,event_type,payload,executed,cron_job_id,cloud_task_name,last_error,"
+                "last_attempt_at,next_retry_at,dead_lettered_at,workflow_state,attempt_count,"
+                "created_at,updated_at"
+            ),
             "order": "scheduled_time.asc",
             "limit": "500",
         }
@@ -1340,7 +1724,11 @@ class SupabaseRepository:
             "user_id": f"eq.{user_id}",
             "executed": "eq.false",
             "scheduled_time": f"gte.{from_time_iso}",
-                "select": "id,user_id,scheduled_time,event_type,payload,executed,cron_job_id,last_error,last_attempt_at,next_retry_at,dead_lettered_at,workflow_state,attempt_count,created_at,updated_at",
+            "select": (
+                "id,user_id,scheduled_time,event_type,payload,executed,cron_job_id,cloud_task_name,last_error,"
+                "last_attempt_at,next_retry_at,dead_lettered_at,workflow_state,attempt_count,"
+                "created_at,updated_at"
+            ),
             "order": "scheduled_time.asc",
             "limit": "500",
         }
@@ -1366,7 +1754,7 @@ class SupabaseRepository:
             "user_id": f"eq.{user_id}",
             "scheduled_time": f"gte.{start_time_iso}",
             "and": f"(scheduled_time.lt.{end_time_iso})",
-            "select": "id,user_id,scheduled_time,event_type,payload,executed,cron_job_id,last_error,last_attempt_at,next_retry_at,dead_lettered_at,workflow_state,attempt_count,created_at,updated_at",
+            "select": "id,user_id,scheduled_time,event_type,payload,executed,cron_job_id,cloud_task_name,last_error,last_attempt_at,next_retry_at,dead_lettered_at,workflow_state,attempt_count,created_at,updated_at",
             "order": "scheduled_time.asc",
             "limit": "500",
         }
@@ -1401,58 +1789,30 @@ class SupabaseRepository:
             extra_headers={"Prefer": "return=minimal"},
         )
 
+    async def update_event_cloud_task_name(self, event_id: str, cloud_task_name: str | None) -> None:
+        await self._request(
+            "PATCH",
+            "events",
+            params={"id": f"eq.{event_id}"},
+            json_body={"cloud_task_name": cloud_task_name, "updated_at": _iso_now()},
+            extra_headers={"Prefer": "return=minimal"},
+        )
+
     async def schedule_event_job(
         self,
         *,
         event_id: str,
         run_at: str,
         timezone_name: str,
-    ) -> int:
-        output = await self._rpc(
-            "schedule_event_job",
-            {
-                "p_event_id": event_id,
-                "p_run_at": run_at,
-                "p_timezone": timezone_name,
-            },
-        )
-        if isinstance(output, int):
-            return output
-        if isinstance(output, float):
-            return int(output)
-        if isinstance(output, str) and output.strip().isdigit():
-            return int(output)
-        if isinstance(output, list) and output:
-            first = output[0]
-            if isinstance(first, dict):
-                value = first.get("schedule_event_job")
-                if isinstance(value, int):
-                    return value
-                if isinstance(value, float):
-                    return int(value)
-        if isinstance(output, dict):
-            value = output.get("schedule_event_job")
-            if isinstance(value, int):
-                return value
-            if isinstance(value, float):
-                return int(value)
-        raise RuntimeError(f"Unexpected schedule_event_job response: {output}")
+    ) -> str:
+        _ = timezone_name
+        return await _create_cloud_task_for_event(event_id=event_id, run_at=run_at)
 
-    async def unschedule_event_job(self, cron_job_id: int) -> bool:
-        output = await self._rpc("unschedule_event_job", {"p_job_id": int(cron_job_id)})
-        if isinstance(output, bool):
-            return output
-        if isinstance(output, list) and output:
-            first = output[0]
-            if isinstance(first, dict):
-                value = first.get("unschedule_event_job")
-                if isinstance(value, bool):
-                    return value
-        if isinstance(output, dict):
-            value = output.get("unschedule_event_job")
-            if isinstance(value, bool):
-                return value
-        return False
+    async def unschedule_event_job(self, cron_job_id: int | str) -> bool:
+        task_name = str(cron_job_id or "").strip()
+        if not task_name:
+            return False
+        return await _delete_cloud_task(task_name)
 
     async def delete_event(self, event_id: str) -> None:
         await self._request(
@@ -1461,6 +1821,169 @@ class SupabaseRepository:
             params={"id": f"eq.{event_id}"},
             extra_headers={"Prefer": "return=minimal"},
         )
+
+    async def get_event_for_execution(self, event_id: str) -> CheckinEventRecord | None:
+        output = await self._rpc("get_event_for_execution", {"p_event_id": event_id})
+        row: Dict[str, Any] | None = None
+        if isinstance(output, dict):
+            row = output
+        elif isinstance(output, list) and output and isinstance(output[0], dict):
+            row = output[0]
+        if not row:
+            return None
+        return CheckinEventRecord(**row)
+
+    async def finalize_event_execution(
+        self,
+        *,
+        event_id: str,
+        last_error: str | None,
+        attempted_at: str,
+        executed: bool,
+        attempt_count: int | None = None,
+    ) -> bool:
+        output = await self._rpc(
+            "finalize_event_execution",
+            {
+                "p_event_id": event_id,
+                "p_last_error": last_error,
+                "p_attempted_at": attempted_at,
+                "p_executed": executed,
+                "p_attempt_count": attempt_count,
+            },
+        )
+        return self._rpc_bool(output, "finalize_event_execution")
+
+    async def schedule_event_retry(
+        self,
+        *,
+        event_id: str,
+        next_run_at: str,
+        timezone_name: str,
+        last_error: str,
+        attempted_at: str,
+    ) -> str:
+        existing = await self.get_event_for_execution(event_id)
+        old_task_name = str((existing.cloud_task_name if existing else "") or "").strip()
+        await self._rpc(
+            "schedule_event_retry",
+            {
+                "p_event_id": event_id,
+                "p_next_run_at": next_run_at,
+                "p_timezone": timezone_name,
+                "p_last_error": last_error,
+                "p_attempted_at": attempted_at,
+            },
+        )
+        if old_task_name:
+            await self.unschedule_event_job(old_task_name)
+        new_task_name = await self.schedule_event_job(
+            event_id=event_id,
+            run_at=next_run_at,
+            timezone_name=timezone_name,
+        )
+        await self.update_event_cloud_task_name(event_id, new_task_name)
+        return new_task_name
+
+    async def update_event_execution_state(
+        self,
+        *,
+        event_id: str,
+        attempt_count: int,
+        attempted_at: str,
+        last_error: str | None,
+        next_retry_at: str | None,
+        workflow_state: Literal["succeeded", "retry_scheduled", "dead_letter"],
+    ) -> None:
+        await self._request(
+            "PATCH",
+            "events",
+            params={"id": f"eq.{event_id}"},
+            json_body={
+                "attempt_count": attempt_count,
+                "last_error": last_error,
+                "last_attempt_at": attempted_at,
+                "next_retry_at": next_retry_at,
+                "workflow_state": workflow_state,
+                "dead_lettered_at": _iso_now() if workflow_state == "dead_letter" else None,
+                "updated_at": _iso_now(),
+            },
+            extra_headers={"Prefer": "return=minimal"},
+        )
+
+    async def get_scheduler_secret_for_execution(self) -> str | None:
+        raw = os.getenv("SCHEDULER_SECRET") or os.getenv("SCHEDULER_EXECUTION_SECRET")
+        value = str(raw or "").strip()
+        return value or None
+
+    async def get_user_timezone_for_execution(self, user_id: str) -> str | None:
+        output = await self._rpc("get_user_timezone_for_execution", {"p_user_id": user_id})
+        return self._rpc_text(output)
+
+    async def get_push_token_for_execution(self, user_id: str) -> str | None:
+        output = await self._rpc("get_push_token_for_execution", {"p_user_id": user_id})
+        return self._rpc_text(output)
+
+    async def delete_push_token_for_execution(self, user_id: str) -> bool:
+        output = await self._rpc("delete_push_token_for_execution", {"p_user_id": user_id})
+        return self._rpc_bool(output, "delete_push_token_for_execution")
+
+    async def ensure_next_morning_wake_event(self, event_id: str) -> Dict[str, Any]:
+        output = await self._rpc("ensure_next_morning_wake_event", {"p_event_id": event_id})
+        if isinstance(output, dict):
+            payload = dict(output)
+        elif isinstance(output, list) and output and isinstance(output[0], dict):
+            payload = dict(output[0])
+        else:
+            return {"status": "unknown"}
+
+        status = str(payload.get("status") or "").strip().lower()
+        continuation_event_id = str(payload.get("event_id") or "").strip()
+        if status != "ok" or not continuation_event_id:
+            return payload
+
+        continuation = await self.get_event_for_execution(continuation_event_id)
+        if not continuation:
+            return {
+                **payload,
+                "status": "error",
+                "reason": "continuation_event_missing",
+            }
+        if continuation.cloud_task_name:
+            return {
+                **payload,
+                "cloud_task_name": continuation.cloud_task_name,
+            }
+
+        run_at = str(continuation.scheduled_time or "").strip()
+        if not run_at:
+            return {
+                **payload,
+                "status": "error",
+                "reason": "continuation_schedule_time_missing",
+            }
+        continuation_timezone = _coerce_string(continuation.payload.get("timezone")) or "UTC"
+
+        try:
+            task_name = await self.schedule_event_job(
+                event_id=continuation_event_id,
+                run_at=run_at,
+                timezone_name=continuation_timezone,
+            )
+            await self.update_event_cloud_task_name(continuation_event_id, task_name)
+        except Exception as error:
+            return {
+                **payload,
+                "status": "error",
+                "reason": "continuation_enqueue_failed",
+                "error": str(error),
+            }
+
+        return {
+            **payload,
+            "queued": True,
+            "cloud_task_name": task_name,
+        }
 
 
 def build_repository() -> InMemoryRepository | SupabaseRepository:
@@ -1717,13 +2240,15 @@ async def _validate_scheduler_runtime_dependencies() -> None:
     if not isinstance(repository, SupabaseRepository):
         return
 
-    scheduler_secret_output = await repository._rpc("get_scheduler_secret_for_execution", {})
-    scheduler_secret = scheduler_secret_output if isinstance(scheduler_secret_output, str) else ""
-    if not scheduler_secret.strip():
-        raise RuntimeError("scheduler_secret is missing from Supabase vault")
+    scheduler_secret = await repository.get_scheduler_secret_for_execution()
+    if not str(scheduler_secret or "").strip():
+        raise RuntimeError("SCHEDULER_SECRET is missing from runtime environment")
 
-    # This RPC exists only in the scheduler source-of-truth migration.
-    await repository._rpc("ensure_next_morning_wake_event", {"p_event_id": "__healthcheck__"})
+    _cloud_tasks_parent_path()
+    _cloud_tasks_dispatch_url()
+
+    # RPC exists only in the scheduler source-of-truth migration and validates availability.
+    await repository.ensure_next_morning_wake_event("__healthcheck__")
 
 
 @asynccontextmanager
@@ -1873,13 +2398,20 @@ def _startup_prompt(entry_context: EntryContext) -> str:
     )
 
 
-def _find_startup_message(messages: List[MessageRecord]) -> MessageRecord | None:
+def _find_startup_message(
+    messages: List[MessageRecord],
+    *,
+    open_id: str | None = None,
+) -> MessageRecord | None:
     for message in messages:
         if message.role != "assistant":
             continue
         metadata = message.metadata if isinstance(message.metadata, dict) else {}
-        if bool(metadata.get("startup_turn")):
-            return message
+        if not bool(metadata.get("startup_turn")):
+            continue
+        if open_id is not None and str(metadata.get("startup_open_id") or "").strip() != open_id:
+            continue
+        return message
     return None
 
 
@@ -1949,20 +2481,20 @@ async def _ensure_startup_message_for_session(
     *,
     user_id: str,
     session_id: str,
+    open_id: str,
     timezone_name: str,
     entry_context: EntryContext,
     source: Literal["manual", "push"],
     missed_proactive_events: List[Dict[str, Any]] | None = None,
 ) -> tuple[StartupWorkflowState, str | None, bool]:
     existing_messages = await repository.list_messages(session_id=session_id)
-    startup_message = _find_startup_message(existing_messages)
+    startup_message = _find_startup_message(existing_messages, open_id=open_id)
     if startup_message:
         return "succeeded", startup_message.id, False
 
     idempotency_key = _conversation_start_idempotency_key(
-        user_id=user_id,
         session_id=session_id,
-        entry_context=entry_context,
+        open_id=open_id,
     )
     startup_message_id = _startup_message_id_for_key(idempotency_key)
     generated_at = _iso_now()
@@ -1992,6 +2524,7 @@ async def _ensure_startup_message_for_session(
             metadata={
                 "model": "google-adk",
                 "startup_turn": True,
+                "startup_open_id": open_id,
                 "startup_generation_key": idempotency_key,
                 "entry_context": entry_context.model_dump(),
                 "source": source,
@@ -2014,7 +2547,7 @@ async def _ensure_startup_message_for_session(
             )
 
         refreshed_messages = await repository.list_messages(session_id=session_id)
-        startup_after_insert = _find_startup_message(refreshed_messages)
+        startup_after_insert = _find_startup_message(refreshed_messages, open_id=open_id)
         if not startup_after_insert:
             return "failed", None, False
 
@@ -2026,6 +2559,7 @@ async def _ensure_startup_message_for_session(
             state_patch={
                 "last_message_id": startup_after_insert.id,
                 "last_role": "assistant",
+                "startup_open_id": open_id,
                 "startup_generation_key": idempotency_key,
                 "startup_generated_at": startup_after_insert.created_at,
             },
@@ -2041,6 +2575,28 @@ async def _ensure_startup_message_for_session(
             error=str(error),
         )
         return "failed", None, False
+
+
+def _resolve_session_open_contract(payload: SessionOpenRequest) -> SessionOpenContract:
+    open_id = _normalize_version_token(payload.open_id, _new_open_id())
+    client_version = _normalize_version_token(payload.client_version, "unknown")
+    contract_version = _normalize_version_token(payload.contract_version, CONTRACT_VERSION)
+    contract_match = contract_version == CONTRACT_VERSION
+    return SessionOpenContract(
+        open_id=open_id,
+        client_version=client_version,
+        contract_version=contract_version,
+        contract_match=contract_match,
+    )
+
+
+def _enforce_session_open_contract(contract: SessionOpenContract) -> None:
+    if not contract.contract_match:
+        raise _http_error(
+            409,
+            "CONTRACT_VERSION_MISMATCH",
+            f"client contract {contract.contract_version} does not match server {CONTRACT_VERSION}",
+        )
 
 
 async def _resolve_timezone_for_user(
@@ -2097,7 +2653,7 @@ async def _seed_next_morning_wake_event(
             "seeded": False,
             "reason": "existing_pending_morning_wake",
             "event_id": earliest.id,
-            "cron_job_id": earliest.cron_job_id,
+            "cloud_task_name": earliest.cloud_task_name,
             "scheduled_time": earliest.scheduled_time,
         }
 
@@ -2151,16 +2707,16 @@ async def _seed_next_morning_wake_event(
             "seeded": False,
             "reason": "existing_pending_morning_wake",
             "event_id": matching.id,
-            "cron_job_id": matching.cron_job_id,
+            "cloud_task_name": matching.cloud_task_name,
             "scheduled_time": matching.scheduled_time,
         }
     try:
-        job_id = await repository.schedule_event_job(
+        task_name = await repository.schedule_event_job(
             event_id=created_event.id,
             run_at=created_event.scheduled_time,
             timezone_name=timezone_name,
         )
-        await repository.update_event_cron_job(created_event.id, int(job_id))
+        await repository.update_event_cloud_task_name(created_event.id, task_name)
     except Exception:
         await repository.delete_event(created_event.id)
         raise
@@ -2168,7 +2724,7 @@ async def _seed_next_morning_wake_event(
     return {
         "seeded": True,
         "event_id": created_event.id,
-        "cron_job_id": int(job_id),
+        "cloud_task_name": task_name,
         "scheduled_time": created_event.scheduled_time,
     }
 
@@ -2479,26 +3035,31 @@ def _task_time_label(task: TaskItem, timezone_name: str) -> str | None:
     return f"{start_dt.strftime('%I:%M %p').lstrip('0')} - {end_dt.strftime('%I:%M %p').lstrip('0')}"
 
 
-def _active_task_ids_for_action(
-    *,
-    action: str | None,
-    payload: Dict[str, Any],
-    result: Dict[str, Any] | None,
-) -> set[str]:
-    if not action:
-        return set()
-    if action == "capture_tasks" and isinstance(result, dict):
-        created = result.get("created_task_ids")
-        if isinstance(created, list):
-            return {str(item) for item in created if str(item).strip()}
-    if action in {"timebox_task", "update_task_status"}:
-        task_id = str(payload.get("task_id") or "").strip()
-        return {task_id} if task_id else set()
-    if action == "set_top_essentials":
-        task_ids = payload.get("task_ids")
-        if isinstance(task_ids, list):
-            return {str(item) for item in task_ids if str(item).strip()}
-    return set()
+def _resolve_temporal_focus_task_id(task_state: TaskStateV1) -> str | None:
+    now = _utc_now()
+    scheduled_tasks = [
+        task
+        for task in task_state.tasks
+        if task.timebox and task.status != "done"
+    ]
+    scheduled_tasks.sort(key=lambda task: task.timebox.start_at if task.timebox else "")
+
+    for task in scheduled_tasks:
+        if not task.timebox:
+            continue
+        start_dt = _parse_iso(task.timebox.start_at)
+        end_dt = _parse_iso(task.timebox.end_at)
+        if start_dt <= now < end_dt:
+            return task.task_id
+
+    for task in scheduled_tasks:
+        if not task.timebox:
+            continue
+        start_dt = _parse_iso(task.timebox.start_at)
+        if start_dt > now:
+            return task.task_id
+
+    return None
 
 
 def _build_task_panel_state(
@@ -2511,12 +3072,9 @@ def _build_task_panel_state(
     result: Dict[str, Any] | None = None,
     error_message: str | None = None,
 ) -> Dict[str, Any]:
-    safe_payload = payload or {}
-    active_task_ids = _active_task_ids_for_action(
-        action=action,
-        payload=safe_payload,
-        result=result,
-    )
+    _ = payload
+    _ = result
+    active_task_id = _resolve_temporal_focus_task_id(task_state)
 
     top_essential_tasks = [
         task for task in task_state.tasks if task.is_essential
@@ -2531,7 +3089,7 @@ def _build_task_panel_state(
                 "title": task.title,
                 "status": task.status,
                 "time_label": _task_time_label(task, timezone_name),
-                "is_active": task.task_id in active_task_ids,
+                "is_active": task.task_id == active_task_id,
                 "is_top_essential": task.is_essential,
             }
         )
@@ -2619,7 +3177,7 @@ async def _schedule_task_event(
     )
 
     try:
-        job_id = await repository.schedule_event_job(
+        task_name = await repository.schedule_event_job(
             event_id=event_id,
             run_at=_iso_from_dt(run_at),
             timezone_name=timezone_name,
@@ -2628,7 +3186,7 @@ async def _schedule_task_event(
         await repository.delete_event(event_id)
         raise
 
-    await repository.update_event_cron_job(event_id, int(job_id))
+    await repository.update_event_cloud_task_name(event_id, task_name)
 
     return {
         "event_id": event_id,
@@ -2636,7 +3194,7 @@ async def _schedule_task_event(
         "scheduled_time": _iso_from_dt(run_at),
         "task_id": task.task_id,
         "task_title": task.title,
-        "cron_job_id": int(job_id),
+        "cloud_task_name": task_name,
     }
 
 
@@ -2706,8 +3264,8 @@ async def _remove_task_events_for_task(
         payload = event.payload if isinstance(event.payload, dict) else {}
         if str(payload.get("task_id") or "").strip() != task_id:
             continue
-        if event.cron_job_id is not None:
-            await repository.unschedule_event_job(int(event.cron_job_id))
+        if event.cloud_task_name:
+            await repository.unschedule_event_job(event.cloud_task_name)
         await repository.delete_event(event.id)
 
 
@@ -2815,7 +3373,7 @@ async def _rebuild_task_events_for_date(
                         "scheduled_time": matched.scheduled_time,
                         "task_id": task.task_id,
                         "task_title": task.title,
-                        "cron_job_id": matched.cron_job_id,
+                        "cloud_task_name": matched.cloud_task_name,
                     }
                 )
                 continue
@@ -2837,8 +3395,8 @@ async def _rebuild_task_events_for_date(
             obsolete.append(event)
 
         for event in obsolete:
-            if event.cron_job_id is not None:
-                await repository.unschedule_event_job(int(event.cron_job_id))
+            if event.cloud_task_name:
+                await repository.unschedule_event_job(event.cloud_task_name)
             await repository.delete_event(event.id)
 
         return scheduled
@@ -3099,6 +3657,439 @@ async def _execute_task_management(
     }
 
 
+def _coerce_string(value: Any) -> str | None:
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return cleaned or None
+    return None
+
+
+def _coerce_number(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _local_date_key_at(timezone_name: str, at_iso: str | None = None) -> str:
+    try:
+        zone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        return ""
+    if at_iso:
+        try:
+            reference = _parse_iso(at_iso)
+        except Exception:
+            return ""
+    else:
+        reference = _utc_now()
+    return reference.astimezone(zone).strftime("%Y-%m-%d")
+
+
+def _daily_session_id_at(user_id: str, timezone_name: str, at_iso: str | None = None) -> str:
+    date_key = _local_date_key_at(timezone_name, at_iso)
+    if not date_key:
+        return ""
+    return f"session_{user_id}_{date_key}"
+
+
+def _next_retry_run_at_iso(attempt_count: int) -> str:
+    exponent = max(0, int(attempt_count) - 1)
+    delay_seconds = min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * (2**exponent))
+    return _iso_from_dt(_utc_now() + timedelta(seconds=delay_seconds))
+
+
+def _format_calendar_reminder_body(payload: Dict[str, Any], timezone_name: str) -> str:
+    event_title = _coerce_string(payload.get("event_title")) or "upcoming event"
+    raw_start = _coerce_string(payload.get("event_start_time"))
+    if not raw_start:
+        return f"{event_title} starts soon."
+    try:
+        start_dt = _parse_iso(raw_start)
+    except Exception:
+        return f"{event_title} starts soon."
+    try:
+        local_dt = start_dt.astimezone(ZoneInfo(timezone_name))
+    except ZoneInfoNotFoundError:
+        return f"{event_title} starts soon."
+    return f"{event_title} starts at {local_dt.strftime('%I:%M %p').lstrip('0')}."
+
+
+async def _send_push_notification(
+    *,
+    user_id: str,
+    title: str,
+    body: str,
+    data: Dict[str, Any],
+) -> bool:
+    push_token = await repository.get_push_token_for_execution(user_id)
+    if not push_token:
+        return False
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                EXPO_PUSH_URL,
+                json={
+                    "to": push_token,
+                    "title": title,
+                    "body": body,
+                    "data": data,
+                    "sound": "default",
+                    "priority": "high",
+                },
+                headers={"Content-Type": "application/json"},
+            )
+    except Exception:
+        return False
+
+    if response.status_code >= 400:
+        return False
+
+    try:
+        payload = response.json()
+    except Exception:
+        return False
+
+    raw_items = payload.get("data")
+    if isinstance(raw_items, list):
+        items = raw_items
+    elif isinstance(raw_items, dict):
+        items = [raw_items]
+    else:
+        items = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("status") != "error":
+            continue
+        details = item.get("details") if isinstance(item.get("details"), dict) else {}
+        if details.get("error") == "DeviceNotRegistered":
+            await repository.delete_push_token_for_execution(user_id)
+        return False
+
+    return True
+
+
+async def _unschedule_if_present(task_name: str | None) -> None:
+    if not task_name:
+        return
+    try:
+        await repository.unschedule_event_job(task_name)
+    except Exception:
+        return
+
+
+async def _resolve_session_timezone_for_event(
+    *,
+    user_id: str,
+    payload: Dict[str, Any],
+    calendar_timezone: str | None,
+) -> str | None:
+    if calendar_timezone:
+        return calendar_timezone
+    payload_timezone = _coerce_string(payload.get("timezone"))
+    if payload_timezone:
+        return payload_timezone
+    return await repository.get_user_timezone_for_execution(user_id)
+
+
+async def _ensure_proactive_session_for_event(
+    *,
+    user_id: str,
+    session_id: str,
+    timezone_name: str,
+    scheduled_time: str | None,
+    title: str,
+    entry_context: EntryContext,
+) -> bool:
+    if not session_id:
+        return False
+    try:
+        await repository.ensure_user(user_id=user_id, timezone_name=timezone_name)
+        session_state_patch = {
+            "title": title,
+            "thread_type": "daily",
+            "lifecycle_state": "active",
+        }
+        date_key = _local_date_key_at(timezone_name, scheduled_time)
+        if date_key:
+            session_state_patch["date_key"] = date_key
+        await _ensure_session(
+            user_id=user_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            entry_context=entry_context,
+            state_patch=session_state_patch,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _resolve_event_execution_context(
+    event: CheckinEventRecord,
+) -> ResolvedEventExecutionContext:
+    event_id = _coerce_string(event.id) or ""
+    event_user_id = _coerce_string(event.user_id) or ""
+    event_type = _coerce_string(event.event_type) or "checkin"
+    raw_payload = event.payload if isinstance(event.payload, dict) else {}
+    event_payload: Dict[str, Any] = dict(raw_payload)
+
+    calendar_timezone: str | None = None
+    if event_type == "calendar_reminder":
+        calendar_timezone = _coerce_string(event_payload.get("timezone"))
+        if not calendar_timezone:
+            calendar_timezone = await repository.get_user_timezone_for_execution(event_user_id)
+        if calendar_timezone:
+            event_payload["timezone"] = calendar_timezone
+
+    session_timezone = await _resolve_session_timezone_for_event(
+        user_id=event_user_id,
+        payload=event_payload,
+        calendar_timezone=calendar_timezone,
+    )
+    reason = _coerce_string(event_payload.get("reason")) or "scheduled_checkin"
+    trigger_type = _coerce_string(event_payload.get("trigger_type")) or event_type
+    calendar_event_id = _coerce_string(event_payload.get("calendar_event_id"))
+    scheduled_time = _coerce_string(event.scheduled_time)
+
+    title = "Check-in"
+    body = "You have a scheduled check-in."
+    if event_type == "morning_wake":
+        title = "Good morning"
+        body = "Ready to plan your day?"
+    elif event_type == "calendar_reminder":
+        title = f"Upcoming: {_coerce_string(event_payload.get('event_title')) or 'Event'}"
+        if calendar_timezone:
+            body = _format_calendar_reminder_body(event_payload, calendar_timezone)
+        else:
+            body = "Reminder unavailable: missing timezone."
+    elif event_type == "checkin":
+        body = f"It is time for your check-in ({reason})."
+
+    session_id = (
+        _daily_session_id_at(event_user_id, session_timezone, scheduled_time)
+        if session_timezone
+        else ""
+    )
+    notification_data: Dict[str, Any] = {
+        "session_id": session_id,
+        "type": event_type,
+        "trigger_type": trigger_type,
+        "event_id": event_id,
+        "user_id": event_user_id,
+        "source": "push",
+        "entry_mode": "proactive",
+        "scheduled_time": scheduled_time,
+    }
+    if calendar_event_id:
+        notification_data["calendar_event_id"] = calendar_event_id
+
+    attempted_at = _iso_now()
+    existing_attempt_count = max(0, _coerce_number(event.attempt_count) or 0)
+
+    return ResolvedEventExecutionContext(
+        event=event,
+        event_id=event_id,
+        event_type=event_type,
+        event_user_id=event_user_id,
+        event_payload=event_payload,
+        calendar_timezone=calendar_timezone,
+        session_timezone=session_timezone,
+        session_id=session_id,
+        trigger_type=trigger_type,
+        calendar_event_id=calendar_event_id,
+        title=title,
+        body=body,
+        notification_data=notification_data,
+        attempted_at=attempted_at,
+        next_attempt_count=existing_attempt_count + 1,
+    )
+
+
+async def _attempt_event_delivery(
+    context: ResolvedEventExecutionContext,
+) -> DeliveryAttemptResult:
+    push_sent = False
+    session_ready = False
+    if context.session_timezone and context.session_id:
+        if not (context.event_type == "calendar_reminder" and not context.calendar_timezone):
+            session_ready = await _ensure_proactive_session_for_event(
+                user_id=context.event_user_id,
+                session_id=context.session_id,
+                timezone_name=context.session_timezone,
+                scheduled_time=_coerce_string(context.event.scheduled_time),
+                title=context.title,
+                entry_context=EntryContext(
+                    source="push",
+                    event_id=context.event_id,
+                    trigger_type=context.trigger_type,
+                    scheduled_time=_coerce_string(context.event.scheduled_time),
+                    calendar_event_id=context.calendar_event_id,
+                    entry_mode="proactive",
+                ),
+            )
+            if session_ready:
+                push_sent = await _send_push_notification(
+                    user_id=context.event_user_id,
+                    title=context.title,
+                    body=context.body,
+                    data=context.notification_data,
+                )
+
+    last_error: str | None = None if push_sent else "push_failed_or_missing_token"
+    if not context.session_timezone or not context.session_id:
+        last_error = "missing_timezone"
+    elif not session_ready:
+        last_error = "session_persist_failed"
+    elif context.event_type == "calendar_reminder" and not context.calendar_timezone:
+        last_error = "missing_timezone"
+
+    delivery_succeeded = bool(
+        push_sent and session_ready and context.session_timezone and context.session_id
+    )
+
+    next_morning_wake: Dict[str, Any] | None = None
+    continuation_failed = False
+    if context.event_type == "morning_wake":
+        next_morning_wake = await repository.ensure_next_morning_wake_event(context.event_id)
+        continuation_failed = str(next_morning_wake.get("status") or "").strip().lower() != "ok"
+        if continuation_failed and not push_sent:
+            last_error = "morning_wake_continuation_failed"
+
+    return DeliveryAttemptResult(
+        push_sent=push_sent,
+        session_ready=session_ready,
+        delivery_succeeded=delivery_succeeded,
+        last_error=last_error,
+        next_morning_wake=next_morning_wake,
+        continuation_failed=continuation_failed,
+    )
+
+
+async def _write_event_attempt_state(
+    *,
+    event_id: str,
+    attempt_count: int,
+    attempted_at: str,
+    last_error: str | None,
+    next_retry_at: str | None,
+    workflow_state: Literal["succeeded", "retry_scheduled", "dead_letter"],
+) -> None:
+    await repository.update_event_execution_state(
+        event_id=event_id,
+        attempt_count=attempt_count,
+        attempted_at=attempted_at,
+        last_error=last_error,
+        next_retry_at=next_retry_at,
+        workflow_state=workflow_state,
+    )
+
+
+async def _finalize_event_execution_attempt(
+    context: ResolvedEventExecutionContext,
+    attempt: DeliveryAttemptResult,
+) -> tuple[int, Dict[str, Any]]:
+    if attempt.delivery_succeeded:
+        finalized = await repository.finalize_event_execution(
+            event_id=context.event_id,
+            last_error="morning_wake_continuation_failed" if attempt.continuation_failed else None,
+            attempted_at=context.attempted_at,
+            executed=True,
+            attempt_count=context.next_attempt_count,
+        )
+        if not finalized:
+            raise RuntimeError("finalize_event_execution failed")
+        await _unschedule_if_present(context.event.cloud_task_name)
+        await _write_event_attempt_state(
+            event_id=context.event_id,
+            attempt_count=context.next_attempt_count,
+            attempted_at=context.attempted_at,
+            last_error="morning_wake_continuation_failed" if attempt.continuation_failed else None,
+            next_retry_at=None,
+            workflow_state="succeeded",
+        )
+        return (
+            200,
+            {
+                "status": "executed",
+                "event_id": context.event_id,
+                "event_type": context.event_type,
+                "attempt_count": context.next_attempt_count,
+                "reason": "delivery_completed",
+                "push_sent": attempt.push_sent,
+                "next_morning_wake": attempt.next_morning_wake,
+                "continuation_failed": attempt.continuation_failed,
+            },
+        )
+
+    if context.next_attempt_count >= MAX_DELIVERY_ATTEMPTS:
+        finalized = await repository.finalize_event_execution(
+            event_id=context.event_id,
+            last_error=attempt.last_error,
+            attempted_at=context.attempted_at,
+            executed=False,
+            attempt_count=context.next_attempt_count,
+        )
+        if not finalized:
+            raise RuntimeError("finalize_event_execution failed")
+        await _unschedule_if_present(context.event.cloud_task_name)
+        await _write_event_attempt_state(
+            event_id=context.event_id,
+            attempt_count=context.next_attempt_count,
+            attempted_at=context.attempted_at,
+            last_error=attempt.last_error,
+            next_retry_at=None,
+            workflow_state="dead_letter",
+        )
+        return (
+            200,
+            {
+                "status": "dead_letter",
+                "event_id": context.event_id,
+                "event_type": context.event_type,
+                "attempt_count": context.next_attempt_count,
+                "reason": "max_delivery_attempts_reached",
+                "error": attempt.last_error,
+            },
+        )
+
+    retry_at = _next_retry_run_at_iso(context.next_attempt_count)
+    retry_error = attempt.last_error or "push_failed_or_missing_token"
+    await repository.schedule_event_retry(
+        event_id=context.event_id,
+        next_run_at=retry_at,
+        timezone_name=context.session_timezone or "UTC",
+        last_error=retry_error,
+        attempted_at=context.attempted_at,
+    )
+    await _write_event_attempt_state(
+        event_id=context.event_id,
+        attempt_count=context.next_attempt_count,
+        attempted_at=context.attempted_at,
+        last_error=retry_error,
+        next_retry_at=retry_at,
+        workflow_state="retry_scheduled",
+    )
+    return (
+        202,
+        {
+            "status": "retry_scheduled",
+            "event_id": context.event_id,
+            "event_type": context.event_type,
+            "attempt_count": context.next_attempt_count,
+            "reason": "delivery_failed_retry_scheduled",
+            "retry_at": retry_at,
+            "error": retry_error,
+        },
+    )
+
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
     runtime_config = _runtime_config_snapshot()
@@ -3114,6 +4105,8 @@ def health() -> Dict[str, Any]:
         "runtime_env": runtime_config["runtime_env"],
         "cloud_run_service": runtime_config["cloud_run_service"],
         "strict_startup_validation": runtime_config["strict_startup_validation"],
+        "release_id": RELEASE_ID,
+        "contract_version": CONTRACT_VERSION,
     }
 
 
@@ -3157,6 +4150,8 @@ async def open_session(payload: SessionOpenRequest) -> Dict[str, Any]:
         raise _http_error(400, "INVALID_DEVICE_ID", "device_id is required")
 
     correlation_id = _new_correlation_id()
+    contract = _resolve_session_open_contract(payload)
+    _enforce_session_open_contract(contract)
     timezone_name = await _resolve_timezone_for_user(
         user_id=device_id,
         provided_timezone=payload.timezone,
@@ -3202,6 +4197,7 @@ async def open_session(payload: SessionOpenRequest) -> Dict[str, Any]:
         startup_status, startup_message_id, startup_generated = await _ensure_startup_message_for_session(
             user_id=device_id,
             session_id=session_id,
+            open_id=contract.open_id,
             timezone_name=timezone_name,
             entry_context=entry_context,
             source=payload.source,
@@ -3234,6 +4230,9 @@ async def open_session(payload: SessionOpenRequest) -> Dict[str, Any]:
         session_id=session_id,
         timezone=timezone_name,
         correlation_id=correlation_id,
+        open_id=contract.open_id,
+        client_version=contract.client_version,
+        contract_version=contract.contract_version,
         startup_status=startup_status,
         startup_message_id=startup_message_id,
         startup_generated=startup_generated,
@@ -3249,7 +4248,61 @@ async def open_session(payload: SessionOpenRequest) -> Dict[str, Any]:
         "needs_onboarding": prepared.needs_onboarding,
         "profile_context": prepared.profile_context,
         "task_panel_state": prepared.task_panel_state,
+        "release_id": RELEASE_ID,
+        "contract_version": CONTRACT_VERSION,
     }
+
+
+@app.post("/agent/events/execute")
+async def execute_event(payload: EventExecuteRequest, request: Request) -> JSONResponse:
+    expected_secret = await repository.get_scheduler_secret_for_execution()
+    provided_secret = _coerce_string(request.headers.get(SCHEDULER_SECRET_HEADER))
+    if not expected_secret or provided_secret != expected_secret:
+        raise _http_error(401, "UNAUTHORIZED", "Scheduler authentication failed")
+
+    event_id = payload.event_id.strip()
+    event = await repository.get_event_for_execution(event_id)
+    if not event:
+        raise _http_error(404, "EVENT_NOT_FOUND", "Event not found")
+    if event.executed:
+        await _unschedule_if_present(event.cloud_task_name)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "executed",
+                "event_id": event_id,
+                "reason": "already_executed",
+            },
+        )
+
+    event_user_id = _coerce_string(event.user_id)
+    if not event_user_id:
+        raise _http_error(500, "EVENT_INVALID", "Event missing user_id")
+
+    try:
+        context = await _resolve_event_execution_context(event)
+        attempt = await _attempt_event_delivery(context)
+        status_code, response_payload = await _finalize_event_execution_attempt(context, attempt)
+        _log_event(
+            logging.INFO,
+            "Scheduled event executed",
+            event_id=context.event_id,
+            user_id=context.event_user_id,
+            status=response_payload.get("status"),
+            attempt_count=response_payload.get("attempt_count"),
+            reason=response_payload.get("reason"),
+        )
+        return JSONResponse(status_code=status_code, content=response_payload)
+    except HTTPException:
+        raise
+    except Exception as error:
+        _log_event(
+            logging.ERROR,
+            "Scheduled event execution failed",
+            event_id=event_id,
+            error=str(error),
+        )
+        raise _http_error(500, "EVENT_EXECUTION_FAILED", str(error)) from error
 
 
 @app.post("/agent/push-token")
@@ -3351,7 +4404,7 @@ async def complete_onboarding(payload: OnboardingCompleteRequest) -> Dict[str, A
         session_id=daily_session_id,
         timezone=timezone_name,
         seeded=morning_seed.get("seeded") if morning_seed else None,
-        scheduled=bool(morning_seed.get("cron_job_id")) if morning_seed else None,
+        scheduled=bool(morning_seed.get("cloud_task_name")) if morning_seed else None,
         event_id=morning_seed.get("event_id") if morning_seed else None,
         scheduled_time=morning_seed.get("scheduled_time") if morning_seed else None,
         reason=morning_seed.get("reason") if morning_seed else "seed_failed",

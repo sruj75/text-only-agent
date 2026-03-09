@@ -111,7 +111,15 @@ def _init_session(
     return ready
 
 
-def _open_session(client, *, device_id: str, timezone: str, session_id: str, entry_context: dict):
+def _open_session(
+    client,
+    *,
+    device_id: str,
+    timezone: str,
+    session_id: str,
+    entry_context: dict,
+    open_id: str | None = None,
+):
     response = client.post(
         "/agent/session/open",
         json={
@@ -120,6 +128,9 @@ def _open_session(client, *, device_id: str, timezone: str, session_id: str, ent
             "session_id": session_id,
             "entry_context": entry_context,
             "source": entry_context.get("source", "manual"),
+            "open_id": open_id or f"open-{uuid.uuid4().hex}",
+            "client_version": main.RELEASE_ID,
+            "contract_version": main.CONTRACT_VERSION,
         },
     )
     assert response.status_code == 200
@@ -445,12 +456,14 @@ def test_session_open_is_idempotent_when_history_exists(app_client):
     fake_agent = app_client["agent"]
     _complete_onboarding(client, device_id="device-repeat-startup", timezone="UTC")
     bootstrap = _bootstrap(app_client, device_id="device-repeat-startup")
+    open_id = f"open-{uuid.uuid4().hex}"
     first = _open_session(
         client,
         device_id=bootstrap["device_id"],
         timezone="UTC",
         session_id=bootstrap["session_id"],
         entry_context={"source": "manual", "entry_mode": "reactive"},
+        open_id=open_id,
     )
     assert first["startup_status"] == "succeeded"
 
@@ -470,6 +483,7 @@ def test_session_open_is_idempotent_when_history_exists(app_client):
         timezone="UTC",
         session_id=bootstrap["session_id"],
         entry_context={"source": "manual", "entry_mode": "reactive"},
+        open_id=open_id,
     )
     assert second["startup_status"] == "succeeded"
     thread_messages = _list_messages(app_client["repository"], bootstrap["session_id"])
@@ -623,6 +637,7 @@ def test_session_open_missed_proactive_is_reported_once_and_reactive_open_stays_
     bootstrap = _bootstrap(app_client, device_id="device-missed-once")
     session_id = bootstrap["session_id"]
     device_id = bootstrap["device_id"]
+    open_id = f"open-{uuid.uuid4().hex}"
 
     missed_event_id = f"event-{uuid.uuid4()}"
     now = main._utc_now()
@@ -641,6 +656,7 @@ def test_session_open_missed_proactive_is_reported_once_and_reactive_open_stays_
         timezone="UTC",
         session_id=session_id,
         entry_context={"source": "manual", "entry_mode": "reactive"},
+        open_id=open_id,
     )
     first_startup_context = fake_agent.run_calls[0]["context"]
     assert first_startup_context["entry_mode"] == "reactive"
@@ -653,6 +669,7 @@ def test_session_open_missed_proactive_is_reported_once_and_reactive_open_stays_
         timezone="UTC",
         session_id=session_id,
         entry_context={"source": "manual", "entry_mode": "reactive"},
+        open_id=open_id,
     )
     assert len(fake_agent.run_calls) == 1
     state = repository.sessions[session_id].state

@@ -3,95 +3,56 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def test_session_messages_primary_key_is_scoped_to_session():
-    migration_path = Path("migrations/20260304193000_session_messages.sql")
-    sql = migration_path.read_text(encoding="utf-8").lower()
-
-    assert "primary key (session_id, id)" in sql
+def _baseline_sql() -> str:
+    return Path("migrations/20260309190000_production_baseline.sql").read_text(encoding="utf-8").lower()
 
 
-def test_scheduler_sync_migration_contains_required_rpcs_and_columns():
-    migration_path = Path("migrations/20260304221000_scheduler_source_of_truth_sync.sql")
-    sql = migration_path.read_text(encoding="utf-8").lower()
-
-    assert "add column if not exists last_attempt_at" in sql
-    assert "add column if not exists attempt_count" in sql
-
-    required_functions = [
-        "create or replace function public.schedule_event_job",
-        "create or replace function public.unschedule_event_job",
-        "create or replace function public.get_event_for_execution",
-        "create or replace function public.finalize_event_execution",
-        "create or replace function public.get_scheduler_secret_for_execution",
-        "create or replace function public.get_user_timezone_for_execution",
-        "create or replace function public.get_push_token_for_execution",
-        "create or replace function public.delete_push_token_for_execution",
-        "create or replace function public.ensure_next_morning_wake_event",
-        "create or replace function public.schedule_event_retry",
-    ]
-    for fn in required_functions:
-        assert fn in sql
+def test_only_one_canonical_migration_exists():
+    files = sorted(path.name for path in Path("migrations").glob("*.sql"))
+    assert files == ["20260309190000_production_baseline.sql"]
 
 
-def test_schedule_event_job_uses_pg_cron_and_pg_net():
-    migration_path = Path("migrations/20260304221000_scheduler_source_of_truth_sync.sql")
-    sql = migration_path.read_text(encoding="utf-8").lower()
+def test_baseline_includes_core_tables_and_event_columns():
+    sql = _baseline_sql()
 
-    assert "cron.schedule" in sql
-    assert "net.http_post" in sql
-
-
-def test_task_persistence_migration_creates_tables_and_cleans_session_state():
-    migration_path = Path("migrations/20260307133000_task_persistence_source_of_truth.sql")
-    sql = migration_path.read_text(encoding="utf-8").lower()
-
+    assert "create table if not exists public.users" in sql
+    assert "create table if not exists public.sessions" in sql
+    assert "create table if not exists public.events" in sql
+    assert "create table if not exists public.session_messages" in sql
     assert "create table if not exists public.tasks" in sql
     assert "create table if not exists public.task_events" in sql
-    assert "migrated_from_session_state" in sql
-    assert "state = state - 'task_state_v1' - 'task_state_version'" in sql
+    assert "add column if not exists cloud_task_name" in sql
+    assert "add column if not exists workflow_state" in sql
+    assert "add column if not exists next_retry_at" in sql
+    assert "add column if not exists dead_lettered_at" in sql
 
 
-def test_cloudbuild_runs_all_migrations_before_deploy():
+def test_baseline_has_cloud_tasks_scheduler_functions():
+    sql = _baseline_sql()
+
+    assert "create or replace function public.prevent_session_user_reassignment" in sql
+    assert "create trigger trg_prevent_session_user_reassignment" in sql
+    assert "create or replace function public.schedule_event_job" in sql
+    assert "create or replace function public.unschedule_event_job" in sql
+    assert "create or replace function public.schedule_event_retry" in sql
+    assert "create or replace function public.ensure_next_morning_wake_event" in sql
+    assert "idx_events_cloud_task_name" in sql
+    assert "idx_events_payload_schedule_owner" in sql
+    assert "idx_events_payload_seed_date" in sql
+
+
+def test_baseline_has_no_pg_cron_or_edge_dispatch_dependencies():
+    sql = _baseline_sql()
+
+    assert "cron.schedule" not in sql
+    assert "cron.unschedule" not in sql
+    assert "net.http_post" not in sql
+    assert "/functions/v1/execute-event" not in sql
+
+
+def test_cloudbuild_runs_migrations_before_deploy():
     yaml_text = Path("cloudbuild.yaml").read_text(encoding="utf-8")
 
     assert "for file in migrations/*.sql" in yaml_text
     assert "SUPABASE_DB_URL" in yaml_text
     assert "psql" in yaml_text
-
-
-def test_retry_guard_migration_keeps_schedule_event_retry_signature():
-    sql = Path("migrations/20260308113429_schedule_event_retry_guard.sql").read_text(encoding="utf-8").lower()
-
-    assert "create or replace function public.schedule_event_retry" in sql
-    assert "p_next_run_at timestamptz" in sql
-    assert "p_timezone text" in sql
-
-
-def test_finalize_guard_migration_keeps_attempt_count_signature():
-    sql = Path("migrations/20260308114250_finalize_event_execution_guard.sql").read_text(encoding="utf-8").lower()
-
-    assert "add column if not exists attempt_count integer not null default 0" in sql
-    assert "create or replace function public.finalize_event_execution" in sql
-    assert "p_attempt_count integer default null" in sql
-
-
-def test_drop_finalize_overload_guard_removes_legacy_signature():
-    sql = Path("migrations/20260308114327_drop_old_finalize_overload_guard.sql").read_text(encoding="utf-8").lower()
-
-    assert "drop function if exists public.finalize_event_execution" in sql
-    assert "timestamptz" in sql
-    assert "boolean" in sql
-
-
-def test_gcloudignore_keeps_migrations_in_build_context():
-    ignore_text = Path(".gcloudignore").read_text(encoding="utf-8")
-
-    assert "\nmigrations\n" not in f"\n{ignore_text}\n"
-
-
-def test_hybrid_workflow_migration_adds_event_workflow_columns():
-    sql = Path("migrations/20260309090000_hybrid_durable_workflow.sql").read_text(encoding="utf-8").lower()
-
-    assert "add column if not exists workflow_state text not null default 'requested'" in sql
-    assert "add column if not exists next_retry_at timestamptz" in sql
-    assert "add column if not exists dead_lettered_at timestamptz" in sql
