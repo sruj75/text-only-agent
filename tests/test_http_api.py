@@ -226,6 +226,35 @@ def test_legacy_bootstrap_route_maps_to_session_open(app_client):
     assert isinstance(payload["messages"], list)
 
 
+def test_legacy_bootstrap_infers_post_onboarding_handoff_when_history_missing(app_client):
+    client = app_client["client"]
+    fake_agent = app_client["agent"]
+
+    completed = client.post(
+        "/agent/onboarding/complete",
+        json={
+            "device_id": "device-legacy-post-onboard",
+            "timezone": "UTC",
+            "wake_time": "07:30",
+            "bedtime": "23:15",
+            "playbook": "Help me start with one tiny next action.",
+            "health_anchors": ["Breakfast"],
+        },
+    )
+    assert completed.status_code == 200
+
+    response = client.post(
+        "/agent/bootstrap-device",
+        json={"device_id": "device-legacy-post-onboard", "timezone": "UTC"},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["needs_onboarding"] is False
+    assert payload["messages"][-1]["metadata"]["startup_turn"] is True
+    assert payload["messages"][-1]["metadata"]["entry_context"]["trigger_type"] == "post_onboarding"
+    assert fake_agent.run_calls[-1]["context"]["trigger_type"] == "post_onboarding"
+
+
 def test_execute_event_runs_in_cloud_run_endpoint(app_client, monkeypatch):
     client = app_client["client"]
     repository = app_client["repository"]

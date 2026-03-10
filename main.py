@@ -19,11 +19,13 @@ from pydantic import BaseModel, Field
 
 from startup_agent.adk import SimpleADK
 from startup_agent.task_actions import (
-    TASK_ACTION_LABELS,
-    TASK_MANAGEMENT_ACTIONS,
+    TASK_INTENT_LABELS,
+    TASK_MANAGEMENT_INTENTS,
+    TASK_QUERY_TYPES,
     TASK_STATUS_VALUES,
-    TASK_WRITE_ACTIONS,
-    TaskManagementAction,
+    TASK_WRITE_INTENTS,
+    TaskManagementIntent,
+    TaskQueryType,
 )
 
 
@@ -185,11 +187,15 @@ TaskEventType = Literal[
 ]
 TaskPanelListener = Callable[[Dict[str, Any]], Awaitable[bool]]
 TASK_INTENT_PATTERN = re.compile(
-    r"\b(task|tasks|todo|to-do|priority|priorities|timebox|schedule|plan day|mark done|blocked)\b",
+    r"\b(task|tasks|todo|to-do|priority|priorities|timebox|schedule|reschedule|delete|plan day|mark done|blocked)\b",
     re.IGNORECASE,
 )
 TASK_CLAIM_PATTERN = re.compile(
     r"\b(added|captured|saved|scheduled|timeboxed|prioritized|marked)\b",
+    re.IGNORECASE,
+)
+TASK_SCHEDULE_CLAIM_PATTERN = re.compile(
+    r"\b(scheduled|timeboxed|rescheduled|moved to|set for)\b",
     re.IGNORECASE,
 )
 PROACTIVE_ACK_STATE_KEY = "proactive_ack_event_ids_v1"
@@ -500,10 +506,6 @@ def _task_error_message_from_http_error(error: HTTPException) -> str:
     return "Task action failed"
 
 
-def _normalize_task_action(action: str) -> str:
-    return action.strip()
-
-
 def _timezone_from_user_profile(user_profile: Dict[str, Any] | None) -> str | None:
     if not isinstance(user_profile, dict):
         return None
@@ -646,7 +648,16 @@ class TaskManagementRequest(BaseModel):
     device_id: str
     timezone: str | None = Field(default=None)
     session_id: str | None = Field(default=None)
-    action: TaskManagementAction
+    intent: TaskManagementIntent
+    entities: Dict[str, Any] = Field(default_factory=dict)
+    options: Dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskQueryRequest(BaseModel):
+    device_id: str
+    timezone: str | None = Field(default=None)
+    session_id: str | None = Field(default=None)
+    query: TaskQueryType
     payload: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -710,6 +721,19 @@ class TaskEventRecord(BaseModel):
     user_id: str
     event_type: TaskEventType
     payload: Dict[str, Any] = Field(default_factory=dict)
+    created_at: str = Field(default_factory=_iso_now)
+
+
+class TaskOperationRecord(BaseModel):
+    operation_id: str
+    user_id: str
+    intent: str
+    session_id: str | None = None
+    entities: Dict[str, Any] = Field(default_factory=dict)
+    options: Dict[str, Any] = Field(default_factory=dict)
+    apply_result: Dict[str, Any] = Field(default_factory=dict)
+    validation_errors: List[str] = Field(default_factory=list)
+    correlation_id: str | None = None
     created_at: str = Field(default_factory=_iso_now)
 
 
@@ -808,6 +832,7 @@ class InMemoryRepository:
         self.events: Dict[str, CheckinEventRecord] = {}
         self.tasks: Dict[str, TaskRecord] = {}
         self.task_events: Dict[str, TaskEventRecord] = {}
+        self.task_operation_log: Dict[str, TaskOperationRecord] = {}
         self.next_job_id = 1000
 
     async def close(self) -> None:
@@ -937,6 +962,16 @@ class InMemoryRepository:
             created.append(task.model_copy())
         return created
 
+    async def delete_tasks(self, user_id: str, task_ids: List[str]) -> int:
+        deleted = 0
+        for task_id in task_ids:
+            existing = self.tasks.get(task_id)
+            if not existing or existing.user_id != user_id:
+                continue
+            self.tasks.pop(task_id, None)
+            deleted += 1
+        return deleted
+
     async def update_task_status(self, task_id: str, user_id: str, status: TaskStatus) -> TaskRecord | None:
         task = self.tasks.get(task_id)
         if not task or task.user_id != user_id:
@@ -1005,6 +1040,10 @@ class InMemoryRepository:
 
     async def append_task_event(self, payload: TaskEventRecord) -> TaskEventRecord:
         self.task_events[payload.id] = payload
+        return payload.model_copy()
+
+    async def append_task_operation(self, payload: TaskOperationRecord) -> TaskOperationRecord:
+        self.task_operation_log[payload.operation_id] = payload
         return payload.model_copy()
 
     async def list_future_task_events(
@@ -1519,7 +1558,7 @@ class SupabaseRepository:
             extra_headers={"Prefer": "return=minimal"},
         )
 
-    async def _list_task_rows(
+    async def _list_task_item_rows(
         self,
         *,
         user_id: str,
@@ -1534,7 +1573,7 @@ class SupabaseRepository:
                 "user_id": f"eq.{user_id}",
                 "select": (
                     "task_id,user_id,title,status,priority_rank,is_essential,"
-                    "timebox_start_at,timebox_end_at,created_at,updated_at"
+                    "created_at,updated_at"
                 ),
                 "order": "created_at.asc,task_id.asc",
                 "limit": str(page_size),
@@ -1545,7 +1584,7 @@ class SupabaseRepository:
 
             page = await self._request(
                 "GET",
-                "tasks",
+                "task_items",
                 params=params,
             )
             page_rows = page or []
@@ -1556,29 +1595,98 @@ class SupabaseRepository:
 
         return rows
 
+    async def _list_task_timebox_rows(
+        self,
+        *,
+        user_id: str,
+        extra_params: Dict[str, str] | None = None,
+    ) -> List[Dict[str, Any]]:
+        page_size = 500
+        offset = 0
+        rows: List[Dict[str, Any]] = []
+
+        while True:
+            params: Dict[str, str] = {
+                "user_id": f"eq.{user_id}",
+                "select": "task_id,user_id,start_at,end_at,source,created_at,updated_at",
+                "order": "start_at.asc",
+                "limit": str(page_size),
+                "offset": str(offset),
+            }
+            if extra_params:
+                params.update(extra_params)
+            page = await self._request(
+                "GET",
+                "task_timeboxes",
+                params=params,
+            )
+            page_rows = page or []
+            rows.extend(page_rows)
+            if len(page_rows) < page_size:
+                break
+            offset += page_size
+
+        return rows
+
+    @staticmethod
+    def _task_record_from_rows(
+        item_row: Dict[str, Any],
+        timebox_row: Dict[str, Any] | None,
+    ) -> TaskRecord:
+        return TaskRecord(
+            task_id=str(item_row.get("task_id") or ""),
+            user_id=str(item_row.get("user_id") or ""),
+            title=str(item_row.get("title") or ""),
+            status=str(item_row.get("status") or "todo"),  # type: ignore[arg-type]
+            priority_rank=item_row.get("priority_rank"),
+            is_essential=bool(item_row.get("is_essential") or False),
+            timebox_start_at=(str(timebox_row.get("start_at") or "").strip() or None)
+            if isinstance(timebox_row, dict)
+            else None,
+            timebox_end_at=(str(timebox_row.get("end_at") or "").strip() or None)
+            if isinstance(timebox_row, dict)
+            else None,
+            created_at=str(item_row.get("created_at") or _iso_now()),
+            updated_at=str(item_row.get("updated_at") or _iso_now()),
+        )
+
     async def list_tasks(self, user_id: str) -> List[TaskRecord]:
-        rows = await self._list_task_rows(user_id=user_id)
-        tasks = [TaskRecord(**row) for row in rows or []]
+        item_rows = await self._list_task_item_rows(user_id=user_id)
+        timebox_rows = await self._list_task_timebox_rows(user_id=user_id)
+        timebox_map = {
+            str(row.get("task_id") or ""): row
+            for row in timebox_rows
+            if str(row.get("task_id") or "").strip()
+        }
+        tasks = [self._task_record_from_rows(row, timebox_map.get(str(row.get("task_id") or ""))) for row in item_rows]
         tasks.sort(key=_task_sort_key)
         return tasks
 
     async def get_task(self, task_id: str, user_id: str) -> TaskRecord | None:
         rows = await self._request(
             "GET",
-            "tasks",
+            "task_items",
             params={
                 "task_id": f"eq.{task_id}",
                 "user_id": f"eq.{user_id}",
-                "select": (
-                    "task_id,user_id,title,status,priority_rank,is_essential,"
-                    "timebox_start_at,timebox_end_at,created_at,updated_at"
-                ),
+                "select": "task_id,user_id,title,status,priority_rank,is_essential,created_at,updated_at",
                 "limit": "1",
             },
         )
         if not rows:
             return None
-        return TaskRecord(**rows[0])
+        timeboxes = await self._request(
+            "GET",
+            "task_timeboxes",
+            params={
+                "task_id": f"eq.{task_id}",
+                "user_id": f"eq.{user_id}",
+                "select": "task_id,user_id,start_at,end_at,source,created_at,updated_at",
+                "limit": "1",
+            },
+        )
+        timebox_row = (timeboxes or [None])[0]
+        return self._task_record_from_rows(rows[0], timebox_row)
 
     async def create_tasks(self, user_id: str, titles: List[str]) -> List[TaskRecord]:
         now = _iso_now()
@@ -1594,11 +1702,26 @@ class SupabaseRepository:
         ]
         rows = await self._request(
             "POST",
-            "tasks",
+            "task_items",
             json_body=payload,
             extra_headers={"Prefer": "return=representation"},
         )
-        return [TaskRecord(**row) for row in rows or []]
+        return [self._task_record_from_rows(row, None) for row in rows or []]
+
+    async def delete_tasks(self, user_id: str, task_ids: List[str]) -> int:
+        if not task_ids:
+            return 0
+        deleted = 0
+        for task_id in task_ids:
+            rows = await self._request(
+                "DELETE",
+                "task_items",
+                params={"task_id": f"eq.{task_id}", "user_id": f"eq.{user_id}"},
+                extra_headers={"Prefer": "return=representation"},
+            )
+            if isinstance(rows, list):
+                deleted += len(rows)
+        return deleted
 
     async def update_task_status(
         self,
@@ -1608,14 +1731,14 @@ class SupabaseRepository:
     ) -> TaskRecord | None:
         rows = await self._request(
             "PATCH",
-            "tasks",
+            "task_items",
             params={"task_id": f"eq.{task_id}", "user_id": f"eq.{user_id}"},
             json_body={"status": status, "updated_at": _iso_now()},
             extra_headers={"Prefer": "return=representation"},
         )
         if not rows:
             return None
-        return TaskRecord(**rows[0])
+        return await self.get_task(task_id=task_id, user_id=user_id)
 
     async def set_task_timebox(
         self,
@@ -1625,19 +1748,22 @@ class SupabaseRepository:
         end_at: str,
     ) -> TaskRecord | None:
         rows = await self._request(
-            "PATCH",
-            "tasks",
-            params={"task_id": f"eq.{task_id}", "user_id": f"eq.{user_id}"},
+            "POST",
+            "task_timeboxes",
+            params={"on_conflict": "task_id"},
             json_body={
-                "timebox_start_at": start_at,
-                "timebox_end_at": end_at,
+                "task_id": task_id,
+                "user_id": user_id,
+                "start_at": start_at,
+                "end_at": end_at,
+                "source": "agent",
                 "updated_at": _iso_now(),
             },
-            extra_headers={"Prefer": "return=representation"},
+            extra_headers={"Prefer": "resolution=merge-duplicates,return=representation"},
         )
         if not rows:
-            return None
-        return TaskRecord(**rows[0])
+            return await self.get_task(task_id=task_id, user_id=user_id)
+        return await self.get_task(task_id=task_id, user_id=user_id)
 
     async def replace_top_essentials(self, user_id: str, task_ids: List[str]) -> List[TaskRecord]:
         tasks = await self.list_tasks(user_id=user_id)
@@ -1647,7 +1773,7 @@ class SupabaseRepository:
             next_rank = ordered_lookup.get(task.task_id)
             rows = await self._request(
                 "PATCH",
-                "tasks",
+                "task_items",
                 params={"task_id": f"eq.{task.task_id}", "user_id": f"eq.{user_id}"},
                 json_body={
                     "priority_rank": next_rank,
@@ -1657,7 +1783,7 @@ class SupabaseRepository:
                 extra_headers={"Prefer": "return=representation"},
             )
             if rows:
-                updated_rows.append(TaskRecord(**rows[0]))
+                updated_rows.append(await self.get_task(task_id=task.task_id, user_id=user_id) or task)
         updated_rows.sort(key=_task_sort_key)
         return updated_rows
 
@@ -1667,27 +1793,42 @@ class SupabaseRepository:
         start_at_utc: str,
         end_at_utc: str,
     ) -> List[TaskRecord]:
-        rows = await self._list_task_rows(
+        timebox_rows = await self._list_task_timebox_rows(
             user_id=user_id,
-            extra_params={
-                "timebox_start_at": "not.is.null",
-                "and": f"(timebox_start_at.gte.{start_at_utc},timebox_start_at.lt.{end_at_utc})",
-            },
+            extra_params={"and": f"(start_at.gte.{start_at_utc},start_at.lt.{end_at_utc})"},
         )
-        tasks = [TaskRecord(**row) for row in rows or []]
+        task_ids = [
+            str(row.get("task_id") or "").strip()
+            for row in timebox_rows
+            if str(row.get("task_id") or "").strip()
+        ]
+        all_tasks = await self.list_tasks(user_id=user_id)
+        tasks = [task for task in all_tasks if task.task_id in set(task_ids)]
         tasks.sort(key=_task_sort_key)
         return tasks
 
     async def append_task_event(self, payload: TaskEventRecord) -> TaskEventRecord:
+        await self.append_task_operation(
+            TaskOperationRecord(
+                operation_id=payload.id,
+                user_id=payload.user_id,
+                intent=payload.event_type,
+                entities=payload.payload,
+                apply_result={"task_id": payload.task_id},
+            )
+        )
+        return payload
+
+    async def append_task_operation(self, payload: TaskOperationRecord) -> TaskOperationRecord:
         rows = await self._request(
             "POST",
-            "task_events",
+            "task_operation_log",
             json_body=[payload.model_dump()],
             extra_headers={"Prefer": "return=representation"},
         )
         if not rows:
-            raise RuntimeError("Task event insert returned empty response")
-        return TaskEventRecord(**rows[0])
+            raise RuntimeError("Task operation insert returned empty response")
+        return TaskOperationRecord(**rows[0])
 
     async def list_future_task_events(
         self,
@@ -2088,8 +2229,9 @@ async def _tool_get_current_time(
 
 
 async def _tool_task_management(
-    action: str,
-    payload: Dict[str, Any],
+    intent: TaskManagementIntent,
+    entities: Dict[str, Any],
+    options: Dict[str, Any],
     session_id: str | None,
     timezone: str | None,
     runtime_context: Dict[str, str],
@@ -2112,8 +2254,8 @@ async def _tool_task_management(
         return {"ok": False, "error": error_message}
 
     target_session_id = raw_session_id or _daily_session_id(raw_user_id, timezone_name)
-    normalized_action = _normalize_task_action(action)
-    normalized_payload = dict(payload)
+    normalized_entities = dict(entities or {})
+    normalized_options = dict(options or {})
 
     try:
         session_record = await _ensure_task_session(
@@ -2133,16 +2275,17 @@ async def _tool_task_management(
                 task_state=task_state,
                 timezone_name=timezone_name,
                 run_status="running",
-                action=normalized_action,
-                payload=normalized_payload,
+                action=intent,
+                payload=normalized_entities,
             ),
         )
 
         output = await _execute_task_management(
             device_id=raw_user_id,
             timezone_name=timezone_name,
-            action=normalized_action,  # runtime-validated in _execute_task_management
-            payload=normalized_payload,
+            intent=intent,
+            entities=normalized_entities,
+            options=normalized_options,
             session_id=target_session_id,
         )
         await _broadcast_task_panel(
@@ -2152,8 +2295,8 @@ async def _tool_task_management(
                 task_state=TaskStateV1(**output["task_state"]),
                 timezone_name=timezone_name,
                 run_status="complete",
-                action=normalized_action,
-                payload=normalized_payload,
+                action=intent,
+                payload=normalized_entities,
                 result=output.get("result"),
             ),
         )
@@ -2167,7 +2310,7 @@ async def _tool_task_management(
             device_id=raw_user_id,
             session_id=target_session_id,
             timezone=timezone_name,
-            action=normalized_action,
+            intent=intent,
             error_code=error_code,
             detail=error_message,
         )
@@ -2183,8 +2326,8 @@ async def _tool_task_management(
                     task_state=error_state,
                     timezone_name=timezone_name,
                     run_status="error",
-                    action=normalized_action,
-                    payload=normalized_payload,
+                    action=intent,
+                    payload=normalized_entities,
                     error_message=error_message,
                 ),
             )
@@ -2202,7 +2345,7 @@ async def _tool_task_management(
                 "device_id": raw_user_id,
                 "session_id": target_session_id,
                 "timezone": timezone_name,
-                "action": normalized_action,
+                "intent": intent,
                 "error": str(error),
             },
         )
@@ -2218,17 +2361,60 @@ async def _tool_task_management(
                     task_state=error_state,
                     timezone_name=timezone_name,
                     run_status="error",
-                    action=normalized_action,
-                    payload=normalized_payload,
+                    action=intent,
+                    payload=normalized_entities,
                     error_message=str(error),
                 ),
             )
         return {"ok": False, "error": {"code": "TASK_ACTION_FAILED", "message": str(error)}}
 
 
+async def _tool_task_query(
+    query: TaskQueryType,
+    payload: Dict[str, Any],
+    session_id: str | None,
+    timezone: str | None,
+    runtime_context: Dict[str, str],
+) -> Dict[str, Any]:
+    if not TASK_MGMT_V1_ENABLED:
+        return {"ok": False, "error": "task_management_v1_disabled"}
+    raw_user_id = str(runtime_context.get("user_id") or "").strip()
+    if not raw_user_id:
+        return {"ok": False, "error": "missing_user_id"}
+    raw_session_id = session_id or runtime_context.get("session_id")
+    try:
+        timezone_name = await _resolve_timezone_for_user(
+            user_id=raw_user_id,
+            provided_timezone=timezone or runtime_context.get("timezone"),
+        )
+    except HTTPException as error:
+        error_message = _error_envelope(status_code=error.status_code, detail=error.detail)["error"]["message"]
+        return {"ok": False, "error": error_message}
+    target_session_id = raw_session_id or _daily_session_id(raw_user_id, timezone_name)
+    try:
+        output = await _execute_task_query(
+            device_id=raw_user_id,
+            timezone_name=timezone_name,
+            query=query,
+            payload=dict(payload or {}),
+            session_id=target_session_id,
+        )
+        await _broadcast_task_panel(raw_user_id, output["session_id"], output["task_panel_state"])
+        return {"ok": True, **output}
+    except HTTPException as error:
+        return {
+            "ok": False,
+            "error": {
+                "code": _task_error_code_from_http_error(error),
+                "message": _task_error_message_from_http_error(error),
+            },
+        }
+
+
 agent = SimpleADK(
     get_current_time_tool=_tool_get_current_time,
     task_management_tool=_tool_task_management,
+    task_query_tool=_tool_task_query,
     enable_task_tools=TASK_TOOL_CALLING_V1_ENABLED,
 )
 
@@ -2829,6 +3015,10 @@ def _looks_like_task_claim(text: str) -> bool:
     )
 
 
+def _looks_like_schedule_claim(text: str) -> bool:
+    return bool(TASK_SCHEDULE_CLAIM_PATTERN.search(text or ""))
+
+
 _TASK_REBUILD_LOCKS: Dict[str, asyncio.Lock] = {}
 
 
@@ -3056,7 +3246,7 @@ def _build_schedule_response(
 def _task_action_label(action: str | None) -> str | None:
     if not action:
         return None
-    return TASK_ACTION_LABELS.get(action, action.replace("_", " ").strip().title())
+    return TASK_INTENT_LABELS.get(action, action.replace("_", " ").strip().title())
 
 
 def _task_time_label(task: TaskItem, timezone_name: str) -> str | None:
@@ -3105,13 +3295,7 @@ def _build_task_panel_state(
     error_message: str | None = None,
 ) -> Dict[str, Any]:
     _ = payload
-    _ = result
     active_task_id = _resolve_temporal_focus_task_id(task_state)
-
-    top_essential_tasks = [
-        task for task in task_state.tasks if task.is_essential
-    ]
-    top_essential_tasks.sort(key=lambda task: (task.priority_rank or 999, task.created_at))
 
     tasks: List[Dict[str, Any]] = []
     for task in task_state.tasks:
@@ -3122,7 +3306,6 @@ def _build_task_panel_state(
                 "status": task.status,
                 "time_label": _task_time_label(task, timezone_name),
                 "is_active": task.task_id == active_task_id,
-                "is_top_essential": task.is_essential,
             }
         )
 
@@ -3159,15 +3342,34 @@ def _build_task_panel_state(
     else:
         headline = None
 
+    last_action_summary = None
+    if isinstance(result, dict):
+        applied = result.get("applied")
+        if isinstance(applied, dict):
+            fragments: List[str] = []
+            for key in [
+                "created",
+                "timeboxed",
+                "rescheduled",
+                "deleted",
+                "status_changed",
+                "prioritized",
+            ]:
+                value = applied.get(key)
+                if isinstance(value, int) and value > 0:
+                    fragments.append(f"{key.replace('_', ' ')}: {value}")
+            if fragments:
+                last_action_summary = ", ".join(fragments)
+
     return {
         "run_status": run_status,
         "active_action": action_label,
         "headline": headline,
         "tasks": tasks,
-        "top_essentials": [task.title for task in top_essential_tasks],
         "schedule": schedule,
         "updated_at": task_state.updated_at,
         "error_message": error_message,
+        "last_action_summary": last_action_summary,
     }
 
 
@@ -3441,233 +3643,333 @@ async def _rebuild_task_events_for_date(
         return scheduled
 
 
-async def _run_task_management_action(
+def _parse_local_time_to_utc(
     *,
-    action: TaskManagementAction,
-    payload: Dict[str, Any],
+    at_local: str,
     timezone_name: str,
-    user_id: str,
-) -> Dict[str, Any]:
-    if action == "capture_tasks":
-        titles = _extract_titles(payload)
-        if not titles:
-            raise _task_error("MISSING_FIELD", "capture_tasks requires at least one title")
+    date_key: str,
+) -> datetime:
+    cleaned = at_local.strip().upper()
+    parsed: datetime | None = None
+    for fmt in ("%I:%M %p", "%I %p", "%H:%M"):
+        try:
+            parsed = datetime.strptime(cleaned, fmt)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        raise _task_error("INVALID_DATETIME", "Unsupported at_local format")
+    local_date = datetime.strptime(date_key, "%Y-%m-%d")
+    local_value = local_date.replace(
+        hour=parsed.hour,
+        minute=parsed.minute,
+        second=0,
+        microsecond=0,
+        tzinfo=ZoneInfo(timezone_name),
+    )
+    return local_value.astimezone(timezone.utc)
 
-        created = await repository.create_tasks(user_id=user_id, titles=titles)
-        for task in created:
-            await _append_task_event(
-                task_id=task.task_id,
-                user_id=user_id,
-                event_type="created",
-                payload={"title": task.title},
-            )
-        all_tasks = await repository.list_tasks(user_id=user_id)
-        return {
-            "action": action,
-            "created_task_ids": [task.task_id for task in created],
-            "tasks": [_task_item_from_record(task).model_dump() for task in all_tasks],
-        }
 
-    if action == "get_tasks":
-        tasks = await repository.list_tasks(user_id=user_id)
-        return {
-            "action": action,
-            "tasks": [_task_item_from_record(task).model_dump() for task in tasks],
-        }
-
-    if action == "set_top_essentials":
-        task_ids = payload.get("task_ids")
-        if not isinstance(task_ids, list):
-            raise _task_error("MISSING_FIELD", "set_top_essentials requires task_ids list")
-        cleaned_ids = [str(item) for item in task_ids if str(item).strip()]
-        if len(cleaned_ids) > 3:
-            raise _task_error("INVALID_PAYLOAD", "set_top_essentials allows max 3 tasks")
-
-        seen: set[str] = set()
-        for task_id in cleaned_ids:
-            if task_id in seen:
-                raise _task_error("INVALID_PAYLOAD", "task_ids contains duplicates")
-            seen.add(task_id)
-        existing_tasks = await repository.list_tasks(user_id=user_id)
-        existing_lookup = {task.task_id: task for task in existing_tasks}
-        for task_id in cleaned_ids:
-            if task_id not in existing_lookup:
-                raise _task_error("INVALID_PAYLOAD", f"Task not found: {task_id}", status_code=404)
-
-        updated_tasks = await repository.replace_top_essentials(user_id=user_id, task_ids=cleaned_ids)
-        for task in updated_tasks:
-            previous = existing_lookup.get(task.task_id)
-            before = (
-                previous.priority_rank if previous else None,
-                previous.is_essential if previous else False,
-            )
-            after = (task.priority_rank, task.is_essential)
-            if before == after:
-                continue
-            await _append_task_event(
-                task_id=task.task_id,
-                user_id=user_id,
-                event_type="top_essential_updated",
-                payload={
-                    "priority_rank": task.priority_rank,
-                    "is_essential": task.is_essential,
-                },
-            )
-
-        return {
-            "action": action,
-            "top_essentials": cleaned_ids,
-            "tasks": [_task_item_from_record(task).model_dump() for task in updated_tasks],
-        }
-
-    if action == "timebox_task":
-        task_id = str(payload.get("task_id") or "").strip()
-        start_at = str(payload.get("start_at") or "").strip()
-        end_at = str(payload.get("end_at") or "").strip()
-
-        if not task_id or not start_at or not end_at:
-            raise _task_error("MISSING_FIELD", "timebox_task requires task_id, start_at, end_at")
-
-        existing_task = await repository.get_task(task_id=task_id, user_id=user_id)
-        if not existing_task:
-            raise _task_error("INVALID_PAYLOAD", f"Task not found: {task_id}", status_code=404)
-
+def _resolve_timebox_window(
+    *,
+    task_payload: Dict[str, Any],
+    timezone_name: str,
+    date_key: str,
+) -> tuple[str, str]:
+    start_at = str(task_payload.get("start_at") or "").strip()
+    end_at = str(task_payload.get("end_at") or "").strip()
+    if start_at and end_at:
         try:
             start_dt = _parse_iso(start_at)
             end_dt = _parse_iso(end_at)
         except Exception as error:
             raise _task_error("INVALID_DATETIME", f"Invalid datetime: {error}") from error
-
         if start_dt >= end_dt:
-            raise _task_error("INVALID_PAYLOAD", "timebox_task requires start_at < end_at")
-
-        start_date_local = _date_key_for_datetime(start_dt, timezone_name)
-        end_date_local = _date_key_for_datetime(end_dt, timezone_name)
-        if start_date_local != end_date_local:
+            raise _task_error("INVALID_PAYLOAD", "start_at must be earlier than end_at")
+        if _date_key_for_datetime(start_dt, timezone_name) != _date_key_for_datetime(end_dt, timezone_name):
             raise _task_error(
                 "INVALID_PAYLOAD",
                 "Timebox must stay within one local calendar day in your timezone.",
             )
+        return _iso_from_dt(start_dt), _iso_from_dt(end_dt)
 
-        normalized_start = _iso_from_dt(start_dt)
-        normalized_end = _iso_from_dt(end_dt)
-        updated_task = await repository.set_task_timebox(
-            task_id=task_id,
-            user_id=user_id,
-            start_at=normalized_start,
-            end_at=normalized_end,
-        )
-        if not updated_task:
-            raise _task_error("INVALID_PAYLOAD", f"Task not found: {task_id}", status_code=404)
+    at_local = str(task_payload.get("at_local") or "").strip()
+    duration = task_payload.get("duration_minutes")
+    if at_local and isinstance(duration, int) and duration > 0:
+        start_dt = _parse_local_time_to_utc(at_local=at_local, timezone_name=timezone_name, date_key=date_key)
+        end_dt = start_dt + timedelta(minutes=duration)
+        if _date_key_for_datetime(start_dt, timezone_name) != _date_key_for_datetime(end_dt, timezone_name):
+            raise _task_error(
+                "INVALID_PAYLOAD",
+                "Timebox must stay within one local calendar day in your timezone.",
+            )
+        return _iso_from_dt(start_dt), _iso_from_dt(end_dt)
 
-        previous_date = _task_date_from_record(existing_task, timezone_name)
-        next_date = _task_date_from_record(updated_task, timezone_name)
-        await _append_task_event(
-            task_id=task_id,
-            user_id=user_id,
-            event_type="timebox_updated",
-            payload={
-                "previous_start_at": existing_task.timebox_start_at,
-                "previous_end_at": existing_task.timebox_end_at,
-                "start_at": normalized_start,
-                "end_at": normalized_end,
-            },
-        )
+    raise _task_error(
+        "INVALID_TIME_INPUT",
+        "Provide start_at/end_at (ISO) or at_local + duration_minutes.",
+    )
 
-        scheduled_events: List[Dict[str, Any]] = []
-        rebuild_dates = {date for date in [previous_date, next_date] if date}
-        try:
-            for rebuild_date in sorted(rebuild_dates):
+
+async def _apply_schedule_rebuild(
+    *,
+    timezone_name: str,
+    user_id: str,
+    candidate_dates: List[str | None],
+) -> List[Dict[str, Any]]:
+    scheduled_events: List[Dict[str, Any]] = []
+    rebuild_dates = {value for value in candidate_dates if value}
+    try:
+        for rebuild_date in sorted(rebuild_dates):
+            scheduled_events.extend(
+                await _rebuild_task_events_for_date(
+                    user_id=user_id,
+                    timezone_name=timezone_name,
+                    date_key=rebuild_date,
+                )
+            )
+    except Exception as error:
+        raise _task_error(
+            "SCHEDULER_UNAVAILABLE",
+            "Task was updated, but reminder scheduling failed. Notifications may not arrive until the scheduler recovers.",
+            status_code=503,
+        ) from error
+    scheduled_events.sort(key=lambda row: row["scheduled_time"])
+    return scheduled_events
+
+
+async def _run_task_management_intent(
+    *,
+    intent: TaskManagementIntent,
+    entities: Dict[str, Any],
+    options: Dict[str, Any],
+    timezone_name: str,
+    user_id: str,
+    session_id: str,
+) -> Dict[str, Any]:
+    applied = {
+        "created": 0,
+        "timeboxed": 0,
+        "rescheduled": 0,
+        "deleted": 0,
+        "status_changed": 0,
+        "prioritized": 0,
+    }
+    rejected: List[Dict[str, Any]] = []
+    now_date = _local_date_key(timezone_name)
+    target_date = str(options.get("date") or entities.get("date") or now_date).strip() or now_date
+    scheduled_events: List[Dict[str, Any]] = []
+
+    if intent == "capture":
+        raw_tasks = entities.get("tasks")
+        if not isinstance(raw_tasks, list) or not raw_tasks:
+            raise _task_error("MISSING_FIELD", "capture intent requires entities.tasks")
+        task_payloads: List[Dict[str, Any]] = []
+        for row in raw_tasks:
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("title") or "").strip()
+            if not title:
+                continue
+            task_payloads.append({**row, "title": title})
+        titles = [row["title"] for row in task_payloads]
+        if not titles:
+            raise _task_error("MISSING_FIELD", "capture requires at least one task title")
+        created = await repository.create_tasks(user_id=user_id, titles=titles)
+        applied["created"] = len(created)
+        for task, payload in zip(created, task_payloads):
+            try:
+                start_at, end_at = _resolve_timebox_window(
+                    task_payload=payload,
+                    timezone_name=timezone_name,
+                    date_key=target_date,
+                )
+            except HTTPException as error:
+                error_code = _task_error_code_from_http_error(error)
+                if error_code == "INVALID_TIME_INPUT":
+                    continue
+                raise
+            previous = await repository.get_task(task_id=task.task_id, user_id=user_id)
+            updated = await repository.set_task_timebox(
+                task_id=task.task_id,
+                user_id=user_id,
+                start_at=start_at,
+                end_at=end_at,
+            )
+            if updated:
+                applied["timeboxed"] += 1
                 scheduled_events.extend(
-                    await _rebuild_task_events_for_date(
-                        user_id=user_id,
+                    await _apply_schedule_rebuild(
                         timezone_name=timezone_name,
-                        date_key=rebuild_date,
+                        user_id=user_id,
+                        candidate_dates=[
+                            _task_date_from_record(previous, timezone_name) if previous else None,
+                            _task_date_from_record(updated, timezone_name),
+                        ],
                     )
                 )
-        except Exception as error:
-            raise _task_error(
-                "SCHEDULER_UNAVAILABLE",
-                "Task was timeboxed, but reminder scheduling failed. Notifications may not arrive until the scheduler recovers.",
-                status_code=503,
-            ) from error
-        scheduled_events.sort(key=lambda row: row["scheduled_time"])
 
-        return {
-            "action": action,
-            "task": _task_item_from_record(updated_task).model_dump(),
-            "scheduled_events": scheduled_events,
-        }
-
-    if action == "get_schedule":
-        date_value = payload.get("date")
-        date_text = str(date_value) if isinstance(date_value, str) else "today"
-        schedule = await _build_schedule_for_user(
-            user_id=user_id,
-            timezone_name=timezone_name,
-            raw_date=date_text,
-        )
-        return {
-            "action": action,
-            "schedule": schedule,
-        }
-
-    if action == "update_task_status":
-        task_id = str(payload.get("task_id") or "").strip()
-        status = str(payload.get("status") or "").strip()
-        if status not in TASK_STATUS_VALUES:
-            raise _task_error("INVALID_PAYLOAD", "Invalid status")
-        existing_task = await repository.get_task(task_id=task_id, user_id=user_id)
-        if not existing_task:
-            raise _task_error("INVALID_PAYLOAD", f"Task not found: {task_id}", status_code=404)
-        updated_task = await repository.update_task_status(
-            task_id=task_id,
-            user_id=user_id,
-            status=status,  # type: ignore[arg-type]
-        )
-        if not updated_task:
-            raise _task_error("INVALID_PAYLOAD", f"Task not found: {task_id}", status_code=404)
-        await _append_task_event(
-            task_id=task_id,
-            user_id=user_id,
-            event_type="status_updated",
-            payload={"from_status": existing_task.status, "to_status": status},
-        )
-        task_date = _task_date_from_record(updated_task, timezone_name)
-        if status == "done":
-            await _remove_task_events_for_task(user_id=user_id, task_id=task_id)
-        elif (
-            existing_task.status == "done"
-            and task_date
-            and updated_task.timebox_end_at
-            and _parse_iso(updated_task.timebox_end_at) >= _utc_now()
-        ):
-            await _rebuild_task_events_for_date(
-                user_id=user_id,
+    elif intent in {"timebox", "reschedule"}:
+        raw_tasks = entities.get("tasks")
+        if isinstance(raw_tasks, list):
+            task_payloads = [row for row in raw_tasks if isinstance(row, dict)]
+        else:
+            task_payloads = [entities]
+        if not task_payloads:
+            raise _task_error("MISSING_FIELD", f"{intent} requires entities with task references")
+        all_tasks = await repository.list_tasks(user_id=user_id)
+        by_title = {task.title.lower(): task for task in all_tasks}
+        counter_key = "rescheduled" if intent == "reschedule" else "timeboxed"
+        for payload in task_payloads:
+            task_id = str(payload.get("task_id") or "").strip()
+            existing_task = None
+            if task_id:
+                existing_task = await repository.get_task(task_id=task_id, user_id=user_id)
+            if not existing_task:
+                title = str(payload.get("title") or "").strip().lower()
+                existing_task = by_title.get(title)
+            if not existing_task:
+                rejected.append({"code": "TASK_NOT_FOUND", "payload": payload})
+                continue
+            start_at, end_at = _resolve_timebox_window(
+                task_payload=payload,
                 timezone_name=timezone_name,
-                date_key=task_date,
+                date_key=target_date,
             )
-        return {
-            "action": action,
-            "task": _task_item_from_record(updated_task).model_dump(),
-        }
+            previous = existing_task
+            updated = await repository.set_task_timebox(
+                task_id=existing_task.task_id,
+                user_id=user_id,
+                start_at=start_at,
+                end_at=end_at,
+            )
+            if not updated:
+                rejected.append({"code": "TASK_UPDATE_FAILED", "task_id": existing_task.task_id})
+                continue
+            applied[counter_key] += 1
+            scheduled_events.extend(
+                await _apply_schedule_rebuild(
+                    timezone_name=timezone_name,
+                    user_id=user_id,
+                    candidate_dates=[
+                        _task_date_from_record(previous, timezone_name),
+                        _task_date_from_record(updated, timezone_name),
+                    ],
+                )
+            )
 
-    raise _task_error("INVALID_ACTION", f"Unsupported action: {action}")
+    elif intent == "prioritize":
+        task_ids = entities.get("task_ids")
+        if not isinstance(task_ids, list):
+            raise _task_error("MISSING_FIELD", "prioritize requires entities.task_ids")
+        cleaned_ids = [str(item).strip() for item in task_ids if str(item).strip()]
+        if len(cleaned_ids) > 3:
+            raise _task_error("INVALID_PAYLOAD", "prioritize supports max 3 task_ids")
+        updated = await repository.replace_top_essentials(user_id=user_id, task_ids=cleaned_ids)
+        applied["prioritized"] = len([task for task in updated if task.is_essential])
+
+    elif intent == "status":
+        updates = entities.get("updates")
+        if isinstance(updates, list):
+            items = [row for row in updates if isinstance(row, dict)]
+        else:
+            items = [entities]
+        if not items:
+            raise _task_error("MISSING_FIELD", "status requires entities with task_id/status")
+        for payload in items:
+            task_id = str(payload.get("task_id") or "").strip()
+            status = str(payload.get("status") or "").strip()
+            if not task_id or status not in TASK_STATUS_VALUES:
+                rejected.append({"code": "INVALID_STATUS_PAYLOAD", "payload": payload})
+                continue
+            existing_task = await repository.get_task(task_id=task_id, user_id=user_id)
+            if not existing_task:
+                rejected.append({"code": "TASK_NOT_FOUND", "task_id": task_id})
+                continue
+            updated = await repository.update_task_status(
+                task_id=task_id,
+                user_id=user_id,
+                status=status,  # type: ignore[arg-type]
+            )
+            if not updated:
+                rejected.append({"code": "TASK_UPDATE_FAILED", "task_id": task_id})
+                continue
+            applied["status_changed"] += 1
+            task_date = _task_date_from_record(updated, timezone_name)
+            if status == "done":
+                await _remove_task_events_for_task(user_id=user_id, task_id=task_id)
+            elif (
+                existing_task.status == "done"
+                and task_date
+                and updated.timebox_end_at
+                and _parse_iso(updated.timebox_end_at) >= _utc_now()
+            ):
+                scheduled_events.extend(
+                    await _apply_schedule_rebuild(
+                        timezone_name=timezone_name,
+                        user_id=user_id,
+                        candidate_dates=[task_date],
+                    )
+                )
+
+    elif intent == "delete":
+        task_ids = entities.get("task_ids")
+        if not isinstance(task_ids, list):
+            raise _task_error("MISSING_FIELD", "delete requires entities.task_ids")
+        cleaned_ids = [str(item).strip() for item in task_ids if str(item).strip()]
+        for task_id in cleaned_ids:
+            await _remove_task_events_for_task(user_id=user_id, task_id=task_id)
+        applied["deleted"] = await repository.delete_tasks(user_id=user_id, task_ids=cleaned_ids)
+
+    else:
+        raise _task_error("INVALID_INTENT", f"Unsupported intent: {intent}")
+
+    tasks = await repository.list_tasks(user_id=user_id)
+    telemetry = {
+        "tasks_created": applied["created"],
+        "tasks_timeboxed": applied["timeboxed"],
+        "tasks_rescheduled": applied["rescheduled"],
+        "tasks_deleted": applied["deleted"],
+        "tasks_status_changed": applied["status_changed"],
+        "tasks_prioritized": applied["prioritized"],
+    }
+    operation_payload = TaskOperationRecord(
+        operation_id=str(uuid.uuid4()),
+        user_id=user_id,
+        intent=intent,
+        session_id=session_id,
+        entities=entities,
+        options=options,
+        apply_result={"applied": applied, "rejected": rejected, "telemetry": telemetry},
+        validation_errors=[],
+        correlation_id=_new_correlation_id(),
+    )
+    append_task_operation = getattr(repository, "append_task_operation", None)
+    if callable(append_task_operation):
+        await append_task_operation(operation_payload)
+    return {
+        "intent": intent,
+        "applied": applied,
+        "rejected": rejected,
+        "scheduled_events": scheduled_events,
+        "tasks": [_task_item_from_record(task).model_dump() for task in tasks],
+        "telemetry": telemetry,
+    }
 
 
 async def _execute_task_management(
     *,
     device_id: str,
     timezone_name: str,
-    action: TaskManagementAction,
-    payload: Dict[str, Any],
+    intent: TaskManagementIntent,
+    entities: Dict[str, Any],
+    options: Dict[str, Any],
     session_id: str | None,
 ) -> Dict[str, Any]:
-    if action not in TASK_MANAGEMENT_ACTIONS:
-        raise _task_error("INVALID_ACTION", f"Unsupported action: {action}")
+    if intent not in TASK_MANAGEMENT_INTENTS:
+        raise _task_error("INVALID_INTENT", f"Unsupported intent: {intent}")
 
     resolved_session_id = session_id or _daily_session_id(device_id, timezone_name)
-
     await repository.ensure_user(user_id=device_id, timezone_name=timezone_name)
     await _ensure_task_session(
         user_id=device_id,
@@ -3675,31 +3977,69 @@ async def _execute_task_management(
         timezone_name=timezone_name,
     )
 
-    result = await _run_task_management_action(
-        action=action,
-        payload=payload,
+    result = await _run_task_management_intent(
+        intent=intent,
+        entities=entities,
+        options=options,
         timezone_name=timezone_name,
         user_id=device_id,
+        session_id=resolved_session_id,
     )
-    task_state = await _load_task_state_for_user(
-        user_id=device_id,
-        timezone_name=timezone_name,
-    )
-
+    task_state = await _load_task_state_for_user(user_id=device_id, timezone_name=timezone_name)
     task_panel_state = _build_task_panel_state(
         task_state=task_state,
         timezone_name=timezone_name,
         run_status="idle",
-        action=action,
-        payload=payload,
+        action=intent,
+        payload=entities,
         result=result,
     )
-
     return {
         "session_id": resolved_session_id,
         "task_state": task_state.model_dump(),
         "result": result,
         "task_panel_state": task_panel_state,
+    }
+
+
+async def _execute_task_query(
+    *,
+    device_id: str,
+    timezone_name: str,
+    query: TaskQueryType,
+    payload: Dict[str, Any],
+    session_id: str | None,
+) -> Dict[str, Any]:
+    if query not in TASK_QUERY_TYPES:
+        raise _task_error("INVALID_QUERY", f"Unsupported query: {query}")
+    resolved_session_id = session_id or _daily_session_id(device_id, timezone_name)
+    await repository.ensure_user(user_id=device_id, timezone_name=timezone_name)
+    await _ensure_task_session(
+        user_id=device_id,
+        session_id=resolved_session_id,
+        timezone_name=timezone_name,
+    )
+    task_state = await _load_task_state_for_user(user_id=device_id, timezone_name=timezone_name)
+    if query == "schedule_day":
+        raw_date = str(payload.get("date") or "today")
+        result: Dict[str, Any] = {
+            "query": query,
+            "schedule": await _build_schedule_for_user(
+                user_id=device_id,
+                timezone_name=timezone_name,
+                raw_date=raw_date,
+            ),
+        }
+    else:
+        result = {
+            "query": query,
+            "tasks": [_task_item_from_record(task).model_dump() for task in await repository.list_tasks(user_id=device_id)],
+        }
+    return {
+        "session_id": resolved_session_id,
+        "task_state": task_state.model_dump(),
+        "result": result,
+        "task_panel_state": _build_task_panel_state(task_state=task_state, timezone_name=timezone_name),
     }
 
 
@@ -4259,6 +4599,15 @@ async def bootstrap_device(payload: LegacyBootstrapRequest) -> Dict[str, Any]:
         raise _http_error(400, "INVALID_DEVICE_ID", "device_id is required")
 
     entry_context = payload.entry_context or EntryContext()
+    if payload.entry_context is None:
+        user_profile = await repository.get_user_profile(user_id=device_id)
+        onboarding_status = str((user_profile or {}).get("onboarding_status") or "").strip().lower()
+        if onboarding_status == "completed" and not await repository.has_conversation_history(user_id=device_id):
+            entry_context = EntryContext(
+                source="manual",
+                entry_mode="proactive",
+                trigger_type="post_onboarding",
+            )
     source = entry_context.source or "manual"
     session_payload = SessionOpenRequest(
         device_id=device_id,
@@ -4282,6 +4631,8 @@ async def bootstrap_device(payload: LegacyBootstrapRequest) -> Dict[str, Any]:
         session_id=opened["session_id"],
         timezone=timezone_name,
         source=source,
+        entry_mode=entry_context.entry_mode,
+        trigger_type=entry_context.trigger_type or "",
     )
     return {
         "device_id": device_id,
@@ -4604,19 +4955,20 @@ async def task_management(payload: TaskManagementRequest) -> Dict[str, Any]:
         output = await _execute_task_management(
             device_id=device_id,
             timezone_name=timezone_name,
-            action=payload.action,
-            payload=payload.payload,
+            intent=payload.intent,
+            entities=payload.entities,
+            options=payload.options,
             session_id=payload.session_id,
         )
         await _broadcast_task_panel(device_id, output["session_id"], output["task_panel_state"])
         _log_event(
             logging.INFO,
-            "Task management action completed",
+            "Task management intent completed",
             device_id=device_id,
             session_id=output["session_id"],
             timezone=timezone_name,
-            action=payload.action,
-            task_written=payload.action in TASK_WRITE_ACTIONS,
+            intent=payload.intent,
+            task_written=payload.intent in TASK_WRITE_INTENTS,
         )
         return output
     except HTTPException as error:
@@ -4624,11 +4976,11 @@ async def task_management(payload: TaskManagementRequest) -> Dict[str, Any]:
         error_message = _task_error_message_from_http_error(error)
         _log_event(
             logging.WARNING,
-            "Task management action rejected",
+            "Task management intent rejected",
             device_id=device_id,
             session_id=payload.session_id,
             timezone=timezone_name,
-            action=payload.action,
+            intent=payload.intent,
             error_code=error_code,
             status_code=error.status_code,
             detail=error_message,
@@ -4636,16 +4988,46 @@ async def task_management(payload: TaskManagementRequest) -> Dict[str, Any]:
         raise
     except Exception as error:
         logger.exception(
-            "Task management action failed",
+            "Task management intent failed",
             extra={
                 "device_id": device_id,
                 "session_id": payload.session_id,
                 "timezone": timezone_name,
-                "action": payload.action,
+                "intent": payload.intent,
                 "error": str(error),
             },
         )
         raise _http_error(500, "TASK_MANAGEMENT_FAILED", f"Task management failed: {error}") from error
+
+
+@app.post("/agent/task-query")
+async def task_query(payload: TaskQueryRequest) -> Dict[str, Any]:
+    if not TASK_MGMT_V1_ENABLED:
+        raise _http_error(404, "TASK_MGMT_DISABLED", "Task management v1 disabled")
+    device_id = payload.device_id.strip()
+    if not device_id:
+        raise _http_error(400, "INVALID_DEVICE_ID", "device_id is required")
+    timezone_name = await _resolve_timezone_for_user(
+        user_id=device_id,
+        provided_timezone=payload.timezone,
+    )
+    output = await _execute_task_query(
+        device_id=device_id,
+        timezone_name=timezone_name,
+        query=payload.query,
+        payload=payload.payload,
+        session_id=payload.session_id,
+    )
+    await _broadcast_task_panel(device_id, output["session_id"], output["task_panel_state"])
+    _log_event(
+        logging.INFO,
+        "Task query completed",
+        device_id=device_id,
+        session_id=output["session_id"],
+        timezone=timezone_name,
+        query=payload.query,
+    )
+    return output
 
 
 @app.websocket("/agent/ws")
@@ -4784,8 +5166,29 @@ async def agent_ws(
             except Exception:
                 task_write_count = 0
         task_written = task_write_count > 0
+        task_action_counts: Dict[str, int] = {}
+        consume_action_counts = getattr(agent, "consume_task_action_counts", None)
+        if callable(consume_action_counts):
+            try:
+                raw_counts = consume_action_counts(user_id=active_user_id, session_id=active_session_id)
+                if isinstance(raw_counts, dict):
+                    task_action_counts = {
+                        str(key): int(value) for key, value in raw_counts.items() if isinstance(value, int)
+                    }
+            except Exception:
+                task_action_counts = {}
         assistant_claimed_task_action = _looks_like_task_claim(assistant_text)
-        if (user_task_intent or assistant_claimed_task_action) and not task_written and not startup_turn:
+        assistant_claimed_schedule = _looks_like_schedule_claim(assistant_text)
+        schedule_write_count = int(task_action_counts.get("timebox", 0)) + int(
+            task_action_counts.get("reschedule", 0)
+        )
+
+        if assistant_claimed_schedule and schedule_write_count <= 0 and not startup_turn:
+            assistant_text = (
+                "I could not safely schedule that yet. "
+                "Please share an explicit time window and I will set it now."
+            )
+        elif (user_task_intent or assistant_claimed_task_action) and not task_written and not startup_turn:
             assistant_text = (
                 "I could not safely apply that task change yet. "
                 "Please confirm the task details and I will retry."
@@ -4810,7 +5213,16 @@ async def agent_ws(
             state_patch={"last_message_id": assistant_message_id, "last_role": "assistant"},
         )
 
-        if (user_task_intent or assistant_claimed_task_action) and not task_written and not startup_turn:
+        if assistant_claimed_schedule and schedule_write_count <= 0 and not startup_turn:
+            _log_event(
+                logging.WARNING,
+                "Schedule claim detected without schedule write",
+                device_id=active_user_id,
+                session_id=active_session_id,
+                schedule_write_count=schedule_write_count,
+                task_action_counts=task_action_counts,
+            )
+        elif (user_task_intent or assistant_claimed_task_action) and not task_written and not startup_turn:
             _log_event(
                 logging.WARNING,
                 "Task intent detected without task write",
@@ -4829,6 +5241,7 @@ async def agent_ws(
                 startup_turn=startup_turn,
                 task_written=task_written,
                 task_write_count=task_write_count,
+                task_action_counts=task_action_counts,
             )
 
         return await _safe_send_json(

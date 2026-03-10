@@ -7,15 +7,56 @@ from zoneinfo import ZoneInfo
 import main
 
 
+def _task_write(
+    client,
+    *,
+    device_id: str,
+    timezone_name: str,
+    intent: str,
+    entities: dict | None = None,
+    options: dict | None = None,
+    session_id: str | None = None,
+):
+    body = {
+        "device_id": device_id,
+        "timezone": timezone_name,
+        "intent": intent,
+        "entities": entities or {},
+        "options": options or {},
+    }
+    if session_id:
+        body["session_id"] = session_id
+    return client.post("/agent/task-management", json=body)
+
+
+def _task_query(
+    client,
+    *,
+    device_id: str,
+    timezone_name: str,
+    query: str,
+    payload: dict | None = None,
+    session_id: str | None = None,
+):
+    body = {
+        "device_id": device_id,
+        "timezone": timezone_name,
+        "query": query,
+        "payload": payload or {},
+    }
+    if session_id:
+        body["session_id"] = session_id
+    return client.post("/agent/task-query", json=body)
+
+
 def _capture(client, device_id: str, timezone_name: str, titles: list[str]):
-    response = client.post(
-        "/agent/task-management",
-        json={
-            "device_id": device_id,
-            "timezone": timezone_name,
-            "action": "capture_tasks",
-            "payload": {"titles": titles},
-        },
+    response = _task_write(
+        client,
+        device_id=device_id,
+        timezone_name=timezone_name,
+        intent="capture",
+        entities={"tasks": [{"title": title} for title in titles]},
+        options={},
     )
     assert response.status_code == 200
     return response.json()
@@ -43,35 +84,34 @@ def test_task_management_happy_path(app_client):
     client = app_client["client"]
 
     captured = _capture(client, "device-task-1", "UTC", ["Deep work", "Email"])
-    task_ids = captured["result"]["created_task_ids"]
+    task_ids = [task["task_id"] for task in captured["result"]["tasks"]]
     assert len(task_ids) == 2
 
-    another_session = client.post(
-        "/agent/task-management",
-        json={
-            "device_id": "device-task-1",
-            "timezone": "UTC",
-            "session_id": "session_device-task-1_cross_session",
-            "action": "get_tasks",
-        },
+    another_session = _task_query(
+        client,
+        device_id="device-task-1",
+        timezone_name="UTC",
+        session_id="session_device-task-1_cross_session",
+        query="tasks_overview",
+        payload={"scope": "today"},
     )
     assert another_session.status_code == 200
     assert [task["task_id"] for task in another_session.json()["result"]["tasks"]] == task_ids
 
-    prioritized = client.post(
-        "/agent/task-management",
-        json={
-            "device_id": "device-task-1",
-            "timezone": "UTC",
-            "session_id": captured["session_id"],
-            "action": "set_top_essentials",
-            "payload": {"task_ids": [task_ids[0], task_ids[1]]},
-        },
+    prioritized = _task_write(
+        client,
+        device_id="device-task-1",
+        timezone_name="UTC",
+        session_id=captured["session_id"],
+        intent="prioritize",
+        entities={"task_ids": [task_ids[0], task_ids[1]]},
+        options={},
     )
     assert prioritized.status_code == 200
     ranked = prioritized.json()["result"]["tasks"]
-    assert ranked[0]["priority_rank"] == 1
-    assert ranked[1]["priority_rank"] == 2
+    rank_by_id = {task["task_id"]: task["priority_rank"] for task in ranked}
+    assert rank_by_id[task_ids[0]] == 1
+    assert rank_by_id[task_ids[1]] == 2
 
     now = datetime.now(timezone.utc)
     start = (now + timedelta(minutes=10)).replace(second=0, microsecond=0)
@@ -79,95 +119,95 @@ def test_task_management_happy_path(app_client):
         start = now.replace(hour=20, minute=0, second=0, microsecond=0)
     end = (start + timedelta(minutes=45)).replace(microsecond=0)
 
-    timeboxed = client.post(
-        "/agent/task-management",
-        json={
-            "device_id": "device-task-1",
-            "timezone": "UTC",
-            "session_id": captured["session_id"],
-            "action": "timebox_task",
-            "payload": {
-                "task_id": task_ids[0],
-                "start_at": start.isoformat().replace("+00:00", "Z"),
-                "end_at": end.isoformat().replace("+00:00", "Z"),
-            },
+    timeboxed = _task_write(
+        client,
+        device_id="device-task-1",
+        timezone_name="UTC",
+        session_id=captured["session_id"],
+        intent="timebox",
+        entities={
+            "task_id": task_ids[0],
+            "start_at": start.isoformat().replace("+00:00", "Z"),
+            "end_at": end.isoformat().replace("+00:00", "Z"),
         },
+        options={},
     )
     assert timeboxed.status_code == 200
     scheduled = timeboxed.json()["result"]["scheduled_events"]
     assert [item["trigger_type"] for item in scheduled] == ["before_task", "after_task"]
 
-    schedule = client.post(
-        "/agent/task-management",
-        json={
-            "device_id": "device-task-1",
-            "timezone": "UTC",
-            "session_id": captured["session_id"],
-            "action": "get_schedule",
-            "payload": {"date": "today"},
-        },
+    schedule = _task_query(
+        client,
+        device_id="device-task-1",
+        timezone_name="UTC",
+        session_id=captured["session_id"],
+        query="schedule_day",
+        payload={"date": "today"},
     )
     assert schedule.status_code == 200
     items = schedule.json()["result"]["schedule"]["items"]
     assert len(items) == 1
     assert items[0]["task_id"] == task_ids[0]
 
-    status_update = client.post(
-        "/agent/task-management",
-        json={
-            "device_id": "device-task-1",
-            "timezone": "UTC",
-            "session_id": captured["session_id"],
-            "action": "update_task_status",
-            "payload": {"task_id": task_ids[0], "status": "in_progress"},
-        },
+    status_update = _task_write(
+        client,
+        device_id="device-task-1",
+        timezone_name="UTC",
+        session_id=captured["session_id"],
+        intent="status",
+        entities={"task_id": task_ids[0], "status": "in_progress"},
+        options={},
     )
     assert status_update.status_code == 200
-    assert status_update.json()["result"]["task"]["status"] == "in_progress"
+    status_by_id = {
+        task["task_id"]: task["status"] for task in status_update.json()["result"]["tasks"]
+    }
+    assert status_by_id[task_ids[0]] == "in_progress"
 
 
 def test_timebox_is_editable_for_persistent_tasks(app_client):
     client = app_client["client"]
     captured = _capture(client, "device-task-editable", "UTC", ["Task"])
-    task_id = captured["result"]["created_task_ids"][0]
+    task_id = captured["result"]["tasks"][0]["task_id"]
 
     now = datetime.now(timezone.utc)
     start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
     end = (start + timedelta(minutes=25)).replace(microsecond=0)
 
-    first = client.post(
-        "/agent/task-management",
-        json={
-            "device_id": "device-task-editable",
-            "timezone": "UTC",
-            "session_id": captured["session_id"],
-            "action": "timebox_task",
-            "payload": {
-                "task_id": task_id,
-                "start_at": start.isoformat().replace("+00:00", "Z"),
-                "end_at": end.isoformat().replace("+00:00", "Z"),
-            },
+    first = _task_write(
+        client,
+        device_id="device-task-editable",
+        timezone_name="UTC",
+        session_id=captured["session_id"],
+        intent="timebox",
+        entities={
+            "task_id": task_id,
+            "start_at": start.isoformat().replace("+00:00", "Z"),
+            "end_at": end.isoformat().replace("+00:00", "Z"),
         },
+        options={},
     )
     assert first.status_code == 200
     assert len(first.json()["result"]["scheduled_events"]) == 2
 
-    second = client.post(
-        "/agent/task-management",
-        json={
-            "device_id": "device-task-editable",
-            "timezone": "UTC",
-            "session_id": captured["session_id"],
-            "action": "timebox_task",
-            "payload": {
-                "task_id": task_id,
-                "start_at": (start + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
-                "end_at": (end + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
-            },
+    second = _task_write(
+        client,
+        device_id="device-task-editable",
+        timezone_name="UTC",
+        session_id=captured["session_id"],
+        intent="timebox",
+        entities={
+            "task_id": task_id,
+            "start_at": (start + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+            "end_at": (end + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
         },
+        options={},
     )
     assert second.status_code == 200
-    assert second.json()["result"]["task"]["timebox"]["start_at"] == (
+    second_tasks = {
+        task["task_id"]: task for task in second.json()["result"]["tasks"]
+    }
+    assert second_tasks[task_id]["timebox"]["start_at"] == (
         start + timedelta(hours=1)
     ).isoformat().replace("+00:00", "Z")
 
@@ -177,7 +217,7 @@ def test_transition_rule_uses_gap_threshold(app_client):
     repository = app_client["repository"]
 
     captured = _capture(client, "device-transition", "UTC", ["Task A", "Task B", "Task C"])
-    task_a, task_b, task_c = captured["result"]["created_task_ids"]
+    task_a, task_b, task_c = [task["task_id"] for task in captured["result"]["tasks"]]
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
 
@@ -193,19 +233,18 @@ def test_transition_rule_uses_gap_threshold(app_client):
         (task_b, b_start, b_end),
         (task_c, c_start, c_end),
     ]:
-        response = client.post(
-            "/agent/task-management",
-            json={
-                "device_id": "device-transition",
-                "timezone": "UTC",
-                "session_id": captured["session_id"],
-                "action": "timebox_task",
-                "payload": {
-                    "task_id": task_id,
-                    "start_at": start.isoformat().replace("+00:00", "Z"),
-                    "end_at": end.isoformat().replace("+00:00", "Z"),
-                },
+        response = _task_write(
+            client,
+            device_id="device-transition",
+            timezone_name="UTC",
+            session_id=captured["session_id"],
+            intent="timebox",
+            entities={
+                "task_id": task_id,
+                "start_at": start.isoformat().replace("+00:00", "Z"),
+                "end_at": end.isoformat().replace("+00:00", "Z"),
             },
+            options={},
         )
         assert response.status_code == 200
 
@@ -251,26 +290,25 @@ def test_timebox_must_stay_within_one_local_calendar_day(app_client):
     timezone_name = "Asia/Kolkata"
 
     captured = _capture(client, "device-day-boundary", timezone_name, ["Task"])
-    task_id = captured["result"]["created_task_ids"][0]
+    task_id = captured["result"]["tasks"][0]["task_id"]
 
     # Session date in local timezone.
     local_day = datetime.now(ZoneInfo(timezone_name)).strftime("%Y-%m-%d")
     start = datetime.fromisoformat(f"{local_day}T23:50:00+05:30").astimezone(timezone.utc)
     end = start + timedelta(minutes=20)  # spills into next local day
 
-    response = client.post(
-        "/agent/task-management",
-        json={
-            "device_id": "device-day-boundary",
-            "timezone": timezone_name,
-            "session_id": captured["session_id"],
-            "action": "timebox_task",
-            "payload": {
-                "task_id": task_id,
-                "start_at": start.isoformat().replace("+00:00", "Z"),
-                "end_at": end.isoformat().replace("+00:00", "Z"),
-            },
+    response = _task_write(
+        client,
+        device_id="device-day-boundary",
+        timezone_name=timezone_name,
+        session_id=captured["session_id"],
+        intent="timebox",
+        entities={
+            "task_id": task_id,
+            "start_at": start.isoformat().replace("+00:00", "Z"),
+            "end_at": end.isoformat().replace("+00:00", "Z"),
         },
+        options={},
     )
 
     assert response.status_code == 400
@@ -371,68 +409,66 @@ def test_done_task_unschedules_and_reopen_rebuilds_future_events(app_client):
     repository = app_client["repository"]
 
     captured = _capture(client, "device-status-events", "UTC", ["Task"])
-    task_id = captured["result"]["created_task_ids"][0]
+    task_id = captured["result"]["tasks"][0]["task_id"]
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
     start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
     end = start + timedelta(minutes=30)
 
-    timeboxed = client.post(
-        "/agent/task-management",
-        json={
-            "device_id": "device-status-events",
-            "timezone": "UTC",
-            "session_id": captured["session_id"],
-            "action": "timebox_task",
-            "payload": {
-                "task_id": task_id,
-                "start_at": start.isoformat().replace("+00:00", "Z"),
-                "end_at": end.isoformat().replace("+00:00", "Z"),
-            },
+    timeboxed = _task_write(
+        client,
+        device_id="device-status-events",
+        timezone_name="UTC",
+        session_id=captured["session_id"],
+        intent="timebox",
+        entities={
+            "task_id": task_id,
+            "start_at": start.isoformat().replace("+00:00", "Z"),
+            "end_at": end.isoformat().replace("+00:00", "Z"),
         },
+        options={},
     )
     assert timeboxed.status_code == 200
     assert len(repository.events) == 2
 
-    done = client.post(
-        "/agent/task-management",
-        json={
-            "device_id": "device-status-events",
-            "timezone": "UTC",
-            "session_id": captured["session_id"],
-            "action": "update_task_status",
-            "payload": {"task_id": task_id, "status": "done"},
-        },
+    done = _task_write(
+        client,
+        device_id="device-status-events",
+        timezone_name="UTC",
+        session_id=captured["session_id"],
+        intent="status",
+        entities={"task_id": task_id, "status": "done"},
+        options={},
     )
     assert done.status_code == 200
     assert repository.events == {}
 
-    reopened = client.post(
-        "/agent/task-management",
-        json={
-            "device_id": "device-status-events",
-            "timezone": "UTC",
-            "session_id": captured["session_id"],
-            "action": "update_task_status",
-            "payload": {"task_id": task_id, "status": "todo"},
-        },
+    reopened = _task_write(
+        client,
+        device_id="device-status-events",
+        timezone_name="UTC",
+        session_id=captured["session_id"],
+        intent="status",
+        entities={"task_id": task_id, "status": "todo"},
+        options={},
     )
     assert reopened.status_code == 200
     assert len(repository.events) == 2
-    assert any(event.event_type == "status_updated" for event in repository.task_events.values())
+    status_operations = [
+        op for op in repository.task_operation_log.values() if op.intent == "status"
+    ]
+    assert len(status_operations) >= 2
 
 
 def test_get_schedule_rejects_invalid_date_format(app_client):
     client = app_client["client"]
 
-    response = client.post(
-        "/agent/task-management",
-        json={
-            "device_id": "device-invalid-date",
-            "timezone": "UTC",
-            "action": "get_schedule",
-            "payload": {"date": "tomorrow"},
-        },
+    response = _task_query(
+        client,
+        device_id="device-invalid-date",
+        timezone_name="UTC",
+        query="schedule_day",
+        payload={"date": "tomorrow"},
     )
 
     assert response.status_code == 400
@@ -444,7 +480,8 @@ def test_supabase_task_list_paginates_past_500_rows():
         project_url="https://example.supabase.co",
         service_role_key="service-role-key",
     )
-    request_offsets: list[str] = []
+    item_offsets: list[str] = []
+    timebox_offsets: list[str] = []
 
     async def fake_request(
         method: str,
@@ -455,31 +492,34 @@ def test_supabase_task_list_paginates_past_500_rows():
         extra_headers=None,
     ):
         assert method == "GET"
-        assert path == "tasks"
         assert json_body is None
         assert extra_headers is None
-        request_offsets.append(params["offset"])
 
         offset = int(params["offset"])
         page_size = int(params["limit"])
         total_rows = 501
         remaining = max(total_rows - offset, 0)
         count = min(page_size, remaining)
-        return [
-            {
-                "task_id": f"task-{offset + index:03d}",
-                "user_id": "device-paged",
-                "title": f"Task {offset + index:03d}",
-                "status": "todo",
-                "priority_rank": None,
-                "is_essential": False,
-                "timebox_start_at": None,
-                "timebox_end_at": None,
-                "created_at": f"2026-03-07T00:{(offset + index) // 60:02d}:{(offset + index) % 60:02d}Z",
-                "updated_at": f"2026-03-07T00:{(offset + index) // 60:02d}:{(offset + index) % 60:02d}Z",
-            }
-            for index in range(count)
-        ]
+
+        if path == "task_items":
+            item_offsets.append(params["offset"])
+            return [
+                {
+                    "task_id": f"task-{offset + index:03d}",
+                    "user_id": "device-paged",
+                    "title": f"Task {offset + index:03d}",
+                    "status": "todo",
+                    "priority_rank": None,
+                    "is_essential": False,
+                    "created_at": f"2026-03-07T00:{(offset + index) // 60:02d}:{(offset + index) % 60:02d}Z",
+                    "updated_at": f"2026-03-07T00:{(offset + index) // 60:02d}:{(offset + index) % 60:02d}Z",
+                }
+                for index in range(count)
+            ]
+
+        assert path == "task_timeboxes"
+        timebox_offsets.append(params["offset"])
+        return []
 
     repository._request = fake_request  # type: ignore[assignment]
     try:
@@ -488,7 +528,8 @@ def test_supabase_task_list_paginates_past_500_rows():
         asyncio.run(repository.close())
 
     assert len(rows) == 501
-    assert request_offsets == ["0", "500"]
+    assert item_offsets == ["0", "500"]
+    assert timebox_offsets == ["0"]
     assert rows[0].task_id == "task-000"
     assert rows[-1].task_id == "task-500"
 
@@ -601,7 +642,7 @@ def test_rebuild_keeps_existing_events_when_new_schedule_fails(app_client):
     repository = app_client["repository"]
 
     captured = _capture(client, "device-rebuild-safe", "UTC", ["Task A", "Task B"])
-    task_a, task_b = captured["result"]["created_task_ids"]
+    task_a, task_b = [task["task_id"] for task in captured["result"]["tasks"]]
 
     now = (datetime.now(timezone.utc) + timedelta(days=1)).replace(
         hour=9,
@@ -612,19 +653,18 @@ def test_rebuild_keeps_existing_events_when_new_schedule_fails(app_client):
     a_start = now
     a_end = a_start + timedelta(minutes=30)
 
-    first = client.post(
-        "/agent/task-management",
-        json={
-            "device_id": "device-rebuild-safe",
-            "timezone": "UTC",
-            "session_id": captured["session_id"],
-            "action": "timebox_task",
-            "payload": {
-                "task_id": task_a,
-                "start_at": a_start.isoformat().replace("+00:00", "Z"),
-                "end_at": a_end.isoformat().replace("+00:00", "Z"),
-            },
+    first = _task_write(
+        client,
+        device_id="device-rebuild-safe",
+        timezone_name="UTC",
+        session_id=captured["session_id"],
+        intent="timebox",
+        entities={
+            "task_id": task_a,
+            "start_at": a_start.isoformat().replace("+00:00", "Z"),
+            "end_at": a_end.isoformat().replace("+00:00", "Z"),
         },
+        options={},
     )
     assert first.status_code == 200
     old_event_ids = set(repository.events.keys())
@@ -643,29 +683,28 @@ def test_rebuild_keeps_existing_events_when_new_schedule_fails(app_client):
         return await original_schedule(event_id=event_id, run_at=run_at, timezone_name=timezone_name)
 
     repository.schedule_event_job = failing_schedule_event_job  # type: ignore[assignment]
-    failed = client.post(
-        "/agent/task-management",
-        json={
-            "device_id": "device-rebuild-safe",
-            "timezone": "UTC",
-            "session_id": captured["session_id"],
-            "action": "timebox_task",
-            "payload": {
-                "task_id": task_b,
-                "start_at": b_start.isoformat().replace("+00:00", "Z"),
-                "end_at": b_end.isoformat().replace("+00:00", "Z"),
-            },
+    failed = _task_write(
+        client,
+        device_id="device-rebuild-safe",
+        timezone_name="UTC",
+        session_id=captured["session_id"],
+        intent="timebox",
+        entities={
+            "task_id": task_b,
+            "start_at": b_start.isoformat().replace("+00:00", "Z"),
+            "end_at": b_end.isoformat().replace("+00:00", "Z"),
         },
+        options={},
     )
     repository.schedule_event_job = original_schedule  # type: ignore[assignment]
 
     assert failed.status_code == 503
     assert failed.json()["error"]["code"] == "SCHEDULER_UNAVAILABLE"
-    assert "Task was timeboxed, but reminder scheduling failed" in failed.json()["error"]["message"]
+    assert "Task was updated, but reminder scheduling failed" in failed.json()["error"]["message"]
     assert old_event_ids.issubset(set(repository.events.keys()))
 
 
-def test_tool_task_management_invalid_action_fails_fast(app_client):
+def test_tool_task_management_invalid_intent_fails_fast(app_client):
     client = app_client["client"]
 
     opened = client.post(
@@ -684,7 +723,8 @@ def test_tool_task_management_invalid_action_fails_fast(app_client):
 
     result = asyncio.run(
         main._tool_task_management(
-            "invalid_action",
+            "invalid_intent",
+            {},
             {},
             session_id,
             "UTC",
@@ -697,4 +737,4 @@ def test_tool_task_management_invalid_action_fails_fast(app_client):
     )
 
     assert result["ok"] is False
-    assert result["error"]["code"] == "INVALID_ACTION"
+    assert result["error"]["code"] == "INVALID_INTENT"

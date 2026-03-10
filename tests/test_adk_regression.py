@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 from typing import get_args, get_type_hints
 
-from startup_agent.adk import SimpleADK, TaskManagementAction
+from startup_agent.adk import SimpleADK
+from startup_agent.task_actions import TaskManagementIntent
 
 
 def test_adk_requires_credentials(monkeypatch):
@@ -32,11 +33,12 @@ def test_adk_registers_function_tools_when_enabled():
     async def _time_handler(timezone, runtime_context):
         return {"ok": True, "timezone": timezone, "ctx": runtime_context}
 
-    async def _task_handler(action, payload, session_id, timezone, runtime_context):
+    async def _task_handler(intent, entities, options, session_id, timezone, runtime_context):
         return {
             "ok": True,
-            "action": action,
-            "payload": payload,
+            "intent": intent,
+            "entities": entities,
+            "options": options,
             "session_id": session_id,
             "timezone": timezone,
             "ctx": runtime_context,
@@ -55,11 +57,12 @@ def test_adk_task_management_parses_json_payload():
     async def _time_handler(timezone, runtime_context):
         return {"ok": True, "timezone": timezone, "ctx": runtime_context}
 
-    async def _task_handler(action, payload, session_id, timezone, runtime_context):
+    async def _task_handler(intent, entities, options, session_id, timezone, runtime_context):
         return {
             "ok": True,
-            "action": action,
-            "payload": payload,
+            "intent": intent,
+            "entities": entities,
+            "options": options,
             "session_id": session_id,
             "timezone": timezone,
             "ctx": runtime_context,
@@ -73,29 +76,29 @@ def test_adk_task_management_parses_json_payload():
 
     result = asyncio.run(
         adk.task_management(
-            action="capture_tasks",
-            payload_json='{"titles": ["Write PRD"]}',
+            intent="capture",
+            entities_json='{"tasks": [{"title": "Write PRD"}]}',
             session_id="s1",
             timezone="UTC",
         )
     )
 
     assert result["ok"] is True
-    assert result["payload"] == {"titles": ["Write PRD"]}
+    assert result["entities"] == {"tasks": [{"title": "Write PRD"}]}
 
 
 def test_adk_task_management_action_contract_is_canonical():
     hints = get_type_hints(SimpleADK.task_management)
-    action_hint = hints["action"]
+    intent_hint = hints["intent"]
 
-    assert action_hint == TaskManagementAction
-    assert set(get_args(action_hint)) == {
-        "capture_tasks",
-        "timebox_task",
-        "set_top_essentials",
-        "update_task_status",
-        "get_tasks",
-        "get_schedule",
+    assert intent_hint == TaskManagementIntent
+    assert set(get_args(intent_hint)) == {
+        "capture",
+        "timebox",
+        "prioritize",
+        "status",
+        "delete",
+        "reschedule",
     }
 
 

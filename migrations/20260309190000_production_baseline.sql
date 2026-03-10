@@ -924,3 +924,199 @@ end;
 $$;
 
 drop function if exists public.finalize_event_execution(text, text, timestamptz, boolean);
+
+-- A2UI hard reset: remove legacy task tables and recreate task schema.
+delete from public.events
+where payload->>'schedule_owner' = 'task_management';
+
+drop table if exists public.task_events cascade;
+drop table if exists public.tasks cascade;
+
+create table if not exists public.task_items (
+  task_id text primary key,
+  user_id text not null references public.users(user_id) on delete cascade,
+  title text not null,
+  status text not null default 'todo' check (status in ('todo', 'in_progress', 'done', 'blocked')),
+  priority_rank integer,
+  is_essential boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.task_timeboxes (
+  task_id text primary key references public.task_items(task_id) on delete cascade,
+  user_id text not null references public.users(user_id) on delete cascade,
+  start_at timestamptz not null,
+  end_at timestamptz not null,
+  source text not null default 'agent',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint task_timeboxes_window check (start_at < end_at)
+);
+
+create table if not exists public.task_operation_log (
+  operation_id text primary key,
+  user_id text not null references public.users(user_id) on delete cascade,
+  intent text not null,
+  session_id text,
+  entities jsonb not null default '{}'::jsonb,
+  options jsonb not null default '{}'::jsonb,
+  apply_result jsonb not null default '{}'::jsonb,
+  validation_errors jsonb not null default '[]'::jsonb,
+  correlation_id text,
+  created_at timestamptz not null default now()
+);
+
+alter table public.task_items enable row level security;
+alter table public.task_timeboxes enable row level security;
+alter table public.task_operation_log enable row level security;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public'
+      and tablename = 'task_items'
+      and policyname = 'Users can select own task items'
+  ) then
+    create policy "Users can select own task items"
+      on public.task_items
+      for select
+      to authenticated
+      using (auth.uid()::text = user_id);
+  end if;
+end
+$$;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public'
+      and tablename = 'task_items'
+      and policyname = 'Users can insert own task items'
+  ) then
+    create policy "Users can insert own task items"
+      on public.task_items
+      for insert
+      to authenticated
+      with check (auth.uid()::text = user_id);
+  end if;
+end
+$$;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public'
+      and tablename = 'task_items'
+      and policyname = 'Users can update own task items'
+  ) then
+    create policy "Users can update own task items"
+      on public.task_items
+      for update
+      to authenticated
+      using (auth.uid()::text = user_id)
+      with check (auth.uid()::text = user_id);
+  end if;
+end
+$$;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public'
+      and tablename = 'task_timeboxes'
+      and policyname = 'Users can select own task timeboxes'
+  ) then
+    create policy "Users can select own task timeboxes"
+      on public.task_timeboxes
+      for select
+      to authenticated
+      using (auth.uid()::text = user_id);
+  end if;
+end
+$$;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public'
+      and tablename = 'task_timeboxes'
+      and policyname = 'Users can insert own task timeboxes'
+  ) then
+    create policy "Users can insert own task timeboxes"
+      on public.task_timeboxes
+      for insert
+      to authenticated
+      with check (auth.uid()::text = user_id);
+  end if;
+end
+$$;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public'
+      and tablename = 'task_timeboxes'
+      and policyname = 'Users can update own task timeboxes'
+  ) then
+    create policy "Users can update own task timeboxes"
+      on public.task_timeboxes
+      for update
+      to authenticated
+      using (auth.uid()::text = user_id)
+      with check (auth.uid()::text = user_id);
+  end if;
+end
+$$;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public'
+      and tablename = 'task_operation_log'
+      and policyname = 'Users can select own task operations'
+  ) then
+    create policy "Users can select own task operations"
+      on public.task_operation_log
+      for select
+      to authenticated
+      using (auth.uid()::text = user_id);
+  end if;
+end
+$$;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public'
+      and tablename = 'task_operation_log'
+      and policyname = 'Users can insert own task operations'
+  ) then
+    create policy "Users can insert own task operations"
+      on public.task_operation_log
+      for insert
+      to authenticated
+      with check (auth.uid()::text = user_id);
+  end if;
+end
+$$;
+
+create index if not exists idx_task_items_user_updated
+  on public.task_items (user_id, updated_at desc);
+
+create index if not exists idx_task_items_user_status_priority
+  on public.task_items (user_id, status, priority_rank);
+
+create index if not exists idx_task_timeboxes_user_start
+  on public.task_timeboxes (user_id, start_at);
+
+create index if not exists idx_task_operation_log_user_created
+  on public.task_operation_log (user_id, created_at desc);

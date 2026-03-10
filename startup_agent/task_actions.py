@@ -1,38 +1,50 @@
 from typing import Literal
 
-TaskManagementAction = Literal[
-    "capture_tasks",
-    "get_tasks",
-    "set_top_essentials",
-    "timebox_task",
-    "get_schedule",
-    "update_task_status",
+TaskManagementIntent = Literal[
+    "capture",
+    "timebox",
+    "prioritize",
+    "status",
+    "delete",
+    "reschedule",
 ]
 
-TASK_MANAGEMENT_ACTIONS: tuple[TaskManagementAction, ...] = (
-    "capture_tasks",
-    "get_tasks",
-    "set_top_essentials",
-    "timebox_task",
-    "get_schedule",
-    "update_task_status",
+TaskQueryType = Literal[
+    "tasks_overview",
+    "schedule_day",
+]
+
+TASK_MANAGEMENT_INTENTS: tuple[TaskManagementIntent, ...] = (
+    "capture",
+    "timebox",
+    "prioritize",
+    "status",
+    "delete",
+    "reschedule",
 )
 
-TASK_ACTION_LABELS: dict[TaskManagementAction, str] = {
-    "capture_tasks": "Capturing tasks",
-    "get_tasks": "Refreshing tasks",
-    "set_top_essentials": "Updating top essentials",
-    "timebox_task": "Updating schedule",
-    "get_schedule": "Loading schedule",
-    "update_task_status": "Updating task status",
+TASK_QUERY_TYPES: tuple[TaskQueryType, ...] = (
+    "tasks_overview",
+    "schedule_day",
+)
+
+TASK_INTENT_LABELS: dict[TaskManagementIntent, str] = {
+    "capture": "Capturing tasks",
+    "timebox": "Scheduling tasks",
+    "prioritize": "Updating priorities",
+    "status": "Updating task status",
+    "delete": "Deleting tasks",
+    "reschedule": "Rescheduling tasks",
 }
 
-TASK_WRITE_ACTIONS: frozenset[TaskManagementAction] = frozenset(
+TASK_WRITE_INTENTS: frozenset[TaskManagementIntent] = frozenset(
     {
-        "capture_tasks",
-        "set_top_essentials",
-        "timebox_task",
-        "update_task_status",
+        "capture",
+        "timebox",
+        "prioritize",
+        "status",
+        "delete",
+        "reschedule",
     }
 )
 

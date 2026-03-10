@@ -3,7 +3,7 @@
   "baseline": {
     "version": "20260309190000",
     "file": "migrations/20260309190000_production_baseline.sql",
-    "sha256": "45d133eb69587c9919b46f0bdc5b83fb7160e93da788f63f285106e3eca73293"
+    "sha256": "57dad5b01034132c17889ff2eb3e78acfe4c4906668309138613b921cd85134c"
   },
   "accepted_legacy_migrations": [
     {
@@ -77,6 +77,10 @@
     {
       "version": "20260309103028",
       "name": "baseline_guardrails_and_scheduler_indexes"
+    },
+    {
+      "version": "20260310151434",
+      "name": "a2ui_task_hard_reset"
     }
   ],
   "operator_policy": {

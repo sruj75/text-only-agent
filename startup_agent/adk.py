@@ -10,7 +10,11 @@ from google.adk.sessions import InMemorySessionService
 from google.adk.tools import FunctionTool, ToolContext
 from google.genai import types
 
-from startup_agent.task_actions import TASK_WRITE_ACTIONS, TaskManagementAction
+from startup_agent.task_actions import (
+    TASK_WRITE_INTENTS,
+    TaskManagementIntent,
+    TaskQueryType,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -23,8 +27,9 @@ Non-negotiables:
 - Ground yourself with real context before advising.
 - Never schedule reminders manually.
 - Do not mention background modes.
-- For task intents (capture, prioritize, timebox, status), call task_management before claiming success.
-- Do not claim a task is scheduled/timeboxed unless a timebox write actually happened.
+- For task writes (capture, prioritize, timebox, status, delete, reschedule), call task_management before claiming success.
+- Use task_query for reads (task list and schedule lookups).
+- Do not claim a task is scheduled/rescheduled unless task_management reports schedule writes applied.
 
 Session context:
 - The runtime injects profile_context and entry_context.
@@ -47,6 +52,12 @@ How to start each conversation:
    - Ask whether to quickly address that miss or continue the current need.
    - If the user declines or ignores it, continue the current need immediately.
 
+Task tool contracts:
+- task_management(intent, entities_json, options_json)
+  intents: capture | timebox | prioritize | status | delete | reschedule
+- task_query(query, payload_json)
+  queries: tasks_overview | schedule_day
+
 Time elicitation policy (required):
 1) Lead with time-anchored prompts, not generic prompts.
    - Avoid: "What do you want to do now?"
@@ -55,11 +66,11 @@ Time elicitation policy (required):
    - "From [window A], what do you want to do?"
    - "After that, from [window B], what is next?"
 3) If the user names a task with explicit time, schedule from that same conversation turn:
-   - Use task_management to capture the task.
-   - Then timebox the task in the same turn when time is clear.
-   - Preferred one-shot payload for capture_tasks:
+   - Use one task_management call with intent="capture" and explicit entities.
+   - If an existing task is being moved, use intent="reschedule".
+   - Preferred entities payload:
      {"tasks":[{"title":"Dog walk","start_at":"<ISO>","end_at":"<ISO>"}]}
-   - Alternative one-shot payload:
+   - Alternative entities payload:
      {"tasks":[{"title":"Dog walk","at_local":"10:00 PM","duration_minutes":30}]}
 4) If timing is ambiguous, ask exactly one targeted follow-up that pushes explicit time:
    - Example: "Do you want this at 10:00 PM or 10:30 PM?"
@@ -77,11 +88,33 @@ Day-planning workflow (ADHD scaffold):
 Reminder policy:
 - Only timeboxed essentials are check-in worthy.
 - Unscheduled tasks stay in task lists and should not get reminder framing.
+
+Few-shot guardrails:
+Example A (explicit schedule one-shot):
+User: "Take my dog out at 10 PM for 30 mins."
+Tool: task_management(intent="capture", entities_json={"tasks":[{"title":"Take my dog out","at_local":"10:00 PM","duration_minutes":30}]})
+Assistant: "Great, you're set: Take my dog out from 10:00 to 10:30 PM."
+
+Example B (ambiguous time -> one follow-up):
+User: "Remind me to do laundry tonight."
+Assistant: "Do you want laundry at 9:00 PM or 10:00 PM?"
+User: "10."
+Tool: task_management(intent="capture", entities_json={"tasks":[{"title":"Laundry","at_local":"10:00 PM","duration_minutes":30}]})
+Assistant: "Done, laundry is scheduled for 10:00-10:30 PM."
+
+Example C (query only):
+User: "What is left for today?"
+Tool: task_query(query="tasks_overview", payload_json={"scope":"today"})
+Assistant: concise summary based on tool response with no write claims.
 """
 
 GetCurrentTimeToolHandler = Callable[[str | None, Dict[str, str]], Awaitable[Dict[str, Any]]]
 TaskManagementToolHandler = Callable[
-    [TaskManagementAction, Dict[str, Any], str | None, str | None, Dict[str, str]],
+    [TaskManagementIntent, Dict[str, Any], Dict[str, Any], str | None, str | None, Dict[str, str]],
+    Awaitable[Dict[str, Any]],
+]
+TaskQueryToolHandler = Callable[
+    [TaskQueryType, Dict[str, Any], str | None, str | None, Dict[str, str]],
     Awaitable[Dict[str, Any]],
 ]
 
@@ -94,12 +127,14 @@ class SimpleADK:
         *,
         get_current_time_tool: GetCurrentTimeToolHandler | None = None,
         task_management_tool: TaskManagementToolHandler | None = None,
+        task_query_tool: TaskQueryToolHandler | None = None,
         enable_task_tools: bool | None = None,
     ) -> None:
         self.app_name = "intentive_agent"
         self.model_name = "gemini-3.1-pro-preview"
         self._get_current_time_tool = get_current_time_tool
         self._task_management_tool = task_management_tool
+        self._task_query_tool = task_query_tool
         self._runtime_context: Dict[Tuple[str, str], Dict[str, str]] = {}
         self._task_write_counts: Dict[Tuple[str, str], int] = {}
         self._task_action_counts: Dict[Tuple[str, str], Dict[str, int]] = {}
@@ -108,6 +143,8 @@ class SimpleADK:
         use_tools = enable_task_tools if enable_task_tools is not None else False
         if use_tools and get_current_time_tool and task_management_tool:
             tools.extend([FunctionTool(self.get_current_time), FunctionTool(self.task_management)])
+            if task_query_tool:
+                tools.append(FunctionTool(self.task_query))
 
         self.agent = LlmAgent(
             name="intentive_coach",
@@ -159,18 +196,17 @@ class SimpleADK:
 
     async def task_management(
         self,
-        action: TaskManagementAction,
-        payload_json: str | None = None,
+        intent: TaskManagementIntent,
+        entities_json: str | None = None,
+        options_json: str | None = None,
         session_id: str | None = None,
         timezone: str | None = None,
         tool_context: ToolContext | None = None,
     ) -> Dict[str, Any]:
-        """Execute task actions.
+        """Execute task writes via deterministic intent + entities payload.
 
-        Preferred capture payloads:
-        - {"titles": ["Deep work"]}
-        - {"tasks":[{"title":"Dog walk","start_at":"2026-03-10T16:30:00Z","end_at":"2026-03-10T17:00:00Z"}]}
-        - {"tasks":[{"title":"Dog walk","at_local":"10:00 PM","duration_minutes":30}]}
+        Example:
+        - intent="capture", entities_json={"tasks":[{"title":"Dog walk","at_local":"10:00 PM","duration_minutes":30}]}
         """
         if not self._task_management_tool:
             return {"ok": False, "error": "task_management tool is unavailable"}
@@ -178,28 +214,37 @@ class SimpleADK:
         if tool_context:
             context_key = (tool_context.user_id, tool_context.session.id)
         runtime_context = self._tool_runtime_context(tool_context)
-        normalized_payload: Dict[str, Any] = {}
-        if isinstance(payload_json, str) and payload_json.strip():
+        normalized_entities: Dict[str, Any] = {}
+        if isinstance(entities_json, str) and entities_json.strip():
             try:
-                parsed_payload = json.loads(payload_json)
+                parsed_payload = json.loads(entities_json)
                 if isinstance(parsed_payload, dict):
-                    normalized_payload = parsed_payload
+                    normalized_entities = parsed_payload
                 else:
                     logger.error(
-                        "task_management payload_json parsed to non-dict (%s); using {}. payload_json=%r",
+                        "task_management entities_json parsed to non-dict (%s); using {}. entities_json=%r",
                         type(parsed_payload).__name__,
-                        payload_json,
+                        entities_json,
                     )
             except json.JSONDecodeError as e:
                 logger.error(
-                    "task_management payload_json JSONDecodeError; using {}. error=%s payload_json=%r",
+                    "task_management entities_json JSONDecodeError; using {}. error=%s entities_json=%r",
                     str(e),
-                    payload_json,
+                    entities_json,
                 )
-                normalized_payload = {}
+                normalized_entities = {}
+        normalized_options: Dict[str, Any] = {}
+        if isinstance(options_json, str) and options_json.strip():
+            try:
+                parsed_options = json.loads(options_json)
+                if isinstance(parsed_options, dict):
+                    normalized_options = parsed_options
+            except json.JSONDecodeError:
+                normalized_options = {}
         output = await self._task_management_tool(
-            action,
-            normalized_payload,
+            intent,
+            normalized_entities,
+            normalized_options,
             session_id,
             timezone,
             runtime_context,
@@ -207,21 +252,54 @@ class SimpleADK:
         if (
             context_key
             and output.get("ok") is True
-            and action in TASK_WRITE_ACTIONS
+            and intent in TASK_WRITE_INTENTS
         ):
             self._task_write_counts[context_key] = self._task_write_counts.get(context_key, 0) + 1
         if context_key and output.get("ok") is True:
             action_counts = dict(self._task_action_counts.get(context_key, {}))
-            action_counts[action] = action_counts.get(action, 0) + 1
+            action_counts[intent] = action_counts.get(intent, 0) + 1
             telemetry = output.get("result", {}).get("telemetry", {})
             if isinstance(telemetry, dict):
                 timeboxed_count = telemetry.get("tasks_timeboxed")
                 if isinstance(timeboxed_count, int) and timeboxed_count > 0:
-                    action_counts["timebox_task"] = (
-                        action_counts.get("timebox_task", 0) + timeboxed_count
+                    action_counts["timebox"] = (
+                        action_counts.get("timebox", 0) + timeboxed_count
+                    )
+                rescheduled_count = telemetry.get("tasks_rescheduled")
+                if isinstance(rescheduled_count, int) and rescheduled_count > 0:
+                    action_counts["reschedule"] = (
+                        action_counts.get("reschedule", 0) + rescheduled_count
                     )
             self._task_action_counts[context_key] = action_counts
         return output
+
+    async def task_query(
+        self,
+        query: TaskQueryType,
+        payload_json: str | None = None,
+        session_id: str | None = None,
+        timezone: str | None = None,
+        tool_context: ToolContext | None = None,
+    ) -> Dict[str, Any]:
+        """Execute task reads."""
+        if not self._task_query_tool:
+            return {"ok": False, "error": "task_query tool is unavailable"}
+        runtime_context = self._tool_runtime_context(tool_context)
+        normalized_payload: Dict[str, Any] = {}
+        if isinstance(payload_json, str) and payload_json.strip():
+            try:
+                parsed_payload = json.loads(payload_json)
+                if isinstance(parsed_payload, dict):
+                    normalized_payload = parsed_payload
+            except json.JSONDecodeError:
+                normalized_payload = {}
+        return await self._task_query_tool(
+            query,
+            normalized_payload,
+            session_id,
+            timezone,
+            runtime_context,
+        )
 
     async def run_stream(
         self,
