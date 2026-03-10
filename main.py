@@ -3349,9 +3349,16 @@ async def _rebuild_task_events_for_date(
         for index, task in enumerate(timeboxed):
             start_dt = _parse_iso(task.timebox_start_at or "")
             end_dt = _parse_iso(task.timebox_end_at or "")
+            previous_task = timeboxed[index - 1] if index > 0 else None
+            previous_end: datetime | None = None
+            if previous_task and previous_task.timebox_end_at:
+                previous_end = _parse_iso(previous_task.timebox_end_at)
 
             before_at = start_dt - timedelta(minutes=5)
-            if before_at >= now_dt:
+            suppress_before_trigger = (
+                previous_end is not None and start_dt - previous_end <= timedelta(minutes=10)
+            )
+            if before_at >= now_dt and not suppress_before_trigger:
                 desired_specs.append(
                     {
                         "task": task,

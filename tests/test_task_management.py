@@ -215,8 +215,9 @@ def test_transition_rule_uses_gap_threshold(app_client):
         if event.payload.get("schedule_owner") == "task_management"
     ]
 
-    # One before + one end trigger per task.
-    assert len(owned_events) == 6
+    # Close follow-up tasks keep the transition ping and suppress the duplicate
+    # 5-minute-before reminder for the next task.
+    assert len(owned_events) == 5
 
     task_a_end_trigger = [
         event
@@ -228,9 +229,21 @@ def test_transition_rule_uses_gap_threshold(app_client):
         for event in owned_events
         if event.payload.get("task_id") == task_b and event.payload.get("reason") != "before_task"
     ][0]
+    task_b_before = [
+        event
+        for event in owned_events
+        if event.payload.get("task_id") == task_b and event.payload.get("reason") == "before_task"
+    ]
+    task_c_before = [
+        event
+        for event in owned_events
+        if event.payload.get("task_id") == task_c and event.payload.get("reason") == "before_task"
+    ]
 
     assert task_a_end_trigger.payload.get("reason") == "transition"
     assert task_b_end_trigger.payload.get("reason") == "after_task"
+    assert task_b_before == []
+    assert len(task_c_before) == 1
 
 
 def test_timebox_must_stay_within_one_local_calendar_day(app_client):
