@@ -24,10 +24,12 @@ Non-negotiables:
 - Never schedule reminders manually.
 - Do not mention background modes.
 - For task intents (capture, prioritize, timebox, status), call task_management before claiming success.
+- Do not claim a task is scheduled/timeboxed unless a timebox write actually happened.
 
 Session context:
 - The runtime injects profile_context and entry_context.
 - The runtime may also inject due diligence task/schedule context from persisted data.
+- The runtime injects due_diligence_time, which includes the user's current local time.
 - The runtime may inject missed_proactive_count and missed_proactive_events (today-only missed invites).
 - entry_mode can be proactive or reactive.
 - trigger_type may be post_onboarding for onboarding handoff.
@@ -45,10 +47,30 @@ How to start each conversation:
    - Ask whether to quickly address that miss or continue the current need.
    - If the user declines or ignores it, continue the current need immediately.
 
+Time elicitation policy (required):
+1) Lead with time-anchored prompts, not generic prompts.
+   - Avoid: "What do you want to do now?"
+   - Prefer: "It's around 6 PM now. What is your main focus from 6:00 to 8:00?"
+2) Ask in time windows when planning:
+   - "From [window A], what do you want to do?"
+   - "After that, from [window B], what is next?"
+3) If the user names a task with explicit time, schedule from that same conversation turn:
+   - Use task_management to capture the task.
+   - Then timebox the task in the same turn when time is clear.
+   - Preferred one-shot payload for capture_tasks:
+     {"tasks":[{"title":"Dog walk","start_at":"<ISO>","end_at":"<ISO>"}]}
+   - Alternative one-shot payload:
+     {"tasks":[{"title":"Dog walk","at_local":"10:00 PM","duration_minutes":30}]}
+4) If timing is ambiguous, ask exactly one targeted follow-up that pushes explicit time:
+   - Example: "Do you want this at 10:00 PM or 10:30 PM?"
+   - After one follow-up, continue coaching and avoid interrogation loops.
+5) Confirm final schedule in one concise line:
+   - "Got it: Dog walk 10:00-10:30 PM."
+
 Day-planning workflow (ADHD scaffold):
-1) Brain dump today's commitments quickly.
-2) Prioritize top 2-3 high-impact essentials.
-3) Timebox essentials with realistic durations.
+1) Quick brain dump.
+2) Prioritize top 2-3 essentials.
+3) Turn essentials into explicit time windows.
 4) Add transition buffers between intense blocks.
 5) Confirm the first tiny action to build momentum now.
 
@@ -80,6 +102,7 @@ class SimpleADK:
         self._task_management_tool = task_management_tool
         self._runtime_context: Dict[Tuple[str, str], Dict[str, str]] = {}
         self._task_write_counts: Dict[Tuple[str, str], int] = {}
+        self._task_action_counts: Dict[Tuple[str, str], Dict[str, int]] = {}
 
         tools = []
         use_tools = enable_task_tools if enable_task_tools is not None else False
@@ -142,6 +165,13 @@ class SimpleADK:
         timezone: str | None = None,
         tool_context: ToolContext | None = None,
     ) -> Dict[str, Any]:
+        """Execute task actions.
+
+        Preferred capture payloads:
+        - {"titles": ["Deep work"]}
+        - {"tasks":[{"title":"Dog walk","start_at":"2026-03-10T16:30:00Z","end_at":"2026-03-10T17:00:00Z"}]}
+        - {"tasks":[{"title":"Dog walk","at_local":"10:00 PM","duration_minutes":30}]}
+        """
         if not self._task_management_tool:
             return {"ok": False, "error": "task_management tool is unavailable"}
         context_key: Tuple[str, str] | None = None
@@ -180,6 +210,17 @@ class SimpleADK:
             and action in TASK_WRITE_ACTIONS
         ):
             self._task_write_counts[context_key] = self._task_write_counts.get(context_key, 0) + 1
+        if context_key and output.get("ok") is True:
+            action_counts = dict(self._task_action_counts.get(context_key, {}))
+            action_counts[action] = action_counts.get(action, 0) + 1
+            telemetry = output.get("result", {}).get("telemetry", {})
+            if isinstance(telemetry, dict):
+                timeboxed_count = telemetry.get("tasks_timeboxed")
+                if isinstance(timeboxed_count, int) and timeboxed_count > 0:
+                    action_counts["timebox_task"] = (
+                        action_counts.get("timebox_task", 0) + timeboxed_count
+                    )
+            self._task_action_counts[context_key] = action_counts
         return output
 
     async def run_stream(
@@ -204,6 +245,7 @@ class SimpleADK:
         context_key = (user_id, session_id)
         self._runtime_context[context_key] = dict(context or {})
         self._task_write_counts[context_key] = 0
+        self._task_action_counts[context_key] = {}
         stream_completed = False
 
         async with aclosing(
@@ -244,9 +286,17 @@ class SimpleADK:
                 self._runtime_context.pop(context_key, None)
                 if not stream_completed:
                     self._task_write_counts.pop(context_key, None)
+                    self._task_action_counts.pop(context_key, None)
 
     def consume_task_write_count(self, *, user_id: str, session_id: str) -> int:
         return int(self._task_write_counts.pop((user_id, session_id), 0))
+
+    def consume_task_action_counts(self, *, user_id: str, session_id: str) -> Dict[str, int]:
+        raw = self._task_action_counts.pop((user_id, session_id), {})
+        output: Dict[str, int] = {}
+        for key, value in raw.items():
+            output[str(key)] = int(value)
+        return output
 
     async def run(
         self,
