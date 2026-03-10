@@ -1,0 +1,91 @@
+{
+  "mode": "single-baseline-with-legacy-compat",
+  "baseline": {
+    "version": "20260309190000",
+    "file": "migrations/20260309190000_production_baseline.sql",
+    "sha256": "45d133eb69587c9919b46f0bdc5b83fb7160e93da788f63f285106e3eca73293"
+  },
+  "accepted_legacy_migrations": [
+    {
+      "version": "20260211110034",
+      "name": "intentive_supabase_init"
+    },
+    {
+      "version": "20260211120603",
+      "name": "auth_timezone_hardening"
+    },
+    {
+      "version": "20260211203448",
+      "name": "rls_user_policies"
+    },
+    {
+      "version": "20260211203528",
+      "name": "grant_authenticated_rls_policies"
+    },
+    {
+      "version": "20260211203936",
+      "name": "composio_connections_rls_policy"
+    },
+    {
+      "version": "20260218120232",
+      "name": "pg_cron_event_scheduler"
+    },
+    {
+      "version": "20260226073033",
+      "name": "onboarding_profile_fields"
+    },
+    {
+      "version": "20260226125622",
+      "name": "morning_wake_continuation"
+    },
+    {
+      "version": "20260304121703",
+      "name": "session_messages_table_v2"
+    },
+    {
+      "version": "20260304144247",
+      "name": "session_message_key_and_session_owner_guard"
+    },
+    {
+      "version": "20260304144557",
+      "name": "harden_prevent_session_user_reassignment_search_path"
+    },
+    {
+      "version": "20260307081652",
+      "name": "task_persistence_source_of_truth"
+    },
+    {
+      "version": "20260308113429",
+      "name": "schedule_event_retry_guard"
+    },
+    {
+      "version": "20260308114250",
+      "name": "finalize_event_execution_guard"
+    },
+    {
+      "version": "20260308114327",
+      "name": "drop_old_finalize_overload_guard"
+    },
+    {
+      "version": "20260308213739",
+      "name": "hybrid_durable_workflow_20260309090000"
+    },
+    {
+      "version": "20260309101108",
+      "name": "cloud_tasks_scheduler_cutover"
+    },
+    {
+      "version": "20260309103028",
+      "name": "baseline_guardrails_and_scheduler_indexes"
+    }
+  ],
+  "operator_policy": {
+    "canonical_intent": "Keep one single canonical migration SQL file in the repo for clarity.",
+    "hard_rule": "Do not rewrite or delete production migration history in Supabase.",
+    "alignment_rule": "Treat legacy live migration versions as accepted ancestry via this manifest, and treat the baseline file as schema source of truth."
+  },
+  "notes": [
+    "This repository intentionally keeps one canonical baseline SQL file.",
+    "This manifest is the compatibility map that bridges old live migration history to the single-baseline repository model."
+  ]
+}
