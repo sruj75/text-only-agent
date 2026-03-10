@@ -3764,6 +3764,56 @@ def _format_calendar_reminder_body(payload: Dict[str, Any], timezone_name: str) 
     return f"{event_title} starts at {local_dt.strftime('%I:%M %p').lstrip('0')}."
 
 
+def _format_local_clock_label(at_iso: str | None, timezone_name: str | None) -> str | None:
+    if not at_iso or not timezone_name:
+        return None
+    try:
+        local_dt = _parse_iso(at_iso).astimezone(ZoneInfo(timezone_name))
+    except Exception:
+        return None
+    return local_dt.strftime("%I:%M %p").lstrip("0")
+
+
+def _format_task_checkin_notification(
+    *,
+    payload: Dict[str, Any],
+    trigger_type: str,
+    timezone_name: str | None,
+) -> tuple[str, str]:
+    task_title = _coerce_string(payload.get("task_title")) or "your task"
+    start_label = _format_local_clock_label(_coerce_string(payload.get("timebox_start")), timezone_name)
+    end_label = _format_local_clock_label(_coerce_string(payload.get("timebox_end")), timezone_name)
+
+    if trigger_type == "before_task":
+        title = f"Up next: {task_title}"
+        body = (
+            f"{task_title} starts at {start_label}. Ready to begin?"
+            if start_label
+            else f"{task_title} starts soon. Ready to begin?"
+        )
+        return title, body
+
+    if trigger_type == "transition":
+        title = f"Next up: {task_title}"
+        body = (
+            f"Time to switch over. {task_title} starts at {start_label}."
+            if start_label
+            else f"Time to switch over to {task_title}."
+        )
+        return title, body
+
+    if trigger_type == "after_task":
+        title = f"Wrap up: {task_title}"
+        body = (
+            f"{task_title} was timeboxed until {end_label}. Ready to wrap up or extend it?"
+            if end_label
+            else f"{task_title} just reached the end of its timebox. Ready to wrap up or extend it?"
+        )
+        return title, body
+
+    return "Check-in", f"It is time for your check-in ({trigger_type or 'scheduled'})."
+
+
 async def _send_push_notification(
     *,
     user_id: str,
@@ -3916,7 +3966,11 @@ async def _resolve_event_execution_context(
         else:
             body = "Reminder unavailable: missing timezone."
     elif event_type == "checkin":
-        body = f"It is time for your check-in ({reason})."
+        title, body = _format_task_checkin_notification(
+            payload=event_payload,
+            trigger_type=trigger_type,
+            timezone_name=session_timezone,
+        )
 
     session_id = (
         _daily_session_id_at(event_user_id, session_timezone, scheduled_time)
@@ -3933,6 +3987,15 @@ async def _resolve_event_execution_context(
         "entry_mode": "proactive",
         "scheduled_time": scheduled_time,
     }
+    task_title = _coerce_string(event_payload.get("task_title"))
+    if task_title:
+        notification_data["task_title"] = task_title
+    timebox_start = _coerce_string(event_payload.get("timebox_start"))
+    if timebox_start:
+        notification_data["timebox_start"] = timebox_start
+    timebox_end = _coerce_string(event_payload.get("timebox_end"))
+    if timebox_end:
+        notification_data["timebox_end"] = timebox_end
     if calendar_event_id:
         notification_data["calendar_event_id"] = calendar_event_id
 

@@ -238,16 +238,24 @@ def test_execute_event_runs_in_cloud_run_endpoint(app_client, monkeypatch):
             main.CheckinEventRecord(
                 id="event-execute-1",
                 user_id="device-event",
-                scheduled_time=main._iso_now(),
+                scheduled_time="2026-03-10T09:23:00Z",
                 event_type="checkin",
-                payload={"trigger_type": "before_task", "timezone": "UTC"},
+                payload={
+                    "trigger_type": "before_task",
+                    "timezone": "UTC",
+                    "task_title": "Deep work",
+                    "timebox_start": "2026-03-10T09:28:00Z",
+                    "timebox_end": "2026-03-10T10:00:00Z",
+                },
                 executed=False,
             )
         )
     )
 
+    push_attempts: list[dict[str, object]] = []
+
     async def _always_send_push(**kwargs):
-        _ = kwargs
+        push_attempts.append(dict(kwargs))
         return True
 
     monkeypatch.setattr(main, "_send_push_notification", _always_send_push)
@@ -264,6 +272,12 @@ def test_execute_event_runs_in_cloud_run_endpoint(app_client, monkeypatch):
     assert payload["event_id"] == "event-execute-1"
     assert repository.events["event-execute-1"].executed is True
     assert repository.events["event-execute-1"].workflow_state == "succeeded"
+    assert len(push_attempts) == 1
+    assert push_attempts[0]["title"] == "Up next: Deep work"
+    assert push_attempts[0]["body"] == "Deep work starts at 9:28 AM. Ready to begin?"
+    assert push_attempts[0]["data"]["task_title"] == "Deep work"
+    assert push_attempts[0]["data"]["timebox_start"] == "2026-03-10T09:28:00Z"
+    assert push_attempts[0]["data"]["timebox_end"] == "2026-03-10T10:00:00Z"
 
 
 def test_execute_event_dead_letters_after_max_attempts(app_client, monkeypatch):
