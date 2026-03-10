@@ -646,7 +646,9 @@ def test_rebuild_keeps_existing_events_when_new_schedule_fails(app_client):
     )
     repository.schedule_event_job = original_schedule  # type: ignore[assignment]
 
-    assert failed.status_code == 500
+    assert failed.status_code == 503
+    assert failed.json()["error"]["code"] == "SCHEDULER_UNAVAILABLE"
+    assert "Task was timeboxed, but reminder scheduling failed" in failed.json()["error"]["message"]
     assert old_event_ids.issubset(set(repository.events.keys()))
 
 

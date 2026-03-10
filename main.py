@@ -620,6 +620,13 @@ class SessionOpenRequest(BaseModel):
     contract_version: str = Field(..., min_length=1)
 
 
+class LegacyBootstrapRequest(BaseModel):
+    device_id: str
+    timezone: str | None = Field(default=None)
+    session_id: str | None = Field(default=None)
+    entry_context: EntryContext | None = Field(default=None)
+
+
 class PushTokenRequest(BaseModel):
     device_id: str
     expo_push_token: str = Field(..., min_length=1)
@@ -2284,21 +2291,46 @@ app = FastAPI(title="Startup Agent API", version="0.3.0", lifespan=lifespan)
 
 
 @app.exception_handler(HTTPException)
-async def handle_http_exception(_: Request, error: HTTPException) -> JSONResponse:
+async def handle_http_exception(request: Request, error: HTTPException) -> JSONResponse:
+    envelope = _error_envelope(status_code=error.status_code, detail=error.detail)
+    payload = envelope["error"]
+    if request.url.path != "/health":
+        _log_event(
+            logging.WARNING if error.status_code < 500 else logging.ERROR,
+            "HTTP exception returned",
+            method=request.method,
+            path=request.url.path,
+            query=str(request.url.query),
+            status_code=error.status_code,
+            error_code=payload.get("code"),
+            error_message=payload.get("message"),
+        )
     return JSONResponse(
         status_code=error.status_code,
-        content=_error_envelope(status_code=error.status_code, detail=error.detail),
+        content=envelope,
     )
 
 
 @app.exception_handler(RequestValidationError)
-async def handle_validation_exception(_: Request, error: RequestValidationError) -> JSONResponse:
+async def handle_validation_exception(request: Request, error: RequestValidationError) -> JSONResponse:
     message = "Invalid request"
     issues = error.errors()
     if issues:
         candidate = str(issues[0].get("msg") or "").strip()
         if candidate:
             message = candidate
+    if request.url.path != "/health":
+        _log_event(
+            logging.WARNING,
+            "HTTP validation failed",
+            method=request.method,
+            path=request.url.path,
+            query=str(request.url.query),
+            status_code=422,
+            error_code="INVALID_REQUEST",
+            error_message=message,
+            issue_count=len(issues),
+        )
     return JSONResponse(
         status_code=422,
         content={
@@ -3537,14 +3569,21 @@ async def _run_task_management_action(
 
         scheduled_events: List[Dict[str, Any]] = []
         rebuild_dates = {date for date in [previous_date, next_date] if date}
-        for rebuild_date in sorted(rebuild_dates):
-            scheduled_events.extend(
-                await _rebuild_task_events_for_date(
-                    user_id=user_id,
-                    timezone_name=timezone_name,
-                    date_key=rebuild_date,
+        try:
+            for rebuild_date in sorted(rebuild_dates):
+                scheduled_events.extend(
+                    await _rebuild_task_events_for_date(
+                        user_id=user_id,
+                        timezone_name=timezone_name,
+                        date_key=rebuild_date,
+                    )
                 )
-            )
+        except Exception as error:
+            raise _task_error(
+                "SCHEDULER_UNAVAILABLE",
+                "Task was timeboxed, but reminder scheduling failed. Notifications may not arrive until the scheduler recovers.",
+                status_code=503,
+            ) from error
         scheduled_events.sort(key=lambda row: row["scheduled_time"])
 
         return {
@@ -4143,6 +4182,49 @@ async def run_agent(payload: AgentRunRequest) -> Dict[str, str]:
     return {"output": output}
 
 
+@app.post("/agent/bootstrap-device")
+async def bootstrap_device(payload: LegacyBootstrapRequest) -> Dict[str, Any]:
+    device_id = payload.device_id.strip()
+    if not device_id:
+        raise _http_error(400, "INVALID_DEVICE_ID", "device_id is required")
+
+    entry_context = payload.entry_context or EntryContext()
+    source = entry_context.source or "manual"
+    session_payload = SessionOpenRequest(
+        device_id=device_id,
+        timezone=payload.timezone,
+        session_id=payload.session_id,
+        entry_context=entry_context,
+        source=source,
+        open_id=_new_open_id(),
+        client_version="legacy-bootstrap",
+        contract_version=CONTRACT_VERSION,
+    )
+    opened = await open_session(session_payload)
+    timezone_name = await _resolve_timezone_for_user(
+        user_id=device_id,
+        provided_timezone=payload.timezone,
+    )
+    _log_event(
+        logging.WARNING,
+        "Legacy bootstrap route used",
+        device_id=device_id,
+        session_id=opened["session_id"],
+        timezone=timezone_name,
+        source=source,
+    )
+    return {
+        "device_id": device_id,
+        "user_id": device_id,
+        "timezone": timezone_name,
+        "session_id": opened["session_id"],
+        "threads": [],
+        "messages": opened["messages"],
+        "needs_onboarding": opened["needs_onboarding"],
+        "profile_context": opened["profile_context"],
+    }
+
+
 @app.post("/agent/session/open")
 async def open_session(payload: SessionOpenRequest) -> Dict[str, Any]:
     device_id = payload.device_id.strip()
@@ -4151,6 +4233,22 @@ async def open_session(payload: SessionOpenRequest) -> Dict[str, Any]:
 
     correlation_id = _new_correlation_id()
     contract = _resolve_session_open_contract(payload)
+    requested_entry_context = payload.entry_context or EntryContext(source=payload.source, entry_mode="reactive")
+    _log_event(
+        logging.INFO,
+        "Session open requested",
+        device_id=device_id,
+        session_id=payload.session_id or "",
+        timezone=payload.timezone or "",
+        correlation_id=correlation_id,
+        open_id=contract.open_id,
+        source=payload.source,
+        client_version=contract.client_version,
+        contract_version=contract.contract_version,
+        entry_mode=requested_entry_context.entry_mode,
+        trigger_type=requested_entry_context.trigger_type or "",
+        event_id=requested_entry_context.event_id or "",
+    )
     _enforce_session_open_contract(contract)
     timezone_name = await _resolve_timezone_for_user(
         user_id=device_id,
@@ -4723,6 +4821,16 @@ async def agent_ws(
                         "message"
                     ]
                     code = "session_forbidden" if error.status_code == 403 else "session_init_failed"
+                    _log_event(
+                        logging.WARNING,
+                        "WebSocket session init rejected",
+                        device_id=active_user_id,
+                        session_id=active_session_id,
+                        correlation_id=ws_correlation_id,
+                        status_code=error.status_code,
+                        error_code=code,
+                        error_message=detail,
+                    )
                     if not await _safe_send_json({"type": "error", "code": code, "detail": detail}):
                         break
                     continue

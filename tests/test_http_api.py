@@ -207,12 +207,23 @@ def test_session_open_rejects_contract_version_mismatch(app_client):
     assert payload["code"] == "CONTRACT_VERSION_MISMATCH"
 
 
-def test_legacy_bootstrap_route_is_removed(app_client):
+def test_legacy_bootstrap_route_maps_to_session_open(app_client):
     client = app_client["client"]
 
-    response = client.post("/agent/bootstrap-device", json={"device_id": "device-old"})
+    response = client.post(
+        "/agent/bootstrap-device",
+        json={"device_id": "device-old", "timezone": "Asia/Kolkata"},
+    )
 
-    assert response.status_code == 404
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["device_id"] == "device-old"
+    assert payload["user_id"] == "device-old"
+    assert payload["timezone"] == "Asia/Kolkata"
+    assert payload["session_id"].startswith("session_device-old_")
+    assert payload["threads"] == []
+    assert payload["needs_onboarding"] is True
+    assert isinstance(payload["messages"], list)
 
 
 def test_execute_event_runs_in_cloud_run_endpoint(app_client, monkeypatch):
