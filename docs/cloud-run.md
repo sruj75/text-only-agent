@@ -48,7 +48,8 @@ If a secret already exists, add a new version instead:
 ## Smoke test checklist
 - `GET /health` returns `status=ok`, `repository_mode=supabase`, and `strict_startup_validation=true`
 - `POST /agent/session/open` works
-- `POST /agent/onboarding/complete` works
+- `POST /agent/onboarding/start` works
+- `POST /agent/onboarding/sleep-schedule` works
 - `POST /agent/task-management` works
 - WebSocket `/agent/ws` can connect, stream, and reconnect
 - Logs show structured JSON entries for startup, HTTP requests, WebSocket lifecycle, and failures

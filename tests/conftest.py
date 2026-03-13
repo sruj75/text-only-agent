@@ -63,6 +63,7 @@ def app_client(monkeypatch: pytest.MonkeyPatch):
     repo = main.InMemoryRepository()
 
     monkeypatch.setattr(main, "agent", fake_agent)
+    monkeypatch.setattr(main, "onboarding_agent", fake_agent)
     monkeypatch.setattr(main, "repository", repo)
 
     with TestClient(main.app) as client:

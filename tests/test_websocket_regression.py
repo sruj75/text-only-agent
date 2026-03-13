@@ -13,10 +13,21 @@ def _bootstrap(
     device_id: str = "device-ws",
     timezone: str = "Asia/Kolkata",
     session_id: str | None = None,
+    complete_onboarding: bool = True,
 ):
     repository = app_client["repository"]
     target_session_id = session_id or main._daily_session_id(device_id, timezone)
     asyncio.run(repository.ensure_user(user_id=device_id, timezone_name=timezone))
+    if complete_onboarding:
+        asyncio.run(
+            repository.upsert_user_profile(
+                user_id=device_id,
+                timezone_name=timezone,
+                wake_time="07:00",
+                bedtime="23:00",
+                onboarding_status=main.ONBOARDING_STATUS_COMPLETED,
+            )
+        )
     asyncio.run(
         main._ensure_session(
             user_id=device_id,
@@ -33,15 +44,21 @@ def _bootstrap(
 
 
 def _complete_onboarding(client, *, device_id: str, timezone: str):
+    started = client.post(
+        "/agent/onboarding/start",
+        json={
+            "device_id": device_id,
+            "timezone": timezone,
+        },
+    )
+    assert started.status_code == 200
     response = client.post(
-        "/agent/onboarding/complete",
+        "/agent/onboarding/sleep-schedule",
         json={
             "device_id": device_id,
             "timezone": timezone,
             "wake_time": "07:00",
             "bedtime": "23:00",
-            "playbook": "Start with one tiny step.",
-            "health_anchors": ["Breakfast"],
         },
     )
     assert response.status_code == 200
@@ -318,7 +335,7 @@ def test_ws_returns_adk_error_without_followup_assistant_message(app_client):
     assert [msg["role"] for msg in payload] == ["user"]
 
 
-def test_ws_includes_due_diligence_for_post_onboarding(app_client):
+def test_ws_includes_due_diligence_for_proactive_context(app_client):
     client = app_client["client"]
     fake_agent = app_client["agent"]
     bootstrap = _bootstrap(app_client, device_id="device-post-onboarding")
@@ -330,7 +347,7 @@ def test_ws_includes_due_diligence_for_post_onboarding(app_client):
         entry_context={
             "source": "push",
             "entry_mode": "proactive",
-            "trigger_type": "post_onboarding",
+            "trigger_type": "before_task",
         },
     )
 
@@ -353,7 +370,7 @@ def test_ws_includes_due_diligence_for_post_onboarding(app_client):
 
     stream_context = fake_agent.stream_calls[-1]["context"]
     assert stream_context["entry_mode"] == "proactive"
-    assert stream_context["trigger_type"] == "post_onboarding"
+    assert stream_context["trigger_type"] == "before_task"
     assert "due_diligence_time" in stream_context
     assert "due_diligence_schedule" in stream_context
     assert "due_diligence_tasks" in stream_context
@@ -388,18 +405,7 @@ def test_ws_includes_profile_context_from_onboarding(app_client):
     client = app_client["client"]
     fake_agent = app_client["agent"]
 
-    completed = client.post(
-        "/agent/onboarding/complete",
-        json={
-            "device_id": "device-profile",
-            "timezone": "UTC",
-            "wake_time": "07:00",
-            "bedtime": "23:00",
-            "playbook": "Start with one tiny step.",
-            "health_anchors": ["Breakfast"],
-        },
-    )
-    assert completed.status_code == 200
+    _complete_onboarding(client, device_id="device-profile", timezone="UTC")
 
     bootstrap = _bootstrap(app_client, device_id="device-profile")
     with client.websocket_connect(
@@ -525,23 +531,12 @@ def test_ws_init_acks_session_without_history_sync(app_client):
     assert len(done) == 1
 
 
-def test_session_open_post_onboarding_handoff_runs_once_per_lifetime(app_client):
+def test_session_open_does_not_rewrite_proactive_trigger_context(app_client):
     client = app_client["client"]
     fake_agent = app_client["agent"]
-    device_id = "device-post-onboarding-once"
+    device_id = "device-proactive-context"
 
-    completed = client.post(
-        "/agent/onboarding/complete",
-        json={
-            "device_id": device_id,
-            "timezone": "UTC",
-            "wake_time": "07:00",
-            "bedtime": "23:00",
-            "playbook": "Plan one step at a time.",
-            "health_anchors": ["Breakfast"],
-        },
-    )
-    assert completed.status_code == 200
+    _complete_onboarding(client, device_id=device_id, timezone="UTC")
     bootstrap = _bootstrap(app_client, device_id=device_id)
     daily_session_id = bootstrap["session_id"]
 
@@ -553,12 +548,12 @@ def test_session_open_post_onboarding_handoff_runs_once_per_lifetime(app_client)
         entry_context={
             "source": "push",
             "entry_mode": "proactive",
-            "trigger_type": "post_onboarding",
+            "trigger_type": "before_task",
         },
     )
-    assert fake_agent.run_calls[0]["context"]["trigger_type"] == "post_onboarding"
+    assert fake_agent.run_calls[0]["context"]["trigger_type"] == "before_task"
 
-    second_session_id = "session_device-post-onboarding-once_secondary"
+    second_session_id = "session_device-proactive-context_secondary"
 
     _open_session(
         client,
@@ -568,12 +563,12 @@ def test_session_open_post_onboarding_handoff_runs_once_per_lifetime(app_client)
         entry_context={
             "source": "push",
             "entry_mode": "proactive",
-            "trigger_type": "post_onboarding",
+            "trigger_type": "before_task",
         },
     )
     second_context = fake_agent.run_calls[1]["context"]
-    assert second_context["entry_mode"] == "reactive"
-    assert second_context["trigger_type"] == ""
+    assert second_context["entry_mode"] == "proactive"
+    assert second_context["trigger_type"] == "before_task"
 
 
 def test_session_open_proactive_ack_tracks_only_current_event_and_surfaces_missed_today_once(app_client):

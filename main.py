@@ -17,7 +17,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from startup_agent.adk import SimpleADK
+from startup_agent.adk import ONBOARDING_INSTRUCTION, SimpleADK
 from startup_agent.task_actions import (
     TASK_INTENT_LABELS,
     TASK_MANAGEMENT_INTENTS,
@@ -202,6 +202,16 @@ PROACTIVE_ACK_STATE_KEY = "proactive_ack_event_ids_v1"
 MISSED_REPORTED_STATE_KEY = "missed_reported_event_ids_v1"
 MISSED_PROACTIVE_EVENT_TYPES = {"morning_wake", "checkin", "calendar_reminder"}
 MISSED_PROACTIVE_MAX_EVENTS = 5
+ONBOARDING_STATUS_PENDING = "pending"
+ONBOARDING_STATUS_IN_PROGRESS = "in_progress"
+ONBOARDING_STATUS_READY_FOR_MAIN = "ready_for_main"
+ONBOARDING_STATUS_COMPLETED = "completed"
+ONBOARDING_AGENT_STATUSES = {
+    ONBOARDING_STATUS_IN_PROGRESS,
+    ONBOARDING_STATUS_READY_FOR_MAIN,
+}
+WAKE_PURPOSE_DAILY_LOOP = "daily_loop"
+WAKE_PURPOSE_ONBOARDING_UNLOCK = "onboarding_unlock"
 
 
 @dataclass
@@ -571,17 +581,6 @@ def _append_event_id(existing: List[str], event_id: str) -> List[str]:
     return [*existing, value]
 
 
-def _default_health_anchors(wake_time: str, bedtime: str) -> List[str]:
-    anchors: List[str] = []
-    if _is_valid_hhmm(wake_time):
-        anchors.append(f"Morning reset around {wake_time}")
-    if _is_valid_hhmm(bedtime):
-        anchors.append(f"Night shutdown around {bedtime}")
-    if not anchors:
-        anchors.append("Daily consistency check-in")
-    return anchors
-
-
 def _get_current_time_context(timezone_name: str) -> Dict[str, str]:
     now_utc = _utc_now()
     now_local = now_utc.astimezone(ZoneInfo(timezone_name))
@@ -635,13 +634,16 @@ class PushTokenRequest(BaseModel):
     timezone: str | None = Field(default=None)
 
 
-class OnboardingCompleteRequest(BaseModel):
+class OnboardingStartRequest(BaseModel):
+    device_id: str
+    timezone: str | None = Field(default=None)
+
+
+class OnboardingSleepScheduleRequest(BaseModel):
     device_id: str
     timezone: str | None = Field(default=None)
     wake_time: str = Field(..., min_length=1)
     bedtime: str = Field(..., min_length=1)
-    playbook: str = Field(..., min_length=1)
-    health_anchors: List[str] = Field(default_factory=list)
 
 
 class TaskManagementRequest(BaseModel):
@@ -846,10 +848,7 @@ class InMemoryRepository:
         existing.setdefault("created_at", _iso_now())
         existing.setdefault("wake_time", None)
         existing.setdefault("bedtime", None)
-        existing.setdefault("health_anchors", [])
-        existing.setdefault("playbook", {})
-        existing.setdefault("onboarding_status", "pending")
-        existing.setdefault("onboarding_completed_at", None)
+        existing.setdefault("onboarding_status", ONBOARDING_STATUS_PENDING)
         self.users[user_id] = existing
 
     async def upsert_push_token(self, user_id: str, expo_push_token: str) -> None:
@@ -873,22 +872,16 @@ class InMemoryRepository:
         *,
         user_id: str,
         timezone_name: str,
-        wake_time: str,
-        bedtime: str,
-        playbook: Dict[str, Any],
-        health_anchors: List[str],
+        wake_time: str | None,
+        bedtime: str | None,
         onboarding_status: str,
-        onboarding_completed_at: str | None,
     ) -> Dict[str, Any]:
         await self.ensure_user(user_id=user_id, timezone_name=timezone_name)
         existing = self.users.get(user_id, {})
         existing["timezone"] = timezone_name
         existing["wake_time"] = wake_time
         existing["bedtime"] = bedtime
-        existing["playbook"] = playbook
-        existing["health_anchors"] = health_anchors
         existing["onboarding_status"] = onboarding_status
-        existing["onboarding_completed_at"] = onboarding_completed_at
         existing["updated_at"] = _iso_now()
         self.users[user_id] = existing
         return dict(existing)
@@ -1415,7 +1408,7 @@ class SupabaseRepository:
             "users",
             params={
                 "user_id": f"eq.{user_id}",
-                "select": "user_id,wake_time,bedtime,timezone,health_anchors,onboarding_status,onboarding_completed_at,playbook,created_at,updated_at",
+                "select": "user_id,wake_time,bedtime,timezone,onboarding_status,created_at,updated_at",
                 "limit": "1",
             },
         )
@@ -1441,12 +1434,9 @@ class SupabaseRepository:
         *,
         user_id: str,
         timezone_name: str,
-        wake_time: str,
-        bedtime: str,
-        playbook: Dict[str, Any],
-        health_anchors: List[str],
+        wake_time: str | None,
+        bedtime: str | None,
         onboarding_status: str,
-        onboarding_completed_at: str | None,
     ) -> Dict[str, Any]:
         rows = await self._request(
             "POST",
@@ -1458,10 +1448,7 @@ class SupabaseRepository:
                     "timezone": timezone_name,
                     "wake_time": wake_time,
                     "bedtime": bedtime,
-                    "playbook": playbook,
-                    "health_anchors": health_anchors,
                     "onboarding_status": onboarding_status,
-                    "onboarding_completed_at": onboarding_completed_at,
                 }
             ],
             extra_headers={"Prefer": "resolution=merge-duplicates,return=representation"},
@@ -2411,11 +2398,48 @@ async def _tool_task_query(
         }
 
 
+async def _tool_onboarding_sleep_schedule(
+    wake_time: str,
+    bedtime: str,
+    session_id: str | None,
+    timezone: str | None,
+    runtime_context: Dict[str, str],
+) -> Dict[str, Any]:
+    raw_user_id = str(runtime_context.get("user_id") or "").strip()
+    if not raw_user_id:
+        return {"ok": False, "error": "missing_user_id"}
+    try:
+        timezone_name = await _resolve_timezone_for_user(
+            user_id=raw_user_id,
+            provided_timezone=timezone or runtime_context.get("timezone"),
+        )
+        target_session_id = session_id or runtime_context.get("session_id")
+        output = await _set_onboarding_sleep_schedule(
+            device_id=raw_user_id,
+            timezone_name=timezone_name,
+            wake_time=wake_time,
+            bedtime=bedtime,
+            session_id=target_session_id,
+        )
+        return {"ok": True, **output}
+    except HTTPException as error:
+        error_message = _error_envelope(status_code=error.status_code, detail=error.detail)["error"]["message"]
+        return {"ok": False, "error": error_message}
+    except Exception as error:
+        return {"ok": False, "error": str(error)}
+
+
 agent = SimpleADK(
     get_current_time_tool=_tool_get_current_time,
     task_management_tool=_tool_task_management,
     task_query_tool=_tool_task_query,
     enable_task_tools=TASK_TOOL_CALLING_V1_ENABLED,
+)
+onboarding_agent = SimpleADK(
+    instruction=ONBOARDING_INSTRUCTION,
+    agent_name="intentive_onboarding",
+    onboarding_sleep_schedule_tool=_tool_onboarding_sleep_schedule,
+    enable_onboarding_tool=True,
 )
 
 
@@ -2575,33 +2599,56 @@ def _build_profile_context(user_profile: Dict[str, Any] | None) -> Dict[str, Any
     profile = user_profile or {}
     wake_time = str(profile.get("wake_time") or "").strip()
     bedtime = str(profile.get("bedtime") or "").strip()
-
-    raw_playbook = profile.get("playbook")
-    playbook: Dict[str, Any] = raw_playbook if isinstance(raw_playbook, dict) else {}
-    anchors = _normalize_text_list(profile.get("health_anchors"))
-    onboarding_status = str(profile.get("onboarding_status") or "pending").strip() or "pending"
+    onboarding_status = _normalize_onboarding_status(profile.get("onboarding_status"))
 
     return {
         "wake_time": wake_time or None,
         "bedtime": bedtime or None,
-        "playbook": playbook,
-        "health_anchors": anchors,
         "onboarding_status": onboarding_status,
     }
 
 
+def _normalize_onboarding_status(raw_status: Any) -> str:
+    status = str(raw_status or "").strip().lower()
+    if status in {
+        ONBOARDING_STATUS_PENDING,
+        ONBOARDING_STATUS_IN_PROGRESS,
+        ONBOARDING_STATUS_READY_FOR_MAIN,
+        ONBOARDING_STATUS_COMPLETED,
+    }:
+        return status
+    return ONBOARDING_STATUS_PENDING
+
+
 def _needs_onboarding(user_profile: Dict[str, Any] | None) -> bool:
-    status = str((user_profile or {}).get("onboarding_status") or "pending").strip().lower()
-    return status != "completed"
+    status = _normalize_onboarding_status((user_profile or {}).get("onboarding_status"))
+    return status == ONBOARDING_STATUS_PENDING
 
 
-def _startup_prompt(entry_context: EntryContext) -> str:
-    trigger_type = (entry_context.trigger_type or "").strip().lower()
-    if trigger_type == "post_onboarding":
+def _onboarding_agent_enabled(profile_context: Dict[str, Any] | None) -> bool:
+    status = _normalize_onboarding_status((profile_context or {}).get("onboarding_status"))
+    return status in ONBOARDING_AGENT_STATUSES
+
+
+def _wake_purpose_from_payload(payload: Dict[str, Any] | None) -> str:
+    if not isinstance(payload, dict):
+        return WAKE_PURPOSE_DAILY_LOOP
+    raw_purpose = str(payload.get("wake_purpose") or "").strip().lower()
+    if raw_purpose == WAKE_PURPOSE_ONBOARDING_UNLOCK:
+        return WAKE_PURPOSE_ONBOARDING_UNLOCK
+    if raw_purpose == WAKE_PURPOSE_DAILY_LOOP:
+        return WAKE_PURPOSE_DAILY_LOOP
+    if bool(payload.get("onboarding_unlock")):
+        return WAKE_PURPOSE_ONBOARDING_UNLOCK
+    return WAKE_PURPOSE_DAILY_LOOP
+
+
+def _startup_prompt(entry_context: EntryContext, *, onboarding_agent_enabled: bool) -> str:
+    if onboarding_agent_enabled:
         return (
-            "Conversation bootstrap: first post-onboarding handoff. "
-            "Generate the first assistant message naturally using context. "
-            "Keep it brief, supportive, and action-oriented."
+            "Conversation bootstrap: onboarding open. "
+            "Greet the user and ask for wake time first, then bedtime. "
+            "After both are collected, call onboarding_sleep_schedule and confirm setup."
         )
     if entry_context.entry_mode == "proactive":
         return (
@@ -2702,6 +2749,7 @@ async def _ensure_startup_message_for_session(
     open_id: str,
     timezone_name: str,
     entry_context: EntryContext,
+    profile_context: Dict[str, Any],
     source: Literal["manual", "push"],
     missed_proactive_events: List[Dict[str, Any]] | None = None,
 ) -> tuple[StartupWorkflowState, str | None, bool]:
@@ -2719,6 +2767,8 @@ async def _ensure_startup_message_for_session(
 
     try:
         inserted_by_this_call = False
+        use_onboarding_agent = _onboarding_agent_enabled(profile_context)
+        selected_agent = onboarding_agent if use_onboarding_agent else agent
         context_map = await _build_runtime_context_for_session(
             user_id=user_id,
             session_id=session_id,
@@ -2726,8 +2776,11 @@ async def _ensure_startup_message_for_session(
             entry_context=entry_context,
             missed_proactive_events=missed_proactive_events,
         )
-        output = await agent.run(
-            prompt=_startup_prompt(entry_context),
+        output = await selected_agent.run(
+            prompt=_startup_prompt(
+                entry_context,
+                onboarding_agent_enabled=use_onboarding_agent,
+            ),
             user_id=user_id,
             session_id=session_id,
             context=context_map,
@@ -2746,6 +2799,7 @@ async def _ensure_startup_message_for_session(
                 "startup_generation_key": idempotency_key,
                 "entry_context": entry_context.model_dump(),
                 "source": source,
+                "agent_mode": "onboarding" if use_onboarding_agent else "main",
                 "correlation_id": _new_correlation_id(),
             },
             created_at=generated_at,
@@ -2838,7 +2892,12 @@ async def _resolve_timezone_for_user(
     )
 
 
-def _next_wake_run_at_utc(*, timezone_name: str, wake_time_hhmm: str) -> datetime:
+def _next_wake_run_at_utc(
+    *,
+    timezone_name: str,
+    wake_time_hhmm: str,
+    force_tomorrow: bool = False,
+) -> datetime:
     if not _is_valid_hhmm(wake_time_hhmm):
         raise _http_error(400, "INVALID_WAKE_TIME", "wake_time must be HH:MM (24h)")
     wake_hour, wake_minute = [int(part) for part in wake_time_hhmm.split(":")]
@@ -2849,7 +2908,7 @@ def _next_wake_run_at_utc(*, timezone_name: str, wake_time_hhmm: str) -> datetim
         second=0,
         microsecond=0,
     )
-    if target_local <= now_local:
+    if force_tomorrow or target_local <= now_local:
         target_local = target_local + timedelta(days=1)
     return target_local.astimezone(timezone.utc)
 
@@ -2859,14 +2918,31 @@ async def _seed_next_morning_wake_event(
     user_id: str,
     timezone_name: str,
     wake_time: str,
+    reason: str = "daily_bootstrap",
+    wake_purpose: str = WAKE_PURPOSE_DAILY_LOOP,
+    force_tomorrow: bool = False,
 ) -> Dict[str, Any]:
+    if wake_purpose not in {WAKE_PURPOSE_DAILY_LOOP, WAKE_PURPOSE_ONBOARDING_UNLOCK}:
+        wake_purpose = WAKE_PURPOSE_DAILY_LOOP
+
+    run_at = _next_wake_run_at_utc(
+        timezone_name=timezone_name,
+        wake_time_hhmm=wake_time,
+        force_tomorrow=force_tomorrow,
+    )
+    seed_date = _date_key_for_datetime(run_at, timezone_name)
     existing = await repository.list_future_events(
         user_id=user_id,
         from_time_iso=_iso_now(),
         event_type="morning_wake",
     )
-    if existing:
-        earliest = existing[0]
+    matching_existing = [
+        event
+        for event in existing
+        if _wake_purpose_from_payload(event.payload) == wake_purpose
+    ]
+    if matching_existing:
+        earliest = matching_existing[0]
         return {
             "seeded": False,
             "reason": "existing_pending_morning_wake",
@@ -2875,17 +2951,23 @@ async def _seed_next_morning_wake_event(
             "scheduled_time": earliest.scheduled_time,
         }
 
-    run_at = _next_wake_run_at_utc(timezone_name=timezone_name, wake_time_hhmm=wake_time)
-    seed_date = _date_key_for_datetime(run_at, timezone_name)
     event_payload = {
         "schedule_owner": "system",
         "schedule_policy": "morning_bootstrap",
         "seed_date": seed_date,
         "timezone": timezone_name,
-        "reason": "daily_bootstrap",
+        "reason": reason,
         "trigger_type": "morning_wake",
+        "wake_purpose": wake_purpose,
     }
-    event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"morning_wake:{user_id}:{seed_date}"))
+    if wake_purpose == WAKE_PURPOSE_ONBOARDING_UNLOCK:
+        event_payload["onboarding_unlock"] = True
+    event_id = str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"morning_wake:{wake_purpose}:{user_id}:{seed_date}",
+        )
+    )
     try:
         created_event = await repository.create_event(
             CheckinEventRecord(
@@ -2916,8 +2998,9 @@ async def _seed_next_morning_wake_event(
                 for event in existing
                 if isinstance(event.payload, dict)
                 and str(event.payload.get("seed_date") or "").strip() == seed_date
+                and _wake_purpose_from_payload(event.payload) == wake_purpose
             ),
-            existing[0] if existing else None,
+            None,
         )
         if not matching:
             raise
@@ -3077,6 +3160,12 @@ async def _prepare_session_state(
     user_profile = await repository.get_user_profile(user_id=user_id)
     profile_context = _build_profile_context(user_profile)
     needs_onboarding = _needs_onboarding(user_profile)
+    onboarding_status = _normalize_onboarding_status(profile_context.get("onboarding_status"))
+    lifecycle_state = "active"
+    if needs_onboarding:
+        lifecycle_state = "needs_onboarding"
+    elif onboarding_status in ONBOARDING_AGENT_STATUSES:
+        lifecycle_state = "onboarding_active"
     session_record = await _ensure_session(
         user_id=user_id,
         session_id=session_id,
@@ -3084,7 +3173,7 @@ async def _prepare_session_state(
         entry_context=entry_context,
         state_patch={
             "profile_context": profile_context,
-            "lifecycle_state": "needs_onboarding" if needs_onboarding else "active",
+            "lifecycle_state": lifecycle_state,
         },
     )
     session_state = dict(session_record.state if session_record else {})
@@ -4463,6 +4552,40 @@ async def _finalize_event_execution_attempt(
             next_retry_at=None,
             workflow_state="succeeded",
         )
+        if context.event_type == "morning_wake" and bool(context.event_payload.get("onboarding_unlock")):
+            existing_profile = await repository.get_user_profile(user_id=context.event_user_id)
+            wake_time = str((existing_profile or {}).get("wake_time") or "").strip() or None
+            bedtime = str((existing_profile or {}).get("bedtime") or "").strip() or None
+            timezone_name = (
+                context.session_timezone
+                or _timezone_from_user_profile(existing_profile)
+                or "UTC"
+            )
+            user_profile = await repository.upsert_user_profile(
+                user_id=context.event_user_id,
+                timezone_name=timezone_name,
+                wake_time=wake_time,
+                bedtime=bedtime,
+                onboarding_status=ONBOARDING_STATUS_COMPLETED,
+            )
+            profile_context = _build_profile_context(user_profile)
+            await _ensure_session(
+                user_id=context.event_user_id,
+                session_id=context.session_id,
+                timezone_name=timezone_name,
+                entry_context=EntryContext(
+                    source="push",
+                    event_id=context.event_id,
+                    trigger_type=context.trigger_type,
+                    scheduled_time=_coerce_string(context.event.scheduled_time),
+                    calendar_event_id=context.calendar_event_id,
+                    entry_mode="proactive",
+                ),
+                state_patch={
+                    "profile_context": profile_context,
+                    "lifecycle_state": "active",
+                },
+            )
         return (
             200,
             {
@@ -4599,15 +4722,6 @@ async def bootstrap_device(payload: LegacyBootstrapRequest) -> Dict[str, Any]:
         raise _http_error(400, "INVALID_DEVICE_ID", "device_id is required")
 
     entry_context = payload.entry_context or EntryContext()
-    if payload.entry_context is None:
-        user_profile = await repository.get_user_profile(user_id=device_id)
-        onboarding_status = str((user_profile or {}).get("onboarding_status") or "").strip().lower()
-        if onboarding_status == "completed" and not await repository.has_conversation_history(user_id=device_id):
-            entry_context = EntryContext(
-                source="manual",
-                entry_mode="proactive",
-                trigger_type="post_onboarding",
-            )
     source = entry_context.source or "manual"
     session_payload = SessionOpenRequest(
         device_id=device_id,
@@ -4679,9 +4793,6 @@ async def open_session(payload: SessionOpenRequest) -> Dict[str, Any]:
     entry_context = base_entry_context.model_copy(
         update={"source": payload.source or base_entry_context.source}
     )
-    is_post_onboarding = (entry_context.trigger_type or "").strip().lower() == "post_onboarding"
-    if is_post_onboarding and await repository.has_conversation_history(user_id=device_id):
-        entry_context = entry_context.model_copy(update={"entry_mode": "reactive", "trigger_type": None})
     session_id = payload.session_id or _daily_session_id(device_id, timezone_name)
 
     prepared = await _prepare_session_state(
@@ -4696,9 +4807,10 @@ async def open_session(payload: SessionOpenRequest) -> Dict[str, Any]:
     startup_message_id: str | None = None
     startup_generated = False
     morning_seed: Dict[str, Any] | None = None
+    onboarding_status = _normalize_onboarding_status(prepared.profile_context.get("onboarding_status"))
     if not prepared.needs_onboarding:
         wake_time = str(prepared.profile_context.get("wake_time") or "").strip()
-        if wake_time:
+        if onboarding_status == ONBOARDING_STATUS_COMPLETED and wake_time:
             try:
                 morning_seed = await _seed_next_morning_wake_event(
                     user_id=device_id,
@@ -4719,6 +4831,7 @@ async def open_session(payload: SessionOpenRequest) -> Dict[str, Any]:
             open_id=contract.open_id,
             timezone_name=timezone_name,
             entry_context=entry_context,
+            profile_context=prepared.profile_context,
             source=payload.source,
             missed_proactive_events=prepared.missed_proactive_events,
         )
@@ -4850,44 +4963,28 @@ async def register_push_token(payload: PushTokenRequest) -> Dict[str, Any]:
     return {"status": "ok", "device_id": device_id, "timezone": timezone_name}
 
 
-@app.post("/agent/onboarding/complete")
-async def complete_onboarding(payload: OnboardingCompleteRequest) -> Dict[str, Any]:
-    device_id = payload.device_id.strip()
-    timezone_name = await _resolve_timezone_for_user(
-        user_id=device_id,
-        provided_timezone=payload.timezone,
-    )
-    wake_time = payload.wake_time.strip()
-    bedtime = payload.bedtime.strip()
-    playbook_text = payload.playbook.strip()
-    health_anchors = _normalize_text_list(payload.health_anchors)
-
-    if not device_id:
-        raise _http_error(400, "INVALID_DEVICE_ID", "device_id is required")
-    if not _is_valid_hhmm(wake_time):
-        raise _http_error(400, "INVALID_WAKE_TIME", "wake_time must be HH:MM (24h)")
-    if not _is_valid_hhmm(bedtime):
-        raise _http_error(400, "INVALID_BEDTIME", "bedtime must be HH:MM (24h)")
-    if len(playbook_text) < 3:
-        raise _http_error(400, "INVALID_PLAYBOOK", "playbook must have at least 3 characters")
-    if not health_anchors:
-        health_anchors = _default_health_anchors(wake_time, bedtime)
-
-    playbook = {"notes": playbook_text}
-    completed_at = _iso_now()
-
+async def _set_onboarding_started(
+    *,
+    device_id: str,
+    timezone_name: str,
+) -> Dict[str, Any]:
     await repository.ensure_user(user_id=device_id, timezone_name=timezone_name)
+    existing_profile = await repository.get_user_profile(user_id=device_id)
+    existing_status = _normalize_onboarding_status((existing_profile or {}).get("onboarding_status"))
+    next_status = (
+        ONBOARDING_STATUS_IN_PROGRESS
+        if existing_status == ONBOARDING_STATUS_PENDING
+        else existing_status
+    )
+    wake_time = str((existing_profile or {}).get("wake_time") or "").strip() or None
+    bedtime = str((existing_profile or {}).get("bedtime") or "").strip() or None
     user_profile = await repository.upsert_user_profile(
         user_id=device_id,
         timezone_name=timezone_name,
         wake_time=wake_time,
         bedtime=bedtime,
-        playbook=playbook,
-        health_anchors=health_anchors,
-        onboarding_status="completed",
-        onboarding_completed_at=completed_at,
+        onboarding_status=next_status,
     )
-
     profile_context = _build_profile_context(user_profile)
     daily_session_id = _daily_session_id(device_id, timezone_name)
     await _ensure_session(
@@ -4898,44 +4995,122 @@ async def complete_onboarding(payload: OnboardingCompleteRequest) -> Dict[str, A
         state_patch={
             "thread_type": "daily",
             "profile_context": profile_context,
-            "lifecycle_state": "active",
+            "lifecycle_state": "onboarding_active"
+            if _onboarding_agent_enabled(profile_context)
+            else "active",
         },
     )
-    morning_seed: Dict[str, Any] | None = None
-    try:
-        morning_seed = await _seed_next_morning_wake_event(
-            user_id=device_id,
-            timezone_name=timezone_name,
-            wake_time=wake_time,
-        )
-    except Exception as error:
-        _log_event(
-            logging.WARNING,
-            "Morning wake seed skipped during onboarding",
-            device_id=device_id,
-            timezone=timezone_name,
-            error=str(error),
-        )
-    _log_event(
-        logging.INFO,
-        "Onboarding completed",
-        device_id=device_id,
-        session_id=daily_session_id,
-        timezone=timezone_name,
-        seeded=morning_seed.get("seeded") if morning_seed else None,
-        scheduled=bool(morning_seed.get("cloud_task_name")) if morning_seed else None,
-        event_id=morning_seed.get("event_id") if morning_seed else None,
-        scheduled_time=morning_seed.get("scheduled_time") if morning_seed else None,
-        reason=morning_seed.get("reason") if morning_seed else "seed_failed",
-    )
-
     return {
         "status": "ok",
         "device_id": device_id,
         "timezone": timezone_name,
-        "needs_onboarding": False,
+        "session_id": daily_session_id,
+        "needs_onboarding": _needs_onboarding(user_profile),
         "profile_context": profile_context,
     }
+
+
+async def _set_onboarding_sleep_schedule(
+    *,
+    device_id: str,
+    timezone_name: str,
+    wake_time: str,
+    bedtime: str,
+    session_id: str | None = None,
+) -> Dict[str, Any]:
+    normalized_wake = wake_time.strip()
+    normalized_bedtime = bedtime.strip()
+    if not _is_valid_hhmm(normalized_wake):
+        raise _http_error(400, "INVALID_WAKE_TIME", "wake_time must be HH:MM (24h)")
+    if not _is_valid_hhmm(normalized_bedtime):
+        raise _http_error(400, "INVALID_BEDTIME", "bedtime must be HH:MM (24h)")
+    await repository.ensure_user(user_id=device_id, timezone_name=timezone_name)
+    user_profile = await repository.upsert_user_profile(
+        user_id=device_id,
+        timezone_name=timezone_name,
+        wake_time=normalized_wake,
+        bedtime=normalized_bedtime,
+        onboarding_status=ONBOARDING_STATUS_READY_FOR_MAIN,
+    )
+    profile_context = _build_profile_context(user_profile)
+    target_session_id = session_id or _daily_session_id(device_id, timezone_name)
+    await _ensure_session(
+        user_id=device_id,
+        session_id=target_session_id,
+        timezone_name=timezone_name,
+        entry_context=EntryContext(source="manual", entry_mode="reactive"),
+        state_patch={
+            "thread_type": "daily",
+            "profile_context": profile_context,
+            "lifecycle_state": "onboarding_active",
+        },
+    )
+    morning_seed = await _seed_next_morning_wake_event(
+        user_id=device_id,
+        timezone_name=timezone_name,
+        wake_time=normalized_wake,
+        reason="onboarding_unlock",
+        wake_purpose=WAKE_PURPOSE_ONBOARDING_UNLOCK,
+        force_tomorrow=True,
+    )
+    _log_event(
+        logging.INFO,
+        "Onboarding sleep schedule saved",
+        device_id=device_id,
+        session_id=target_session_id,
+        timezone=timezone_name,
+        status=ONBOARDING_STATUS_READY_FOR_MAIN,
+        seeded=morning_seed.get("seeded"),
+        reason=morning_seed.get("reason"),
+        event_id=morning_seed.get("event_id"),
+        scheduled_time=morning_seed.get("scheduled_time"),
+    )
+    return {
+        "status": "ok",
+        "device_id": device_id,
+        "timezone": timezone_name,
+        "session_id": target_session_id,
+        "needs_onboarding": False,
+        "profile_context": profile_context,
+        "morning_seed": morning_seed,
+    }
+
+
+@app.post("/agent/onboarding/start")
+async def onboarding_start(payload: OnboardingStartRequest) -> Dict[str, Any]:
+    device_id = payload.device_id.strip()
+    if not device_id:
+        raise _http_error(400, "INVALID_DEVICE_ID", "device_id is required")
+    timezone_name = await _resolve_timezone_for_user(
+        user_id=device_id,
+        provided_timezone=payload.timezone,
+    )
+    output = await _set_onboarding_started(device_id=device_id, timezone_name=timezone_name)
+    _log_event(
+        logging.INFO,
+        "Onboarding started",
+        device_id=device_id,
+        session_id=output.get("session_id"),
+        timezone=timezone_name,
+    )
+    return output
+
+
+@app.post("/agent/onboarding/sleep-schedule")
+async def onboarding_sleep_schedule(payload: OnboardingSleepScheduleRequest) -> Dict[str, Any]:
+    device_id = payload.device_id.strip()
+    if not device_id:
+        raise _http_error(400, "INVALID_DEVICE_ID", "device_id is required")
+    timezone_name = await _resolve_timezone_for_user(
+        user_id=device_id,
+        provided_timezone=payload.timezone,
+    )
+    return await _set_onboarding_sleep_schedule(
+        device_id=device_id,
+        timezone_name=timezone_name,
+        wake_time=payload.wake_time,
+        bedtime=payload.bedtime,
+    )
 
 
 @app.post("/agent/task-management")
@@ -5075,6 +5250,7 @@ async def agent_ws(
     initialized = False
     latest_entry_context = EntryContext()
     latest_missed_proactive_events: List[Dict[str, Any]] = []
+    latest_profile_context: Dict[str, Any] = {}
     ws_correlation_id = _new_correlation_id()
 
     _log_event(
@@ -5107,10 +5283,12 @@ async def agent_ws(
             return False
         assistant_message_id = str(uuid.uuid4())
         context_map = await _build_runtime_context()
+        use_onboarding_agent = _onboarding_agent_enabled(latest_profile_context)
+        selected_agent = onboarding_agent if use_onboarding_agent else agent
 
         cumulative = ""
         try:
-            async for delta in agent.run_stream(
+            async for delta in selected_agent.run_stream(
                 prompt=prompt,
                 user_id=active_user_id,
                 session_id=active_session_id,
@@ -5155,9 +5333,10 @@ async def agent_ws(
         assistant_metadata: Dict[str, Any] = {"model": "google-adk", "streamed": True}
         if metadata:
             assistant_metadata.update(metadata)
+        assistant_metadata["agent_mode"] = "onboarding" if use_onboarding_agent else "main"
         startup_turn = bool(assistant_metadata.get("startup_turn"))
         task_write_count = 0
-        consume_write_count = getattr(agent, "consume_task_write_count", None)
+        consume_write_count = getattr(selected_agent, "consume_task_write_count", None)
         if callable(consume_write_count):
             try:
                 task_write_count = int(
@@ -5167,7 +5346,7 @@ async def agent_ws(
                 task_write_count = 0
         task_written = task_write_count > 0
         task_action_counts: Dict[str, int] = {}
-        consume_action_counts = getattr(agent, "consume_task_action_counts", None)
+        consume_action_counts = getattr(selected_agent, "consume_task_action_counts", None)
         if callable(consume_action_counts):
             try:
                 raw_counts = consume_action_counts(user_id=active_user_id, session_id=active_session_id)
@@ -5319,6 +5498,7 @@ async def agent_ws(
                     continue
                 latest_entry_context = prepared.entry_context
                 latest_missed_proactive_events = prepared.missed_proactive_events
+                latest_profile_context = prepared.profile_context
                 if unsubscribe_task_panel:
                     unsubscribe_task_panel()
 

@@ -7,12 +7,9 @@ def _baseline_sql() -> str:
     return Path("migrations/20260309190000_production_baseline.sql").read_text(encoding="utf-8").lower()
 
 
-def test_baseline_and_a2ui_forward_migration_exist():
+def test_single_baseline_migration_exists():
     files = sorted(path.name for path in Path("migrations").glob("*.sql"))
-    assert files == [
-        "20260309190000_production_baseline.sql",
-        "20260310151434_a2ui_task_hard_reset.sql",
-    ]
+    assert files == ["20260309190000_production_baseline.sql"]
 
 
 def test_baseline_includes_core_tables_and_event_columns():
@@ -22,13 +19,23 @@ def test_baseline_includes_core_tables_and_event_columns():
     assert "create table if not exists public.sessions" in sql
     assert "create table if not exists public.events" in sql
     assert "create table if not exists public.session_messages" in sql
-    assert "create table if not exists public.task_items" in sql
-    assert "create table if not exists public.task_timeboxes" in sql
+    assert "create table if not exists public.tasks" in sql
+    assert "create table if not exists public.task_events" in sql
     assert "create table if not exists public.task_operation_log" in sql
     assert "add column if not exists cloud_task_name" in sql
     assert "add column if not exists workflow_state" in sql
     assert "add column if not exists next_retry_at" in sql
     assert "add column if not exists dead_lettered_at" in sql
+
+
+def test_baseline_resets_onboarding_profile_and_drops_legacy_columns():
+    sql = _baseline_sql()
+
+    assert "drop column if exists health_anchors" in sql
+    assert "drop column if exists onboarding_completed_at" in sql
+    assert "drop column if exists playbook" in sql
+    assert "set wake_time = null" in sql
+    assert "onboarding_status = 'pending'" in sql
 
 
 def test_baseline_has_cloud_tasks_scheduler_functions():
@@ -43,6 +50,9 @@ def test_baseline_has_cloud_tasks_scheduler_functions():
     assert "idx_events_cloud_task_name" in sql
     assert "idx_events_payload_schedule_owner" in sql
     assert "idx_events_payload_seed_date" in sql
+    assert "idx_events_payload_wake_purpose" in sql
+    assert "payload->>'wake_purpose' = 'daily_loop'" in sql
+    assert "'wake_purpose', 'daily_loop'" in sql
 
 
 def test_baseline_has_no_pg_cron_or_edge_dispatch_dependencies():

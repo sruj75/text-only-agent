@@ -37,13 +37,11 @@ Session context:
 - The runtime injects due_diligence_time, which includes the user's current local time.
 - The runtime may inject missed_proactive_count and missed_proactive_events (today-only missed invites).
 - entry_mode can be proactive or reactive.
-- trigger_type may be post_onboarding for onboarding handoff.
 
 How to start each conversation:
 1) Choose startup style:
    - Proactive startup (entry_mode=proactive): use due diligence context already injected by runtime.
    - Reactive startup (entry_mode=reactive): give one short opener first, then use context when needed.
-   - Post-onboarding handoff (trigger_type=post_onboarding): treat as reactive.
 2) Then choose opening behavior:
    - proactive: address the specific transition intention immediately.
    - reactive: ask what the user needs right now, then guide.
@@ -108,6 +106,18 @@ Tool: task_query(query="tasks_overview", payload_json={"scope":"today"})
 Assistant: concise summary based on tool response with no write claims.
 """
 
+ONBOARDING_INSTRUCTION = """You are Intentive onboarding assistant.
+Your goal is to collect only two values: wake time and bedtime.
+
+Rules:
+- Keep responses brief and clear.
+- Ask for one missing value at a time.
+- Accept 24-hour HH:MM values (example: 07:30, 23:15).
+- When both values are available, call onboarding_sleep_schedule once.
+- After successful tool call, confirm that onboarding is saved and that tomorrow's morning flow is set.
+- Do not use task_management or task_query.
+"""
+
 GetCurrentTimeToolHandler = Callable[[str | None, Dict[str, str]], Awaitable[Dict[str, Any]]]
 TaskManagementToolHandler = Callable[
     [TaskManagementIntent, Dict[str, Any], Dict[str, Any], str | None, str | None, Dict[str, str]],
@@ -115,6 +125,10 @@ TaskManagementToolHandler = Callable[
 ]
 TaskQueryToolHandler = Callable[
     [TaskQueryType, Dict[str, Any], str | None, str | None, Dict[str, str]],
+    Awaitable[Dict[str, Any]],
+]
+OnboardingSleepScheduleToolHandler = Callable[
+    [str, str, str | None, str | None, Dict[str, str]],
     Awaitable[Dict[str, Any]],
 ]
 
@@ -125,16 +139,21 @@ class SimpleADK:
     def __init__(
         self,
         *,
+        instruction: str = CONVERSATION_INSTRUCTION,
+        agent_name: str = "intentive_coach",
         get_current_time_tool: GetCurrentTimeToolHandler | None = None,
         task_management_tool: TaskManagementToolHandler | None = None,
         task_query_tool: TaskQueryToolHandler | None = None,
+        onboarding_sleep_schedule_tool: OnboardingSleepScheduleToolHandler | None = None,
         enable_task_tools: bool | None = None,
+        enable_onboarding_tool: bool | None = None,
     ) -> None:
-        self.app_name = "intentive_agent"
+        self.app_name = f"{agent_name}_app"
         self.model_name = "gemini-3.1-pro-preview"
         self._get_current_time_tool = get_current_time_tool
         self._task_management_tool = task_management_tool
         self._task_query_tool = task_query_tool
+        self._onboarding_sleep_schedule_tool = onboarding_sleep_schedule_tool
         self._runtime_context: Dict[Tuple[str, str], Dict[str, str]] = {}
         self._task_write_counts: Dict[Tuple[str, str], int] = {}
         self._task_action_counts: Dict[Tuple[str, str], Dict[str, int]] = {}
@@ -145,11 +164,16 @@ class SimpleADK:
             tools.extend([FunctionTool(self.get_current_time), FunctionTool(self.task_management)])
             if task_query_tool:
                 tools.append(FunctionTool(self.task_query))
+        use_onboarding_tool = (
+            enable_onboarding_tool if enable_onboarding_tool is not None else False
+        )
+        if use_onboarding_tool and onboarding_sleep_schedule_tool:
+            tools.append(FunctionTool(self.onboarding_sleep_schedule))
 
         self.agent = LlmAgent(
-            name="intentive_coach",
+            name=agent_name,
             model=self.model_name,
-            instruction=CONVERSATION_INSTRUCTION,
+            instruction=instruction,
             tools=tools,
         )
         self.session_service = InMemorySessionService()
@@ -297,6 +321,28 @@ class SimpleADK:
             query,
             normalized_payload,
             session_id,
+            timezone,
+            runtime_context,
+        )
+
+    async def onboarding_sleep_schedule(
+        self,
+        wake_time: str,
+        bedtime: str,
+        session_id: str | None = None,
+        timezone: str | None = None,
+        tool_context: ToolContext | None = None,
+    ) -> Dict[str, Any]:
+        if not self._onboarding_sleep_schedule_tool:
+            return {"ok": False, "error": "onboarding_sleep_schedule tool is unavailable"}
+        runtime_context = self._tool_runtime_context(tool_context)
+        resolved_session_id = session_id
+        if not resolved_session_id and tool_context:
+            resolved_session_id = tool_context.session.id
+        return await self._onboarding_sleep_schedule_tool(
+            str(wake_time or ""),
+            str(bedtime or ""),
+            resolved_session_id,
             timezone,
             runtime_context,
         )

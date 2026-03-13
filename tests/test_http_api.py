@@ -29,6 +29,35 @@ def _session_open_payload(
     return payload
 
 
+def _start_and_configure_onboarding(
+    client,
+    *,
+    device_id: str,
+    timezone: str,
+    wake_time: str = "07:00",
+    bedtime: str = "23:00",
+):
+    started = client.post(
+        "/agent/onboarding/start",
+        json={
+            "device_id": device_id,
+            "timezone": timezone,
+        },
+    )
+    assert started.status_code == 200
+    scheduled = client.post(
+        "/agent/onboarding/sleep-schedule",
+        json={
+            "device_id": device_id,
+            "timezone": timezone,
+            "wake_time": wake_time,
+            "bedtime": bedtime,
+        },
+    )
+    assert scheduled.status_code == 200
+    return scheduled
+
+
 def test_health_endpoint(app_client):
     client = app_client["client"]
 
@@ -226,22 +255,17 @@ def test_legacy_bootstrap_route_maps_to_session_open(app_client):
     assert isinstance(payload["messages"], list)
 
 
-def test_legacy_bootstrap_infers_post_onboarding_handoff_when_history_missing(app_client):
+def test_legacy_bootstrap_uses_reactive_context_after_onboarding_start(app_client):
     client = app_client["client"]
     fake_agent = app_client["agent"]
 
-    completed = client.post(
-        "/agent/onboarding/complete",
-        json={
-            "device_id": "device-legacy-post-onboard",
-            "timezone": "UTC",
-            "wake_time": "07:30",
-            "bedtime": "23:15",
-            "playbook": "Help me start with one tiny next action.",
-            "health_anchors": ["Breakfast"],
-        },
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-legacy-post-onboard",
+        timezone="UTC",
+        wake_time="07:30",
+        bedtime="23:15",
     )
-    assert completed.status_code == 200
 
     response = client.post(
         "/agent/bootstrap-device",
@@ -251,8 +275,7 @@ def test_legacy_bootstrap_infers_post_onboarding_handoff_when_history_missing(ap
     payload = response.json()
     assert payload["needs_onboarding"] is False
     assert payload["messages"][-1]["metadata"]["startup_turn"] is True
-    assert payload["messages"][-1]["metadata"]["entry_context"]["trigger_type"] == "post_onboarding"
-    assert fake_agent.run_calls[-1]["context"]["trigger_type"] == "post_onboarding"
+    assert fake_agent.run_calls[-1]["context"]["trigger_type"] == ""
 
 
 def test_execute_event_runs_in_cloud_run_endpoint(app_client, monkeypatch):
@@ -385,18 +408,11 @@ def test_agent_run_returns_503_when_adk_fails(app_client):
 
 def test_session_open_generates_startup_message_with_full_history(app_client):
     client = app_client["client"]
-    completed = client.post(
-        "/agent/onboarding/complete",
-        json={
-            "device_id": "device-session-open",
-            "timezone": "UTC",
-            "wake_time": "07:00",
-            "bedtime": "23:00",
-            "playbook": "Start with one tiny step.",
-            "health_anchors": ["Breakfast"],
-        },
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-session-open",
+        timezone="UTC",
     )
-    assert completed.status_code == 200
     opened = client.post(
         "/agent/session/open",
         json=_session_open_payload(
@@ -416,18 +432,11 @@ def test_session_open_generates_startup_message_with_full_history(app_client):
 def test_session_open_is_idempotent_for_same_start_request(app_client):
     client = app_client["client"]
     open_id = f"open-{uuid.uuid4().hex}"
-    completed = client.post(
-        "/agent/onboarding/complete",
-        json={
-            "device_id": "device-session-idempotent",
-            "timezone": "UTC",
-            "wake_time": "07:00",
-            "bedtime": "23:00",
-            "playbook": "Start with one tiny step.",
-            "health_anchors": ["Breakfast"],
-        },
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-session-idempotent",
+        timezone="UTC",
     )
-    assert completed.status_code == 200
     first = client.post(
         "/agent/session/open",
         json=_session_open_payload(
@@ -460,18 +469,11 @@ def test_session_open_is_idempotent_for_same_start_request(app_client):
 
 def test_session_open_generates_new_startup_for_new_open_cycle(app_client):
     client = app_client["client"]
-    completed = client.post(
-        "/agent/onboarding/complete",
-        json={
-            "device_id": "device-new-open-cycle",
-            "timezone": "UTC",
-            "wake_time": "07:00",
-            "bedtime": "23:00",
-            "playbook": "Start with one tiny step.",
-            "health_anchors": ["Breakfast"],
-        },
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-new-open-cycle",
+        timezone="UTC",
     )
-    assert completed.status_code == 200
 
     first = client.post(
         "/agent/session/open",
@@ -509,18 +511,11 @@ def test_session_open_only_marks_missed_events_when_startup_is_generated(app_cli
     device_id = "device-session-missed-gating"
     open_id = f"open-{uuid.uuid4().hex}"
 
-    completed = client.post(
-        "/agent/onboarding/complete",
-        json={
-            "device_id": device_id,
-            "timezone": "UTC",
-            "wake_time": "07:00",
-            "bedtime": "23:00",
-            "playbook": "Start with one tiny step.",
-            "health_anchors": ["Breakfast"],
-        },
+    _start_and_configure_onboarding(
+        client,
+        device_id=device_id,
+        timezone="UTC",
     )
-    assert completed.status_code == 200
 
     first_open = client.post(
         "/agent/session/open",
@@ -566,39 +561,21 @@ def test_session_open_only_marks_missed_events_when_startup_is_generated(app_cli
     assert state.get(main.MISSED_REPORTED_STATE_KEY) in (None, [])
 
 
-def test_complete_onboarding_updates_user_and_session_open_context(app_client):
+def test_onboarding_start_transitions_pending_to_in_progress(app_client):
     client = app_client["client"]
-    repository = app_client["repository"]
-
-    opened_before = client.post(
-        "/agent/session/open",
-        json=_session_open_payload(device_id="device-onboard", timezone="Asia/Kolkata"),
-    )
-    assert opened_before.status_code == 200
-    assert opened_before.json()["needs_onboarding"] is True
-
-    completed = client.post(
-        "/agent/onboarding/complete",
+    started = client.post(
+        "/agent/onboarding/start",
         json={
             "device_id": "device-onboard",
             "timezone": "Asia/Kolkata",
-            "wake_time": "07:30",
-            "bedtime": "23:15",
-            "playbook": "Ask me for one tiny next step and 10-minute sprint.",
-            "health_anchors": ["Breakfast", "Medication"],
         },
     )
-    assert completed.status_code == 200
-    payload = completed.json()
+    assert started.status_code == 200
+    payload = started.json()
     assert payload["needs_onboarding"] is False
-    assert payload["profile_context"]["wake_time"] == "07:30"
-    assert payload["profile_context"]["bedtime"] == "23:15"
-    assert payload["profile_context"]["playbook"]["notes"].startswith("Ask me")
-    morning_events = [
-        event for event in repository.events.values() if event.user_id == "device-onboard" and event.event_type == "morning_wake"
-    ]
-    assert len(morning_events) == 1
-    assert morning_events[0].cloud_task_name is not None
+    assert payload["profile_context"]["onboarding_status"] == "in_progress"
+    assert payload["profile_context"]["wake_time"] is None
+    assert payload["profile_context"]["bedtime"] is None
 
     opened_after = client.post(
         "/agent/session/open",
@@ -607,39 +584,90 @@ def test_complete_onboarding_updates_user_and_session_open_context(app_client):
     assert opened_after.status_code == 200
     after_payload = opened_after.json()
     assert after_payload["needs_onboarding"] is False
-    assert after_payload["profile_context"]["wake_time"] == "07:30"
-    assert after_payload["profile_context"]["health_anchors"] == [
-        "Breakfast",
-        "Medication",
-    ]
+    assert after_payload["profile_context"]["onboarding_status"] == "in_progress"
 
 
-def test_complete_onboarding_succeeds_when_morning_seed_fails(app_client, monkeypatch):
+def test_onboarding_sleep_schedule_updates_user_and_seeds_unlock_event(app_client):
     client = app_client["client"]
-
-    async def _raise_seed_error(*, user_id: str, timezone_name: str, wake_time: str):
-        _ = user_id
-        _ = timezone_name
-        _ = wake_time
-        raise RuntimeError("seed failed")
-
-    monkeypatch.setattr(main, "_seed_next_morning_wake_event", _raise_seed_error)
-
-    completed = client.post(
-        "/agent/onboarding/complete",
+    repository = app_client["repository"]
+    started = client.post(
+        "/agent/onboarding/start",
+        json={"device_id": "device-onboard-sleep", "timezone": "UTC"},
+    )
+    assert started.status_code == 200
+    scheduled = client.post(
+        "/agent/onboarding/sleep-schedule",
         json={
-            "device_id": "device-onboard-seed-fail",
+            "device_id": "device-onboard-sleep",
             "timezone": "UTC",
             "wake_time": "07:30",
             "bedtime": "23:15",
-            "playbook": "One tiny step first.",
-            "health_anchors": ["Breakfast"],
         },
     )
-    assert completed.status_code == 200
-    payload = completed.json()
+    assert scheduled.status_code == 200
+    payload = scheduled.json()
     assert payload["needs_onboarding"] is False
     assert payload["profile_context"]["wake_time"] == "07:30"
+    assert payload["profile_context"]["bedtime"] == "23:15"
+    assert payload["profile_context"]["onboarding_status"] == "ready_for_main"
+    morning_events = [
+        event
+        for event in repository.events.values()
+        if event.user_id == "device-onboard-sleep" and event.event_type == "morning_wake"
+    ]
+    assert len(morning_events) == 1
+    assert morning_events[0].payload["onboarding_unlock"] is True
+    assert morning_events[0].cloud_task_name is not None
+
+
+def test_onboarding_sleep_schedule_seeds_unlock_without_deleting_daily_loop_event(app_client):
+    client = app_client["client"]
+    repository = app_client["repository"]
+    stale_event_id = "event-stale-morning-wake"
+    asyncio.run(
+        repository.create_event(
+            main.CheckinEventRecord(
+                id=stale_event_id,
+                user_id="device-onboard-stale",
+                scheduled_time="2099-01-01T07:00:00Z",
+                event_type="morning_wake",
+                payload={
+                    "seed_date": "2099-01-01",
+                    "reason": "daily_bootstrap",
+                },
+                executed=False,
+                cloud_task_name="projects/local/locations/local/queues/default/tasks/1234",
+            )
+        )
+    )
+    started = client.post(
+        "/agent/onboarding/start",
+        json={"device_id": "device-onboard-stale", "timezone": "UTC"},
+    )
+    assert started.status_code == 200
+    scheduled = client.post(
+        "/agent/onboarding/sleep-schedule",
+        json={
+            "device_id": "device-onboard-stale",
+            "timezone": "UTC",
+            "wake_time": "07:30",
+            "bedtime": "23:15",
+        },
+    )
+    assert scheduled.status_code == 200
+    assert stale_event_id in repository.events
+
+    morning_events = [
+        event
+        for event in repository.events.values()
+        if event.user_id == "device-onboard-stale" and event.event_type == "morning_wake"
+    ]
+    assert len(morning_events) == 2
+    unlock_events = [
+        event for event in morning_events if bool(event.payload.get("onboarding_unlock"))
+    ]
+    assert len(unlock_events) == 1
+    assert unlock_events[0].payload.get("reason") == "onboarding_unlock"
 
 
 def test_seed_next_morning_wake_event_handles_insert_conflict_without_duplicates(
@@ -692,42 +720,73 @@ def test_seed_next_morning_wake_event_handles_insert_conflict_without_duplicates
     assert result["cloud_task_name"] == "projects/local/locations/local/queues/default/tasks/999"
 
 
-def test_complete_onboarding_backfills_health_anchors_when_missing(app_client):
+def test_onboarding_sleep_schedule_unlock_event_execution_marks_completed(app_client, monkeypatch):
     client = app_client["client"]
+    repository = app_client["repository"]
+    monkeypatch.setenv("SCHEDULER_SECRET", "scheduler-test-secret")
+    async def _always_send_push(**kwargs):
+        _ = kwargs
+        return True
+    monkeypatch.setattr(main, "_send_push_notification", _always_send_push)
 
-    completed = client.post(
-        "/agent/onboarding/complete",
-        json={
-            "device_id": "device-onboard-default-anchors",
-            "timezone": "UTC",
-            "wake_time": "07:30",
-            "bedtime": "23:15",
-            "playbook": "Help me start with one tiny next action.",
-            "health_anchors": [],
-        },
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-onboard-complete",
+        timezone="UTC",
+        wake_time="07:30",
+        bedtime="23:15",
     )
-    assert completed.status_code == 200
-    payload = completed.json()
-    assert payload["profile_context"]["health_anchors"] == [
-        "Morning reset around 07:30",
-        "Night shutdown around 23:15",
-    ]
-
-
-def test_complete_onboarding_validates_required_fields(app_client):
-    client = app_client["client"]
-
+    asyncio.run(
+        repository.upsert_push_token(
+            user_id="device-onboard-complete",
+            expo_push_token="ExponentPushToken[test]",
+        )
+    )
+    onboarding_event = next(
+        event
+        for event in repository.events.values()
+        if event.user_id == "device-onboard-complete"
+        and event.event_type == "morning_wake"
+        and bool(event.payload.get("onboarding_unlock"))
+    )
     response = client.post(
-        "/agent/onboarding/complete",
+        "/agent/events/execute",
+        json={"event_id": onboarding_event.id},
+        headers={"x-scheduler-secret": "scheduler-test-secret"},
+    )
+    assert response.status_code == 200
+    user_profile = repository.users["device-onboard-complete"]
+    assert user_profile["onboarding_status"] == "completed"
+
+
+def test_onboarding_sleep_schedule_validates_required_fields(app_client):
+    client = app_client["client"]
+    client.post(
+        "/agent/onboarding/start",
+        json={"device_id": "device-onboard-invalid", "timezone": "UTC"},
+    )
+    response = client.post(
+        "/agent/onboarding/sleep-schedule",
         json={
             "device_id": "device-onboard-invalid",
             "timezone": "UTC",
             "wake_time": "7:30",
             "bedtime": "23:15",
-            "playbook": "ok",
-            "health_anchors": [],
         },
     )
-
     assert response.status_code == 400
     assert "wake_time must be HH:MM" in response.json()["error"]["message"]
+
+
+def test_old_complete_endpoint_is_removed(app_client):
+    client = app_client["client"]
+    response = client.post(
+        "/agent/onboarding/complete",
+        json={
+            "device_id": "device-removed-endpoint",
+            "timezone": "UTC",
+            "wake_time": "07:30",
+            "bedtime": "23:15",
+        },
+    )
+    assert response.status_code == 404

@@ -5,13 +5,42 @@ create table if not exists public.users (
   wake_time text,
   bedtime text,
   timezone text not null default 'UTC',
-  health_anchors jsonb not null default '[]'::jsonb,
   onboarding_status text not null default 'pending',
-  onboarding_completed_at timestamptz,
-  playbook jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table if exists public.users
+  drop column if exists health_anchors;
+
+alter table if exists public.users
+  drop column if exists onboarding_completed_at;
+
+alter table if exists public.users
+  drop column if exists playbook;
+
+create table if not exists public.system_migration_markers (
+  key text primary key,
+  created_at timestamptz not null default now()
+);
+
+do $$
+begin
+  if not exists (
+    select 1
+    from public.system_migration_markers
+    where key = 'onboarding_rebuild_v1_20260313'
+  ) then
+    update public.users
+    set wake_time = null,
+        bedtime = null,
+        onboarding_status = 'pending',
+        updated_at = now();
+    insert into public.system_migration_markers (key)
+    values ('onboarding_rebuild_v1_20260313');
+  end if;
+end
+$$;
 
 create table if not exists public.sessions (
   session_id text primary key,
@@ -524,6 +553,9 @@ create index if not exists idx_events_payload_schedule_owner
 create index if not exists idx_events_payload_seed_date
   on public.events ((payload ->> 'seed_date'));
 
+create index if not exists idx_events_payload_wake_purpose
+  on public.events ((payload ->> 'wake_purpose'));
+
 with task_payloads as (
   select
     s.user_id,
@@ -838,6 +870,13 @@ begin
     and event_type = 'morning_wake'
     and executed = false
     and payload->>'seed_date' = v_seed_date
+    and (
+      payload->>'wake_purpose' = 'daily_loop'
+      or (
+        payload->>'wake_purpose' is null
+        and coalesce(payload->>'onboarding_unlock', 'false') <> 'true'
+      )
+    )
   order by scheduled_time asc
   limit 1;
 
@@ -849,7 +888,8 @@ begin
           'seed_date', v_seed_date,
           'timezone', v_tz,
           'schedule_owner', 'system',
-          'schedule_policy', 'morning_bootstrap'
+          'schedule_policy', 'morning_bootstrap',
+          'wake_purpose', 'daily_loop'
         ),
         executed = false,
         cron_job_id = null,
@@ -899,7 +939,8 @@ begin
       'seed_date', v_seed_date,
       'timezone', v_tz,
       'schedule_owner', 'system',
-      'schedule_policy', 'morning_bootstrap'
+      'schedule_policy', 'morning_bootstrap',
+      'wake_purpose', 'daily_loop'
     ),
     false,
     null,

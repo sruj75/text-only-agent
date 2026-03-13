@@ -3,7 +3,7 @@
   "baseline": {
     "version": "20260309190000",
     "file": "migrations/20260309190000_production_baseline.sql",
-    "sha256": "57dad5b01034132c17889ff2eb3e78acfe4c4906668309138613b921cd85134c"
+    "sha256": "f89acce0edeefee6d855da2f1e8710f34b65ff672fe5e474d5a0008eda91e085"
   },
   "accepted_legacy_migrations": [
     {
@@ -81,6 +81,14 @@
     {
       "version": "20260310151434",
       "name": "a2ui_task_hard_reset"
+    },
+    {
+      "version": "20260313065352",
+      "name": "onboarding_rebuild_v1_20260313"
+    },
+    {
+      "version": "20260313072722",
+      "name": "wake_purpose_separation_20260313"
     }
   ],
   "operator_policy": {
