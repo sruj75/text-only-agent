@@ -547,6 +547,28 @@ def _is_valid_hhmm(value: str) -> bool:
     return bool(re.match(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$", value))
 
 
+def _require_onboarding_tool_time(raw_value: str, *, field: str) -> str:
+    value = str(raw_value or "").strip()
+    if not value:
+        raise _http_error(
+            400,
+            f"INVALID_{field.upper()}",
+            f"{field} is required",
+        )
+
+    if _is_valid_hhmm(value):
+        return value
+
+    raise _http_error(
+        400,
+        f"INVALID_{field.upper()}",
+        (
+            f"{field} must be HH:MM (24h). "
+            "Convert natural-language times to one explicit value before calling onboarding_sleep_schedule."
+        ),
+    )
+
+
 def _normalize_text_list(value: Any) -> List[str]:
     if not isinstance(value, list):
         return []
@@ -2201,7 +2223,11 @@ async def _tool_get_current_time(
 ) -> Dict[str, Any]:
     raw_user_id = str(runtime_context.get("user_id") or "").strip()
     if not raw_user_id:
-        return {"ok": False, "error": "missing_user_id"}
+        return {
+            "ok": False,
+            "error": "missing_user_id",
+            "retry_hint": "Pass wake_time and bedtime as one HH:MM value each.",
+        }
 
     try:
         timezone_name = await _resolve_timezone_for_user(
@@ -2210,7 +2236,11 @@ async def _tool_get_current_time(
         )
     except HTTPException as error:
         error_message = _error_envelope(status_code=error.status_code, detail=error.detail)["error"]["message"]
-        return {"ok": False, "error": error_message}
+        return {
+            "ok": False,
+            "error": error_message,
+            "retry_hint": "Pass wake_time and bedtime as one HH:MM value each.",
+        }
 
     return {"ok": True, "current_time": _get_current_time_context(timezone_name)}
 
@@ -2648,6 +2678,8 @@ def _startup_prompt(entry_context: EntryContext, *, onboarding_agent_enabled: bo
         return (
             "Conversation bootstrap: onboarding open. "
             "Greet the user and ask for wake time first, then bedtime. "
+            "Understand natural phrasing, but before calling onboarding_sleep_schedule convert it into one explicit HH:MM value. "
+            "If the user gives a range, multiple options, or a vague answer, ask one short clarification question. "
             "After both are collected, call onboarding_sleep_schedule and confirm setup."
         )
     if entry_context.entry_mode == "proactive":
@@ -5018,12 +5050,8 @@ async def _set_onboarding_sleep_schedule(
     bedtime: str,
     session_id: str | None = None,
 ) -> Dict[str, Any]:
-    normalized_wake = wake_time.strip()
-    normalized_bedtime = bedtime.strip()
-    if not _is_valid_hhmm(normalized_wake):
-        raise _http_error(400, "INVALID_WAKE_TIME", "wake_time must be HH:MM (24h)")
-    if not _is_valid_hhmm(normalized_bedtime):
-        raise _http_error(400, "INVALID_BEDTIME", "bedtime must be HH:MM (24h)")
+    normalized_wake = _require_onboarding_tool_time(wake_time, field="wake_time")
+    normalized_bedtime = _require_onboarding_tool_time(bedtime, field="bedtime")
     await repository.ensure_user(user_id=device_id, timezone_name=timezone_name)
     user_profile = await repository.upsert_user_profile(
         user_id=device_id,
@@ -5361,13 +5389,24 @@ async def agent_ws(
         schedule_write_count = int(task_action_counts.get("timebox", 0)) + int(
             task_action_counts.get("reschedule", 0)
         )
+        enforce_task_write_guardrails = not use_onboarding_agent
 
-        if assistant_claimed_schedule and schedule_write_count <= 0 and not startup_turn:
+        if (
+            enforce_task_write_guardrails
+            and assistant_claimed_schedule
+            and schedule_write_count <= 0
+            and not startup_turn
+        ):
             assistant_text = (
                 "I could not safely schedule that yet. "
                 "Please share an explicit time window and I will set it now."
             )
-        elif (user_task_intent or assistant_claimed_task_action) and not task_written and not startup_turn:
+        elif (
+            enforce_task_write_guardrails
+            and (user_task_intent or assistant_claimed_task_action)
+            and not task_written
+            and not startup_turn
+        ):
             assistant_text = (
                 "I could not safely apply that task change yet. "
                 "Please confirm the task details and I will retry."
@@ -5392,7 +5431,12 @@ async def agent_ws(
             state_patch={"last_message_id": assistant_message_id, "last_role": "assistant"},
         )
 
-        if assistant_claimed_schedule and schedule_write_count <= 0 and not startup_turn:
+        if (
+            enforce_task_write_guardrails
+            and assistant_claimed_schedule
+            and schedule_write_count <= 0
+            and not startup_turn
+        ):
             _log_event(
                 logging.WARNING,
                 "Schedule claim detected without schedule write",
@@ -5401,7 +5445,12 @@ async def agent_ws(
                 schedule_write_count=schedule_write_count,
                 task_action_counts=task_action_counts,
             )
-        elif (user_task_intent or assistant_claimed_task_action) and not task_written and not startup_turn:
+        elif (
+            enforce_task_write_guardrails
+            and (user_task_intent or assistant_claimed_task_action)
+            and not task_written
+            and not startup_turn
+        ):
             _log_event(
                 logging.WARNING,
                 "Task intent detected without task write",

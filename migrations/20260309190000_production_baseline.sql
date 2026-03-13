@@ -1161,3 +1161,245 @@ create index if not exists idx_task_timeboxes_user_start
 
 create index if not exists idx_task_operation_log_user_created
   on public.task_operation_log (user_id, created_at desc);
+
+-- Supabase MVP cleanup (aggressive hardening while keeping task runtime tables live).
+-- pg_net is not used by runtime paths; remove it to clear public exposure warning.
+drop extension if exists pg_net;
+
+alter table if exists public.system_migration_markers enable row level security;
+revoke all on table public.system_migration_markers from anon;
+revoke all on table public.system_migration_markers from authenticated;
+
+revoke all on table public.users from anon;
+revoke all on table public.sessions from anon;
+revoke all on table public.session_messages from anon;
+revoke all on table public.events from anon;
+revoke all on table public.push_tokens from anon;
+revoke all on table public.task_items from anon;
+revoke all on table public.task_timeboxes from anon;
+revoke all on table public.task_operation_log from anon;
+
+revoke all on table public.users from authenticated;
+revoke all on table public.sessions from authenticated;
+revoke all on table public.session_messages from authenticated;
+revoke all on table public.events from authenticated;
+revoke all on table public.push_tokens from authenticated;
+revoke all on table public.task_items from authenticated;
+revoke all on table public.task_timeboxes from authenticated;
+revoke all on table public.task_operation_log from authenticated;
+
+grant select, insert, update on table public.users to authenticated;
+grant select, insert, update on table public.sessions to authenticated;
+grant select, insert, update on table public.session_messages to authenticated;
+grant select, insert, update on table public.events to authenticated;
+grant select, insert, update on table public.push_tokens to authenticated;
+grant select, insert, update on table public.task_items to authenticated;
+grant select, insert, update on table public.task_timeboxes to authenticated;
+grant select, insert, update on table public.task_operation_log to authenticated;
+
+drop policy if exists "Users can access own data" on public.users;
+drop policy if exists "Users can access own sessions" on public.sessions;
+drop policy if exists "Users can access own push tokens" on public.push_tokens;
+drop policy if exists "Users can access own events" on public.events;
+
+drop policy if exists "Users can select own profile" on public.users;
+drop policy if exists "Users can insert own profile" on public.users;
+drop policy if exists "Users can update own profile" on public.users;
+
+drop policy if exists "Users can select own sessions" on public.sessions;
+drop policy if exists "Users can insert own sessions" on public.sessions;
+drop policy if exists "Users can update own sessions" on public.sessions;
+
+drop policy if exists "Users can select own push tokens" on public.push_tokens;
+drop policy if exists "Users can insert own push tokens" on public.push_tokens;
+drop policy if exists "Users can update own push tokens" on public.push_tokens;
+
+drop policy if exists "Users can select own events" on public.events;
+drop policy if exists "Users can insert own events" on public.events;
+drop policy if exists "Users can update own events" on public.events;
+
+drop policy if exists "Users can select own session messages" on public.session_messages;
+drop policy if exists "Users can insert own session messages" on public.session_messages;
+
+drop policy if exists "Users can select own task items" on public.task_items;
+drop policy if exists "Users can insert own task items" on public.task_items;
+drop policy if exists "Users can update own task items" on public.task_items;
+
+drop policy if exists "Users can select own task timeboxes" on public.task_timeboxes;
+drop policy if exists "Users can insert own task timeboxes" on public.task_timeboxes;
+drop policy if exists "Users can update own task timeboxes" on public.task_timeboxes;
+
+drop policy if exists "Users can select own task operations" on public.task_operation_log;
+drop policy if exists "Users can insert own task operations" on public.task_operation_log;
+
+create policy "Users can select own profile"
+  on public.users
+  for select
+  to authenticated
+  using ((select auth.uid())::text = user_id);
+
+create policy "Users can insert own profile"
+  on public.users
+  for insert
+  to authenticated
+  with check ((select auth.uid())::text = user_id);
+
+create policy "Users can update own profile"
+  on public.users
+  for update
+  to authenticated
+  using ((select auth.uid())::text = user_id)
+  with check ((select auth.uid())::text = user_id);
+
+create policy "Users can select own sessions"
+  on public.sessions
+  for select
+  to authenticated
+  using ((select auth.uid())::text = user_id);
+
+create policy "Users can insert own sessions"
+  on public.sessions
+  for insert
+  to authenticated
+  with check ((select auth.uid())::text = user_id);
+
+create policy "Users can update own sessions"
+  on public.sessions
+  for update
+  to authenticated
+  using ((select auth.uid())::text = user_id)
+  with check ((select auth.uid())::text = user_id);
+
+create policy "Users can select own push tokens"
+  on public.push_tokens
+  for select
+  to authenticated
+  using ((select auth.uid())::text = user_id);
+
+create policy "Users can insert own push tokens"
+  on public.push_tokens
+  for insert
+  to authenticated
+  with check ((select auth.uid())::text = user_id);
+
+create policy "Users can update own push tokens"
+  on public.push_tokens
+  for update
+  to authenticated
+  using ((select auth.uid())::text = user_id)
+  with check ((select auth.uid())::text = user_id);
+
+create policy "Users can select own events"
+  on public.events
+  for select
+  to authenticated
+  using ((select auth.uid())::text = user_id);
+
+create policy "Users can insert own events"
+  on public.events
+  for insert
+  to authenticated
+  with check ((select auth.uid())::text = user_id);
+
+create policy "Users can update own events"
+  on public.events
+  for update
+  to authenticated
+  using ((select auth.uid())::text = user_id)
+  with check ((select auth.uid())::text = user_id);
+
+create policy "Users can select own session messages"
+  on public.session_messages
+  for select
+  to authenticated
+  using ((select auth.uid())::text = user_id);
+
+create policy "Users can insert own session messages"
+  on public.session_messages
+  for insert
+  to authenticated
+  with check ((select auth.uid())::text = user_id);
+
+create policy "Users can select own task items"
+  on public.task_items
+  for select
+  to authenticated
+  using ((select auth.uid())::text = user_id);
+
+create policy "Users can insert own task items"
+  on public.task_items
+  for insert
+  to authenticated
+  with check ((select auth.uid())::text = user_id);
+
+create policy "Users can update own task items"
+  on public.task_items
+  for update
+  to authenticated
+  using ((select auth.uid())::text = user_id)
+  with check ((select auth.uid())::text = user_id);
+
+create policy "Users can select own task timeboxes"
+  on public.task_timeboxes
+  for select
+  to authenticated
+  using ((select auth.uid())::text = user_id);
+
+create policy "Users can insert own task timeboxes"
+  on public.task_timeboxes
+  for insert
+  to authenticated
+  with check ((select auth.uid())::text = user_id);
+
+create policy "Users can update own task timeboxes"
+  on public.task_timeboxes
+  for update
+  to authenticated
+  using ((select auth.uid())::text = user_id)
+  with check ((select auth.uid())::text = user_id);
+
+create policy "Users can select own task operations"
+  on public.task_operation_log
+  for select
+  to authenticated
+  using ((select auth.uid())::text = user_id);
+
+create policy "Users can insert own task operations"
+  on public.task_operation_log
+  for insert
+  to authenticated
+  with check ((select auth.uid())::text = user_id);
+
+drop index if exists public.idx_events_schedule_owner;
+drop index if exists public.idx_events_seed_date;
+
+drop table if exists public.task_events cascade;
+drop table if exists public.tasks cascade;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from public.system_migration_markers
+    where key = 'supabase_mvp_cleanup_20260313'
+  ) then
+    truncate table
+      public.session_messages,
+      public.sessions,
+      public.events,
+      public.task_timeboxes,
+      public.task_items,
+      public.task_operation_log,
+      public.push_tokens;
+
+    update public.users
+    set wake_time = null,
+        bedtime = null,
+        onboarding_status = 'pending',
+        updated_at = now();
+
+    insert into public.system_migration_markers (key)
+    values ('supabase_mvp_cleanup_20260313');
+  end if;
+end
+$$;

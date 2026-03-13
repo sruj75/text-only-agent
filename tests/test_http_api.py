@@ -759,7 +759,29 @@ def test_onboarding_sleep_schedule_unlock_event_execution_marks_completed(app_cl
     assert user_profile["onboarding_status"] == "completed"
 
 
-def test_onboarding_sleep_schedule_validates_required_fields(app_client):
+def test_onboarding_sleep_schedule_accepts_explicit_hhmm_values(app_client):
+    client = app_client["client"]
+    client.post(
+        "/agent/onboarding/start",
+        json={"device_id": "device-onboard-explicit", "timezone": "UTC"},
+    )
+    response = client.post(
+        "/agent/onboarding/sleep-schedule",
+        json={
+            "device_id": "device-onboard-explicit",
+            "timezone": "UTC",
+            "wake_time": "09:00",
+            "bedtime": "22:00",
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["profile_context"]["wake_time"] == "09:00"
+    assert payload["profile_context"]["bedtime"] == "22:00"
+    assert payload["profile_context"]["onboarding_status"] == "ready_for_main"
+
+
+def test_onboarding_sleep_schedule_rejects_natural_language_time(app_client):
     client = app_client["client"]
     client.post(
         "/agent/onboarding/start",
@@ -770,12 +792,31 @@ def test_onboarding_sleep_schedule_validates_required_fields(app_client):
         json={
             "device_id": "device-onboard-invalid",
             "timezone": "UTC",
-            "wake_time": "7:30",
+            "wake_time": "I wake up around 9 am",
             "bedtime": "23:15",
         },
     )
     assert response.status_code == 400
-    assert "wake_time must be HH:MM" in response.json()["error"]["message"]
+    assert "wake_time must be HH:MM (24h)" in response.json()["error"]["message"]
+
+
+def test_onboarding_sleep_schedule_rejects_ambiguous_time(app_client):
+    client = app_client["client"]
+    client.post(
+        "/agent/onboarding/start",
+        json={"device_id": "device-onboard-ambiguous", "timezone": "UTC"},
+    )
+    response = client.post(
+        "/agent/onboarding/sleep-schedule",
+        json={
+            "device_id": "device-onboard-ambiguous",
+            "timezone": "UTC",
+            "wake_time": "9pm or 10pm",
+            "bedtime": "23:15",
+        },
+    )
+    assert response.status_code == 400
+    assert "Convert natural-language times" in response.json()["error"]["message"]
 
 
 def test_old_complete_endpoint_is_removed(app_client):

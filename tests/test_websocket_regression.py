@@ -431,6 +431,42 @@ def test_ws_includes_profile_context_from_onboarding(app_client):
     assert profile_context["bedtime"] == "23:00"
 
 
+def test_ws_onboarding_mode_skips_task_write_guardrail_rewrites(app_client, monkeypatch):
+    client = app_client["client"]
+    repository = app_client["repository"]
+    device_id = "device-onboarding-guardrail"
+    timezone = "UTC"
+
+    started = client.post(
+        "/agent/onboarding/start",
+        json={"device_id": device_id, "timezone": timezone},
+    )
+    assert started.status_code == 200
+
+    target_session_id = main._daily_session_id(device_id, timezone)
+    asyncio.run(
+        main._ensure_session(
+            user_id=device_id,
+            session_id=target_session_id,
+            timezone_name=timezone,
+            entry_context=main.EntryContext(source="manual", entry_mode="reactive"),
+            state_patch={"thread_type": "daily"},
+        )
+    )
+
+    monkeypatch.setattr(main, "_looks_like_schedule_claim", lambda _text: True)
+
+    with client.websocket_connect(f"/agent/ws?device_id={device_id}&timezone={timezone}") as ws:
+        _init_session(ws, session_id=target_session_id)
+        ws.send_json({"type": "user_message", "message_id": "m-onboarding", "text": "my bedtime is 10pm"})
+        frames = _drain_until_done(ws)
+
+    done = next(frame for frame in frames if frame.get("type") == "assistant_done")
+    assert done["text"] == "hello world"
+    saved_messages = _list_messages(repository, target_session_id)
+    assert saved_messages[-1]["content"] == "hello world"
+
+
 def test_session_open_creates_startup_message_for_empty_reactive_thread(app_client):
     client = app_client["client"]
     fake_agent = app_client["agent"]

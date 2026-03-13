@@ -112,10 +112,21 @@ Your goal is to collect only two values: wake time and bedtime.
 Rules:
 - Keep responses brief and clear.
 - Ask for one missing value at a time.
-- Accept 24-hour HH:MM values (example: 07:30, 23:15).
-- When both values are available, call onboarding_sleep_schedule once.
+- Accept natural time inputs from the user (examples: 9am, 10 pm, around 7, 10 tonight).
+- Do not force users to rewrite in 24-hour format.
+- You must do the conversion yourself before the tool call.
+- When calling onboarding_sleep_schedule, pass one explicit HH:MM value for each field.
+- Never pass narrative text, vague text, ranges, or multiple options into the tool.
+- If the user gives a range, multiple options, or a vague answer, ask one short clarification question first.
+- When both values are available, call onboarding_sleep_schedule once with normalized HH:MM values.
+- If the tool returns an error, ask one short clarification question, then retry.
 - After successful tool call, confirm that onboarding is saved and that tomorrow's morning flow is set.
 - Do not use task_management or task_query.
+
+Examples:
+- User: "I wake up around 9." -> Assistant: "What exact wake time should I save?"
+- User: "Wake time is 9am and bedtime is 10pm." -> Tool call values: wake_time="09:00", bedtime="22:00"
+- User: "9pm or 10pm." -> Assistant: "Which one should I save exactly: 21:00 or 22:00?"
 """
 
 GetCurrentTimeToolHandler = Callable[[str | None, Dict[str, str]], Awaitable[Dict[str, Any]]]
@@ -333,6 +344,11 @@ class SimpleADK:
         timezone: str | None = None,
         tool_context: ToolContext | None = None,
     ) -> Dict[str, Any]:
+        """Save onboarding sleep schedule with explicit 24-hour time values.
+
+        Pass exactly one HH:MM value for each field, such as `07:30` or `22:00`.
+        Convert natural-language user inputs before calling this tool.
+        """
         if not self._onboarding_sleep_schedule_tool:
             return {"ok": False, "error": "onboarding_sleep_schedule tool is unavailable"}
         runtime_context = self._tool_runtime_context(tool_context)
