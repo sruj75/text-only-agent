@@ -531,6 +531,41 @@ def test_ws_init_acks_session_without_history_sync(app_client):
     assert len(done) == 1
 
 
+def test_ws_init_subscribes_to_task_panel_updates(app_client):
+    client = app_client["client"]
+    bootstrap = _bootstrap(app_client, device_id="device-task-panel-live", timezone="UTC")
+    _open_session(
+        client,
+        device_id=bootstrap["device_id"],
+        timezone="UTC",
+        session_id=bootstrap["session_id"],
+        entry_context={"source": "manual", "entry_mode": "reactive"},
+    )
+
+    with client.websocket_connect(
+        f"/agent/ws?device_id={bootstrap['device_id']}&timezone=UTC"
+    ) as ws:
+        _init_session(
+            ws,
+            session_id=bootstrap["session_id"],
+        )
+
+        response = client.post(
+            "/agent/task-query",
+            json={
+                "device_id": bootstrap["device_id"],
+                "session_id": bootstrap["session_id"],
+                "timezone": "UTC",
+                "query": "tasks_overview",
+            },
+        )
+        assert response.status_code == 200
+
+        frame = ws.receive_json()
+        assert frame["type"] == "task_panel_state"
+        assert "run_status" in frame["state"]
+
+
 def test_session_open_does_not_rewrite_proactive_trigger_context(app_client):
     client = app_client["client"]
     fake_agent = app_client["agent"]
@@ -669,3 +704,64 @@ def test_session_open_missed_proactive_is_reported_once_and_reactive_open_stays_
     assert len(fake_agent.run_calls) == 1
     state = repository.sessions[session_id].state
     assert state[main.MISSED_REPORTED_STATE_KEY] == [missed_event_id]
+
+
+def test_session_stream_ws_sends_initial_snapshot(app_client):
+    client = app_client["client"]
+    _complete_onboarding(client, device_id="device-session-stream", timezone="UTC")
+    bootstrap = _bootstrap(app_client, device_id="device-session-stream", timezone="UTC")
+
+    with client.websocket_connect(
+        f"/agent/session/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
+    ) as ws:
+        frame = ws.receive_json()
+
+    assert frame["type"] == "session_snapshot"
+    assert frame["snapshot"]["session_id"] == bootstrap["session_id"]
+    assert "messages" in frame["snapshot"]
+    assert "task_panel_state" in frame["snapshot"]
+
+
+def test_session_stream_ws_receives_assistant_events(app_client):
+    client = app_client["client"]
+    _complete_onboarding(client, device_id="device-stream-events", timezone="UTC")
+    bootstrap = _bootstrap(app_client, device_id="device-stream-events", timezone="UTC")
+    _open_session(
+        client,
+        device_id=bootstrap["device_id"],
+        timezone="UTC",
+        session_id=bootstrap["session_id"],
+        entry_context={"source": "manual", "entry_mode": "reactive"},
+    )
+
+    with client.websocket_connect(
+        f"/agent/session/ws?device_id={bootstrap['device_id']}&session_id={bootstrap['session_id']}&timezone=UTC"
+    ) as ws:
+        first = ws.receive_json()
+        assert first["type"] == "session_snapshot"
+
+        response = client.post(
+            "/agent/conversation/turn",
+            json={
+                "device_id": bootstrap["device_id"],
+                "session_id": bootstrap["session_id"],
+                "timezone": "UTC",
+                "prompt": "say hello",
+                "transport": "voice",
+                "entry_context": {
+                    "source": "manual",
+                    "entry_mode": "reactive",
+                },
+            },
+        )
+        assert response.status_code == 200
+
+        frames = _drain_until_done(ws)
+        snapshot_frame = ws.receive_json()
+
+    deltas = [frame["delta"] for frame in frames if frame["type"] == "assistant_delta"]
+    done_frame = next(frame for frame in frames if frame["type"] == "assistant_done")
+    assert deltas == ["hello", " world"]
+    assert done_frame["text"] == "hello world"
+    assert snapshot_frame["type"] == "session_snapshot"
+    assert snapshot_frame["snapshot"]["session_id"] == bootstrap["session_id"]

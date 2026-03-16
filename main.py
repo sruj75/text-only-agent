@@ -17,7 +17,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from startup_agent.adk import ONBOARDING_INSTRUCTION, SimpleADK
+from startup_agent.adk import ONBOARDING_INSTRUCTION, SimpleADK, TurnExecutionResult
+from startup_agent.livekit_voice import LiveKitVoiceCoordinator
 from startup_agent.task_actions import (
     TASK_INTENT_LABELS,
     TASK_MANAGEMENT_INTENTS,
@@ -114,6 +115,10 @@ def _strict_startup_validation_enabled() -> bool:
     return _env_flag("STRICT_STARTUP_VALIDATION", default)
 
 
+def _voice_debug_enabled() -> bool:
+    return _env_flag("VOICE_DEBUG", False)
+
+
 def _required_runtime_env_vars() -> List[str]:
     return ["GOOGLE_API_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"]
 
@@ -186,6 +191,7 @@ TaskEventType = Literal[
     "migrated_from_session_state",
 ]
 TaskPanelListener = Callable[[Dict[str, Any]], Awaitable[bool]]
+SessionStreamListener = Callable[[Dict[str, Any]], Awaitable[bool]]
 TASK_INTENT_PATTERN = re.compile(
     r"\b(task|tasks|todo|to-do|priority|priorities|timebox|schedule|reschedule|delete|plan day|mark done|blocked)\b",
     re.IGNORECASE,
@@ -321,6 +327,58 @@ def _conversation_start_idempotency_key(
 def _startup_message_id_for_key(idempotency_key: str) -> str:
     token = uuid.uuid5(uuid.NAMESPACE_URL, idempotency_key).hex[:24]
     return f"startup_{token}"
+
+
+def _find_user_message(
+    messages: List["MessageRecord"],
+    user_message_id: str,
+) -> "MessageRecord | None":
+    for message in messages:
+        if message.id == user_message_id and message.role == "user":
+            return message
+    return None
+
+
+def _assistant_reply_for_user_turn(
+    messages: List["MessageRecord"],
+    user_message_id: str,
+) -> "MessageRecord | None":
+    # Preferred path: explicit assistant reply linkage for robust idempotent replay.
+    for message in messages:
+        if message.role != "assistant" or not message.content.strip():
+            continue
+        metadata = message.metadata if isinstance(message.metadata, dict) else {}
+        in_reply_to = metadata.get("in_reply_to")
+        if isinstance(in_reply_to, str) and in_reply_to == user_message_id:
+            return message
+
+    # Compatibility fallback for previously persisted messages without linkage.
+    user_index = next(
+        (
+            index
+            for index, message in enumerate(messages)
+            if message.id == user_message_id and message.role == "user"
+        ),
+        -1,
+    )
+    if user_index < 0:
+        return None
+
+    for message in messages[user_index + 1 :]:
+        if message.role == "user":
+            break
+        if message.role == "assistant" and message.content.strip():
+            return message
+    return None
+
+
+def _is_duplicate_message_insert_error(error: Exception) -> bool:
+    raw = str(error).lower()
+    return (
+        "duplicate key" in raw
+        or "unique constraint" in raw
+        or "session_messages_pkey" in raw
+    )
 
 
 def _normalize_version_token(raw_value: str | None, fallback: str) -> str:
@@ -619,6 +677,28 @@ class SessionOpenRequest(BaseModel):
     open_id: str = Field(..., min_length=1)
     client_version: str = Field(..., min_length=1)
     contract_version: str = Field(..., min_length=1)
+
+
+class SessionStateRequest(BaseModel):
+    device_id: str
+    session_id: str = Field(..., min_length=1)
+    timezone: str | None = Field(default=None)
+
+
+class VoiceConnectRequest(BaseModel):
+    device_id: str
+    session_id: str = Field(..., min_length=1)
+    timezone: str | None = Field(default=None)
+
+
+class ConversationTurnRequest(BaseModel):
+    device_id: str
+    session_id: str = Field(..., min_length=1)
+    timezone: str | None = Field(default=None)
+    prompt: str = Field(..., min_length=1)
+    transport: Literal["chat", "voice"] = "chat"
+    entry_context: EntryContext | None = Field(default=None)
+    user_message_id: str | None = Field(default=None)
 
 
 class LegacyBootstrapRequest(BaseModel):
@@ -2145,6 +2225,7 @@ def build_repository() -> InMemoryRepository | SupabaseRepository:
 
 repository = build_repository()
 task_panel_subscribers: Dict[tuple[str, str], List[TaskPanelListener]] = {}
+session_stream_subscribers: Dict[tuple[str, str], List[SessionStreamListener]] = {}
 
 
 def _subscribe_task_panel(
@@ -2193,6 +2274,64 @@ async def _broadcast_task_panel(
         ]
         if not task_panel_subscribers[(user_id, session_id)]:
             task_panel_subscribers.pop((user_id, session_id), None)
+
+    await _broadcast_session_stream(
+        user_id=user_id,
+        session_id=session_id,
+        payload={
+            "type": "task_panel_state",
+            "state": snapshot,
+        },
+    )
+
+
+def _subscribe_session_stream(
+    user_id: str,
+    session_id: str,
+    listener: SessionStreamListener,
+) -> Any:
+    key = (user_id, session_id)
+    bucket = session_stream_subscribers.setdefault(key, [])
+    bucket.append(listener)
+
+    def _unsubscribe() -> None:
+        listeners = session_stream_subscribers.get(key)
+        if not listeners:
+            return
+        try:
+            listeners.remove(listener)
+        except ValueError:
+            return
+        if not listeners:
+            session_stream_subscribers.pop(key, None)
+
+    return _unsubscribe
+
+
+async def _broadcast_session_stream(
+    *,
+    user_id: str,
+    session_id: str,
+    payload: Dict[str, Any],
+) -> None:
+    listeners = list(session_stream_subscribers.get((user_id, session_id), []))
+    stale: List[SessionStreamListener] = []
+
+    for listener in listeners:
+        try:
+            delivered = await listener(payload)
+        except Exception:
+            delivered = False
+        if not delivered:
+            stale.append(listener)
+
+    if stale:
+        current = session_stream_subscribers.get((user_id, session_id), [])
+        session_stream_subscribers[(user_id, session_id)] = [
+            listener for listener in current if listener not in stale
+        ]
+        if not session_stream_subscribers[(user_id, session_id)]:
+            session_stream_subscribers.pop((user_id, session_id), None)
 
 
 async def _tool_get_current_time(
@@ -2441,6 +2580,7 @@ onboarding_agent = SimpleADK(
     onboarding_sleep_schedule_tool=_tool_onboarding_sleep_schedule,
     enable_onboarding_tool=True,
 )
+livekit_voice = LiveKitVoiceCoordinator.from_env()
 
 
 def _active_adk_model_name() -> str:
@@ -3231,6 +3371,711 @@ async def _prepare_session_state(
             timezone_name=timezone_name,
         ),
     )
+
+
+class SessionService:
+    """Owns the persisted session contract for chat, voice, onboarding, and tasks.
+
+    This is the single authority for what a session contains. Transports can ask
+    for a snapshot, but they should never rebuild transcript or task state on
+    their own.
+    """
+
+    async def _require_existing_session(self, *, user_id: str, session_id: str) -> SessionRecord:
+        existing_session = await repository.get_session(session_id=session_id, user_id=user_id)
+        if not existing_session:
+            raise _http_error(404, "SESSION_NOT_FOUND", "Session not found")
+        return existing_session
+
+    async def load_prepared_state(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        timezone_name: str,
+        entry_context: EntryContext | None = None,
+        persist_event_state: bool = False,
+    ) -> PreparedSessionState:
+        existing_session = await self._require_existing_session(user_id=user_id, session_id=session_id)
+        session_entry_context = entry_context or _entry_context_from_state(existing_session.state)
+        return await _prepare_session_state(
+            user_id=user_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            entry_context=session_entry_context,
+            persist_event_state=persist_event_state,
+        )
+
+    async def build_snapshot(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        timezone_name: str,
+        entry_context: EntryContext | None = None,
+    ) -> Dict[str, Any]:
+        prepared = await self.load_prepared_state(
+            user_id=user_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            entry_context=entry_context,
+            persist_event_state=False,
+        )
+        return {
+            "session_id": session_id,
+            "messages": [message.model_dump() for message in prepared.messages],
+            "needs_onboarding": prepared.needs_onboarding,
+            "profile_context": prepared.profile_context,
+            "task_panel_state": prepared.task_panel_state,
+            "release_id": RELEASE_ID,
+            "contract_version": CONTRACT_VERSION,
+        }
+
+    async def open_session(
+        self,
+        *,
+        device_id: str,
+        payload: SessionOpenRequest,
+    ) -> Dict[str, Any]:
+        correlation_id = _new_correlation_id()
+        contract = _resolve_session_open_contract(payload)
+        requested_entry_context = payload.entry_context or EntryContext(
+            source=payload.source,
+            entry_mode="reactive",
+        )
+        _log_event(
+            logging.INFO,
+            "Session open requested",
+            device_id=device_id,
+            session_id=payload.session_id or "",
+            timezone=payload.timezone or "",
+            correlation_id=correlation_id,
+            open_id=contract.open_id,
+            source=payload.source,
+            client_version=contract.client_version,
+            contract_version=contract.contract_version,
+            entry_mode=requested_entry_context.entry_mode,
+            trigger_type=requested_entry_context.trigger_type or "",
+            event_id=requested_entry_context.event_id or "",
+        )
+        _enforce_session_open_contract(contract)
+        timezone_name = await _resolve_timezone_for_user(
+            user_id=device_id,
+            provided_timezone=payload.timezone,
+        )
+        base_entry_context = payload.entry_context or EntryContext(
+            source=payload.source,
+            entry_mode="reactive",
+        )
+        entry_context = base_entry_context.model_copy(
+            update={"source": payload.source or base_entry_context.source}
+        )
+        session_id = payload.session_id or _daily_session_id(device_id, timezone_name)
+
+        prepared = await _prepare_session_state(
+            user_id=device_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            entry_context=entry_context,
+            persist_event_state=True,
+        )
+
+        startup_status: StartupWorkflowState = "failed"
+        startup_message_id: str | None = None
+        startup_generated = False
+        morning_seed: Dict[str, Any] | None = None
+        onboarding_status = _normalize_onboarding_status(
+            prepared.profile_context.get("onboarding_status")
+        )
+        if not prepared.needs_onboarding:
+            wake_time = str(prepared.profile_context.get("wake_time") or "").strip()
+            if onboarding_status == ONBOARDING_STATUS_COMPLETED and wake_time:
+                try:
+                    morning_seed = await _seed_next_morning_wake_event(
+                        user_id=device_id,
+                        timezone_name=timezone_name,
+                        wake_time=wake_time,
+                    )
+                except Exception as error:
+                    _log_event(
+                        logging.WARNING,
+                        "Morning wake seed skipped during session open",
+                        device_id=device_id,
+                        timezone=timezone_name,
+                        error=str(error),
+                    )
+            (
+                startup_status,
+                startup_message_id,
+                startup_generated,
+            ) = await _ensure_startup_message_for_session(
+                user_id=device_id,
+                session_id=session_id,
+                open_id=contract.open_id,
+                timezone_name=timezone_name,
+                entry_context=entry_context,
+                profile_context=prepared.profile_context,
+                source=payload.source,
+                missed_proactive_events=prepared.missed_proactive_events,
+            )
+            surfaced_ids = [
+                str(item.get("event_id") or "").strip()
+                for item in prepared.missed_proactive_events
+                if str(item.get("event_id") or "").strip()
+            ]
+            if startup_status == "succeeded" and startup_generated and surfaced_ids:
+                latest_missed_reported_ids = list(prepared.missed_reported_ids)
+                for surfaced_id in surfaced_ids:
+                    latest_missed_reported_ids = _append_event_id(
+                        latest_missed_reported_ids,
+                        surfaced_id,
+                    )
+                await _ensure_session(
+                    user_id=device_id,
+                    session_id=session_id,
+                    timezone_name=timezone_name,
+                    entry_context=entry_context,
+                    state_patch={MISSED_REPORTED_STATE_KEY: latest_missed_reported_ids},
+                )
+
+        messages = list(prepared.messages)
+        if startup_generated:
+            messages = await repository.list_messages(session_id=session_id)
+        _log_event(
+            logging.INFO,
+            "Session open completed",
+            device_id=device_id,
+            session_id=session_id,
+            timezone=timezone_name,
+            correlation_id=correlation_id,
+            open_id=contract.open_id,
+            client_version=contract.client_version,
+            contract_version=contract.contract_version,
+            startup_status=startup_status,
+            startup_message_id=startup_message_id,
+            startup_generated=startup_generated,
+            morning_seeded=morning_seed.get("seeded") if morning_seed else None,
+            morning_seed_reason=morning_seed.get("reason") if morning_seed else None,
+            message_count=len(messages),
+            needs_onboarding=prepared.needs_onboarding,
+        )
+        return {
+            "session_id": session_id,
+            "startup_status": startup_status,
+            "messages": [message.model_dump() for message in messages],
+            "needs_onboarding": prepared.needs_onboarding,
+            "profile_context": prepared.profile_context,
+            "task_panel_state": prepared.task_panel_state,
+            "release_id": RELEASE_ID,
+            "contract_version": CONTRACT_VERSION,
+        }
+
+
+class ConversationEngine:
+    """Runs exactly one assistant turn for every transport.
+
+    Chat and voice share the same persisted turn flow, which removes duplicate
+    ownership and keeps reliability work concentrated in one place.
+    """
+
+    def __init__(self, session_service: SessionService) -> None:
+        self.session_service = session_service
+
+    async def _prepare_turn(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        timezone_name: str,
+        prompt: str,
+        transport: Literal["chat", "voice"],
+        entry_context: EntryContext,
+        user_message_id: str | None = None,
+        persist_user_message: bool = True,
+    ) -> tuple[PreparedSessionState, Any, Dict[str, str], bool, str]:
+        prepared = await self.session_service.load_prepared_state(
+            user_id=user_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            entry_context=entry_context,
+            persist_event_state=False,
+        )
+        resolved_user_message_id = user_message_id or str(uuid.uuid4())
+        if persist_user_message:
+            await repository.insert_message(
+                payload=MessageRecord(
+                    id=resolved_user_message_id,
+                    session_id=session_id,
+                    user_id=user_id,
+                    role="user",
+                    content=prompt,
+                    metadata={
+                        "entry_context": entry_context.model_dump(),
+                        "transport": transport,
+                    },
+                    created_at=_iso_now(),
+                )
+            )
+        elif not user_message_id:
+            raise RuntimeError("user_message_id is required when persist_user_message is false")
+        use_onboarding_agent = _onboarding_agent_enabled(prepared.profile_context)
+        selected_agent = onboarding_agent if use_onboarding_agent else agent
+        context_map = await _build_runtime_context_for_session(
+            user_id=user_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            entry_context=entry_context,
+            missed_proactive_events=prepared.missed_proactive_events,
+        )
+        return prepared, selected_agent, context_map, use_onboarding_agent, resolved_user_message_id
+
+    def _finalize_assistant_text(
+        self,
+        *,
+        prompt: str,
+        turn_result: TurnExecutionResult,
+    ) -> tuple[str, Dict[str, int], bool]:
+        assistant_text = turn_result.assistant_text.strip() or "I could not generate a response right now."
+        task_action_counts = {
+            str(key): int(value)
+            for key, value in (turn_result.task_action_counts or {}).items()
+            if isinstance(value, int)
+        }
+        task_written = bool(turn_result.task_written)
+
+        assistant_claimed_task_action = _looks_like_task_claim(assistant_text)
+        assistant_claimed_schedule = _looks_like_schedule_claim(assistant_text)
+        schedule_write_count = int(task_action_counts.get("timebox", 0)) + int(
+            task_action_counts.get("reschedule", 0)
+        )
+        user_task_intent = _looks_like_task_intent(prompt)
+
+        if assistant_claimed_schedule and schedule_write_count <= 0:
+            assistant_text = (
+                "I could not safely schedule that yet. "
+                "Please share an explicit time window and I will set it now."
+            )
+        elif (user_task_intent or assistant_claimed_task_action) and not task_written:
+            assistant_text = (
+                "I could not safely apply that task change yet. "
+                "Please confirm the task details and I will retry."
+            )
+        return assistant_text, task_action_counts, task_written
+
+    async def _complete_turn(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        timezone_name: str,
+        entry_context: EntryContext,
+        transport: Literal["chat", "voice"],
+        prompt: str,
+        turn_result: TurnExecutionResult,
+        use_onboarding_agent: bool,
+        user_message_id: str,
+        assistant_message_id: str,
+    ) -> Dict[str, Any]:
+        normalized_text, task_action_counts, task_written = self._finalize_assistant_text(
+            prompt=prompt,
+            turn_result=turn_result,
+        )
+        agent_mode = turn_result.agent_mode or (
+            "onboarding" if use_onboarding_agent else "main"
+        )
+        assistant_message = MessageRecord(
+            id=assistant_message_id,
+            session_id=session_id,
+            user_id=user_id,
+            role="assistant",
+            content=normalized_text,
+            metadata={
+                "model": "google-adk",
+                "streamed": turn_result.streamed,
+                "transport": transport,
+                "agent_mode": agent_mode,
+                "in_reply_to": user_message_id,
+            },
+            created_at=_iso_now(),
+        )
+        await repository.insert_message(payload=assistant_message)
+        await _ensure_session(
+            user_id=user_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            entry_context=entry_context,
+            state_patch={"last_message_id": assistant_message_id, "last_role": "assistant"},
+        )
+        _log_event(
+            logging.INFO,
+            "Assistant turn completed",
+            device_id=user_id,
+            session_id=session_id,
+            timezone=timezone_name,
+            transport=transport,
+            streamed=turn_result.streamed,
+            task_written=task_written,
+            task_action_counts=task_action_counts,
+        )
+        snapshot = await self.session_service.build_snapshot(
+            user_id=user_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            entry_context=entry_context,
+        )
+        await _broadcast_session_stream(
+            user_id=user_id,
+            session_id=session_id,
+            payload={
+                "type": "assistant_done",
+                "message_id": assistant_message_id,
+                "text": normalized_text,
+                "created_at": assistant_message.created_at,
+            },
+        )
+        await _broadcast_session_stream(
+            user_id=user_id,
+            session_id=session_id,
+            payload={
+                "type": "session_snapshot",
+                "snapshot": snapshot,
+            },
+        )
+        return {
+            **snapshot,
+            "output": normalized_text,
+            "message_id": assistant_message_id,
+            "created_at": assistant_message.created_at,
+        }
+
+    async def _run_agent_turn(
+        self,
+        *,
+        selected_agent: Any,
+        prompt: str,
+        user_id: str,
+        session_id: str,
+        context_map: Dict[str, str],
+    ) -> TurnExecutionResult:
+        run_turn = getattr(selected_agent, "run_turn", None)
+        if callable(run_turn):
+            return await run_turn(
+                prompt=prompt,
+                user_id=user_id,
+                session_id=session_id,
+                context=context_map,
+            )
+
+        assistant_text = await selected_agent.run(
+            prompt=prompt,
+            user_id=user_id,
+            session_id=session_id,
+            context=context_map,
+        )
+        return TurnExecutionResult(
+            assistant_text=str(assistant_text or ""),
+            task_action_counts={},
+            task_written=False,
+            streamed=False,
+        )
+
+    async def _run_agent_stream_turn(
+        self,
+        *,
+        selected_agent: Any,
+        prompt: str,
+        user_id: str,
+        session_id: str,
+        context_map: Dict[str, str],
+        assistant_message_id: str,
+        on_delta: Callable[[str, str, str], Awaitable[bool]],
+    ) -> TurnExecutionResult | None:
+        run_stream_turn = getattr(selected_agent, "run_stream_turn", None)
+        if callable(run_stream_turn):
+            return await run_stream_turn(
+                prompt=prompt,
+                user_id=user_id,
+                session_id=session_id,
+                context=context_map,
+                on_delta=lambda delta, cumulative: on_delta(
+                    assistant_message_id,
+                    delta,
+                    cumulative,
+                ),
+            )
+
+        cumulative = ""
+        async for delta in selected_agent.run_stream(
+            prompt=prompt,
+            user_id=user_id,
+            session_id=session_id,
+            context=context_map,
+        ):
+            if not delta:
+                continue
+            cumulative += delta
+            if not await on_delta(assistant_message_id, delta, cumulative):
+                return None
+        return TurnExecutionResult(
+            assistant_text=cumulative,
+            task_action_counts={},
+            task_written=False,
+            streamed=True,
+        )
+
+    async def run_turn(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        timezone_name: str,
+        prompt: str,
+        transport: Literal["chat", "voice"],
+        entry_context: EntryContext,
+        user_message_id: str | None = None,
+        persist_user_message: bool = True,
+    ) -> Dict[str, Any]:
+        prepared, selected_agent, context_map, use_onboarding_agent, resolved_user_message_id = await self._prepare_turn(
+            user_id=user_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            prompt=prompt,
+            transport=transport,
+            entry_context=entry_context,
+            user_message_id=user_message_id,
+            persist_user_message=persist_user_message,
+        )
+        del prepared
+        assistant_message_id = str(uuid.uuid4())
+        try:
+            turn_result = await self._run_agent_turn(
+                selected_agent=selected_agent,
+                prompt=prompt,
+                user_id=user_id,
+                session_id=session_id,
+                context_map=context_map,
+            )
+        except Exception as error:
+            model_name = _active_adk_model_name()
+            logger.exception(
+                "Assistant turn failed",
+                extra={
+                    "device_id": user_id,
+                    "session_id": session_id,
+                    "timezone": timezone_name,
+                    "model": model_name,
+                    "transport": transport,
+                    "error": str(error),
+                },
+            )
+            raise _http_error(
+                503,
+                "ADK_UNAVAILABLE",
+                f"Google ADK unavailable (model={model_name}): {error}",
+            ) from error
+        return await self._complete_turn(
+            user_id=user_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            entry_context=entry_context,
+            transport=transport,
+            prompt=prompt,
+            turn_result=turn_result,
+            use_onboarding_agent=use_onboarding_agent,
+            user_message_id=resolved_user_message_id,
+            assistant_message_id=assistant_message_id,
+        )
+
+    async def stream_turn(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        timezone_name: str,
+        prompt: str,
+        transport: Literal["chat", "voice"],
+        entry_context: EntryContext,
+        on_delta: Callable[[str, str, str], Awaitable[bool]],
+        user_message_id: str | None = None,
+        persist_user_message: bool = True,
+    ) -> Dict[str, Any] | None:
+        prepared, selected_agent, context_map, use_onboarding_agent, resolved_user_message_id = await self._prepare_turn(
+            user_id=user_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            prompt=prompt,
+            transport=transport,
+            entry_context=entry_context,
+            user_message_id=user_message_id,
+            persist_user_message=persist_user_message,
+        )
+        del prepared
+        assistant_message_id = str(uuid.uuid4())
+        try:
+            turn_result = await self._run_agent_stream_turn(
+                selected_agent=selected_agent,
+                prompt=prompt,
+                user_id=user_id,
+                session_id=session_id,
+                context_map=context_map,
+                assistant_message_id=assistant_message_id,
+                on_delta=on_delta,
+            )
+            if turn_result is None:
+                return None
+        except Exception as error:
+            model_name = _active_adk_model_name()
+            logger.exception(
+                "Assistant stream failed",
+                extra={
+                    "device_id": user_id,
+                    "session_id": session_id,
+                    "timezone": timezone_name,
+                    "model": model_name,
+                    "transport": transport,
+                    "error": str(error),
+                },
+            )
+            raise _http_error(
+                503,
+                "ADK_UNAVAILABLE",
+                f"Google ADK unavailable (model={model_name}): {error}",
+            ) from error
+        return await self._complete_turn(
+            user_id=user_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            entry_context=entry_context,
+            transport=transport,
+            prompt=prompt,
+            turn_result=turn_result,
+            use_onboarding_agent=use_onboarding_agent,
+            user_message_id=resolved_user_message_id,
+            assistant_message_id=assistant_message_id,
+        )
+
+
+class VoiceGateway:
+    """Owns the LiveKit connect contract for the voice-first product.
+
+    Frontend and worker code should only know about one connect endpoint. This
+    gateway hides room lifecycle and dispatch fallback so transports stay thin.
+    """
+
+    def __init__(
+        self,
+        *,
+        session_service: SessionService,
+    ) -> None:
+        self.session_service = session_service
+
+    def _require_coordinator(self) -> LiveKitVoiceCoordinator:
+        coordinator = livekit_voice
+        if coordinator is None:
+            raise _http_error(
+                503,
+                "LIVEKIT_NOT_CONFIGURED",
+                "LiveKit voice mode is not configured on the backend",
+            )
+        return coordinator
+
+    async def connect(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        timezone_name: str,
+        request: Request,
+    ) -> Dict[str, Any]:
+        coordinator = self._require_coordinator()
+        prepared = await self.session_service.load_prepared_state(
+            user_id=user_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            persist_event_state=False,
+        )
+        session_state = await self.session_service.build_snapshot(
+            user_id=user_id,
+            session_id=session_id,
+            timezone_name=timezone_name,
+            entry_context=prepared.entry_context,
+        )
+        room_name = f"voice_{session_id}"
+        backend_url = (
+            str(os.getenv("INTENTIVE_BACKEND_URL") or "").strip()
+            or str(os.getenv("CLOUD_RUN_URL") or "").strip()
+            or str(request.base_url).rstrip("/")
+        )
+        dispatch_metadata = {
+            "device_id": user_id,
+            "session_id": session_id,
+            "timezone": timezone_name,
+            "backend_url": backend_url,
+            "entry_context": prepared.entry_context.model_dump(),
+        }
+        room_metadata = {
+            "device_id": user_id,
+            "session_id": session_id,
+            "timezone": timezone_name,
+            "transport": "voice",
+        }
+        await coordinator.ensure_room(room_name=room_name, metadata=room_metadata)
+        dispatch_result = await coordinator.dispatch_agent(
+            room_name=room_name,
+            metadata=dispatch_metadata,
+        )
+        if dispatch_result.fallback_used:
+            _log_event(
+                logging.WARNING,
+                "Voice explicit dispatch failed; token fallback enabled",
+                device_id=user_id,
+                session_id=session_id,
+                timezone=timezone_name,
+                diagnostic_code=dispatch_result.diagnostic_code or "",
+                diagnostic=dispatch_result.diagnostic or {},
+            )
+        else:
+            _log_event(
+                logging.INFO,
+                "Voice explicit dispatch succeeded",
+                device_id=user_id,
+                session_id=session_id,
+                timezone=timezone_name,
+            )
+        participant_identity = coordinator.participant_identity(
+            device_id=user_id,
+            session_id=session_id,
+        )
+        participant_token, expires_at = coordinator.build_participant_token(
+            room_name=room_name,
+            participant_identity=participant_identity,
+            participant_name="Intentive User",
+            participant_metadata={
+                "device_id": user_id,
+                "session_id": session_id,
+                "timezone": timezone_name,
+            },
+            dispatch_metadata=dispatch_metadata,
+            use_token_dispatch_fallback=dispatch_result.fallback_used,
+        )
+        response: Dict[str, Any] = {
+            **session_state,
+            "room_name": room_name,
+            "server_url": coordinator.url,
+            "participant_identity": participant_identity,
+            "participant_token": participant_token,
+            "expires_at": expires_at,
+            "dispatch_mode": dispatch_result.mode,
+            "fallback_used": dispatch_result.fallback_used,
+        }
+        if _voice_debug_enabled() and dispatch_result.diagnostic_code:
+            response["voice_diagnostic_code"] = dispatch_result.diagnostic_code
+        return response
+
+
+session_service = SessionService()
+conversation_engine = ConversationEngine(session_service)
+voice_gateway = VoiceGateway(session_service=session_service)
 
 
 def _extract_titles(payload: Dict[str, Any]) -> List[str]:
@@ -4682,6 +5527,27 @@ def health() -> Dict[str, Any]:
     }
 
 
+@app.get("/agent/voice/health")
+def voice_health() -> Dict[str, Any]:
+    env_status = LiveKitVoiceCoordinator.env_status()
+    coordinator_loaded = livekit_voice is not None
+    configured = bool(env_status.get("configured")) and coordinator_loaded
+    return {
+        "status": "ok" if configured else "degraded",
+        "configured": configured,
+        "coordinator_loaded": coordinator_loaded,
+        "missing_env_vars": list(env_status.get("missing_env_vars") or []),
+        "agent_name": str(env_status.get("agent_name") or ""),
+        "livekit_url": str(os.getenv("LIVEKIT_URL") or "").strip(),
+        "expected_worker_stt": str(os.getenv("LIVEKIT_STT_MODEL") or "deepgram/nova-3"),
+        "expected_worker_stt_language": str(os.getenv("LIVEKIT_STT_LANGUAGE") or "en"),
+        "expected_worker_tts": str(os.getenv("LIVEKIT_TTS_MODEL") or "cartesia/sonic-3"),
+        "expected_worker_tts_voice": str(
+            os.getenv("LIVEKIT_TTS_VOICE") or "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
+        ),
+    }
+
+
 @app.post("/agent/run")
 async def run_agent(payload: AgentRunRequest) -> Dict[str, str]:
     context = payload.context or {}
@@ -4765,124 +5631,175 @@ async def open_session(payload: SessionOpenRequest) -> Dict[str, Any]:
     device_id = payload.device_id.strip()
     if not device_id:
         raise _http_error(400, "INVALID_DEVICE_ID", "device_id is required")
+    return await session_service.open_session(device_id=device_id, payload=payload)
 
-    correlation_id = _new_correlation_id()
-    contract = _resolve_session_open_contract(payload)
-    requested_entry_context = payload.entry_context or EntryContext(source=payload.source, entry_mode="reactive")
-    _log_event(
-        logging.INFO,
-        "Session open requested",
-        device_id=device_id,
-        session_id=payload.session_id or "",
-        timezone=payload.timezone or "",
-        correlation_id=correlation_id,
-        open_id=contract.open_id,
-        source=payload.source,
-        client_version=contract.client_version,
-        contract_version=contract.contract_version,
-        entry_mode=requested_entry_context.entry_mode,
-        trigger_type=requested_entry_context.trigger_type or "",
-        event_id=requested_entry_context.event_id or "",
-    )
-    _enforce_session_open_contract(contract)
+
+@app.post("/agent/session/state")
+async def get_session_state(payload: SessionStateRequest) -> Dict[str, Any]:
+    device_id = payload.device_id.strip()
+    if not device_id:
+        raise _http_error(400, "INVALID_DEVICE_ID", "device_id is required")
     timezone_name = await _resolve_timezone_for_user(
         user_id=device_id,
         provided_timezone=payload.timezone,
     )
-    base_entry_context = payload.entry_context or EntryContext(source=payload.source, entry_mode="reactive")
-    entry_context = base_entry_context.model_copy(
-        update={"source": payload.source or base_entry_context.source}
-    )
-    session_id = payload.session_id or _daily_session_id(device_id, timezone_name)
-
-    prepared = await _prepare_session_state(
+    return await session_service.build_snapshot(
         user_id=device_id,
-        session_id=session_id,
+        session_id=payload.session_id.strip(),
         timezone_name=timezone_name,
-        entry_context=entry_context,
-        persist_event_state=True,
     )
 
-    startup_status: StartupWorkflowState = "failed"
-    startup_message_id: str | None = None
-    startup_generated = False
-    morning_seed: Dict[str, Any] | None = None
-    onboarding_status = _normalize_onboarding_status(prepared.profile_context.get("onboarding_status"))
-    if not prepared.needs_onboarding:
-        wake_time = str(prepared.profile_context.get("wake_time") or "").strip()
-        if onboarding_status == ONBOARDING_STATUS_COMPLETED and wake_time:
-            try:
-                morning_seed = await _seed_next_morning_wake_event(
-                    user_id=device_id,
-                    timezone_name=timezone_name,
-                    wake_time=wake_time,
-                )
-            except Exception as error:
-                _log_event(
-                    logging.WARNING,
-                    "Morning wake seed skipped during session open",
-                    device_id=device_id,
-                    timezone=timezone_name,
-                    error=str(error),
-                )
-        startup_status, startup_message_id, startup_generated = await _ensure_startup_message_for_session(
+
+@app.post("/agent/conversation/turn")
+async def conversation_turn(payload: ConversationTurnRequest) -> Dict[str, Any]:
+    device_id = payload.device_id.strip()
+    if not device_id:
+        raise _http_error(400, "INVALID_DEVICE_ID", "device_id is required")
+
+    timezone_name = await _resolve_timezone_for_user(
+        user_id=device_id,
+        provided_timezone=payload.timezone,
+    )
+    existing_session = await repository.get_session(
+        session_id=payload.session_id,
+        user_id=device_id,
+    )
+    entry_context = payload.entry_context or _entry_context_from_state(
+        existing_session.state if existing_session else {}
+    )
+
+    async def _on_delta(message_id: str, delta: str, cumulative: str) -> bool:
+        await _broadcast_session_stream(
             user_id=device_id,
-            session_id=session_id,
-            open_id=contract.open_id,
+            session_id=payload.session_id,
+            payload={
+                "type": "assistant_delta",
+                "message_id": message_id,
+                "delta": delta,
+                "text": cumulative,
+            },
+        )
+        return True
+
+    async def _load_replay_context() -> tuple[Dict[str, Any], List[MessageRecord]] | None:
+        if not payload.user_message_id:
+            return None
+        if not await repository.message_exists(
+            session_id=payload.session_id,
+            message_id=payload.user_message_id,
+        ):
+            return None
+
+        snapshot = await session_service.build_snapshot(
+            user_id=device_id,
+            session_id=payload.session_id,
             timezone_name=timezone_name,
             entry_context=entry_context,
-            profile_context=prepared.profile_context,
-            source=payload.source,
-            missed_proactive_events=prepared.missed_proactive_events,
         )
-        surfaced_ids = [
-            str(item.get("event_id") or "").strip()
-            for item in prepared.missed_proactive_events
-            if str(item.get("event_id") or "").strip()
-        ]
-        if startup_status == "succeeded" and startup_generated and surfaced_ids:
-            latest_missed_reported_ids = list(prepared.missed_reported_ids)
-            for surfaced_id in surfaced_ids:
-                latest_missed_reported_ids = _append_event_id(latest_missed_reported_ids, surfaced_id)
-            await _ensure_session(
-                user_id=device_id,
-                session_id=session_id,
-                timezone_name=timezone_name,
-                entry_context=entry_context,
-                state_patch={MISSED_REPORTED_STATE_KEY: latest_missed_reported_ids},
+        existing_messages = [MessageRecord(**message) for message in snapshot["messages"]]
+        persisted_user_message = _find_user_message(
+            existing_messages,
+            payload.user_message_id,
+        )
+        if not persisted_user_message:
+            raise _http_error(
+                409,
+                "USER_MESSAGE_ID_CONFLICT",
+                "user_message_id already exists for a different message role",
             )
+        if persisted_user_message.content != payload.prompt:
+            raise _http_error(
+                409,
+                "USER_MESSAGE_ID_PROMPT_MISMATCH",
+                "user_message_id already exists with a different prompt",
+            )
+        return snapshot, existing_messages
 
-    messages = list(prepared.messages)
-    if startup_generated:
-        messages = await repository.list_messages(session_id=session_id)
-    _log_event(
-        logging.INFO,
-        "Session open completed",
-        device_id=device_id,
-        session_id=session_id,
-        timezone=timezone_name,
-        correlation_id=correlation_id,
-        open_id=contract.open_id,
-        client_version=contract.client_version,
-        contract_version=contract.contract_version,
-        startup_status=startup_status,
-        startup_message_id=startup_message_id,
-        startup_generated=startup_generated,
-        morning_seeded=morning_seed.get("seeded") if morning_seed else None,
-        morning_seed_reason=morning_seed.get("reason") if morning_seed else None,
-        message_count=len(messages),
-        needs_onboarding=prepared.needs_onboarding,
+    replay_context = await _load_replay_context()
+    if replay_context:
+        snapshot, existing_messages = replay_context
+
+        persisted_assistant_message = _assistant_reply_for_user_turn(
+            existing_messages,
+            payload.user_message_id,
+        )
+        if persisted_assistant_message:
+            return {
+                **snapshot,
+                "output": persisted_assistant_message.content,
+                "message_id": persisted_assistant_message.id,
+                "created_at": persisted_assistant_message.created_at,
+            }
+
+        result = await conversation_engine.stream_turn(
+            prompt=payload.prompt,
+            user_id=device_id,
+            session_id=payload.session_id,
+            timezone_name=timezone_name,
+            transport=payload.transport,
+            entry_context=entry_context,
+            on_delta=_on_delta,
+            user_message_id=payload.user_message_id,
+            persist_user_message=False,
+        )
+        if result is None:
+            raise _http_error(503, "TURN_STREAM_ABORTED", "Conversation turn aborted before completion")
+        return result
+
+    try:
+        result = await conversation_engine.stream_turn(
+            prompt=payload.prompt,
+            user_id=device_id,
+            session_id=payload.session_id,
+            timezone_name=timezone_name,
+            transport=payload.transport,
+            entry_context=entry_context,
+            on_delta=_on_delta,
+            user_message_id=payload.user_message_id,
+        )
+    except RuntimeError as error:
+        if payload.user_message_id and _is_duplicate_message_insert_error(error):
+            replay_context = await _load_replay_context()
+            if replay_context:
+                snapshot, existing_messages = replay_context
+                persisted_assistant_message = _assistant_reply_for_user_turn(
+                    existing_messages,
+                    payload.user_message_id,
+                )
+                if persisted_assistant_message:
+                    return {
+                        **snapshot,
+                        "output": persisted_assistant_message.content,
+                        "message_id": persisted_assistant_message.id,
+                        "created_at": persisted_assistant_message.created_at,
+                    }
+            raise _http_error(
+                409,
+                "USER_MESSAGE_ID_IN_PROGRESS",
+                "user_message_id is already being processed; retry shortly",
+            ) from error
+        raise
+    if result is None:
+        raise _http_error(503, "TURN_STREAM_ABORTED", "Conversation turn aborted before completion")
+    return result
+
+
+@app.post("/agent/voice/connect")
+async def connect_voice(payload: VoiceConnectRequest, request: Request) -> Dict[str, Any]:
+    device_id = payload.device_id.strip()
+    if not device_id:
+        raise _http_error(400, "INVALID_DEVICE_ID", "device_id is required")
+
+    timezone_name = await _resolve_timezone_for_user(
+        user_id=device_id,
+        provided_timezone=payload.timezone,
     )
-    return {
-        "session_id": session_id,
-        "startup_status": startup_status,
-        "messages": [message.model_dump() for message in messages],
-        "needs_onboarding": prepared.needs_onboarding,
-        "profile_context": prepared.profile_context,
-        "task_panel_state": prepared.task_panel_state,
-        "release_id": RELEASE_ID,
-        "contract_version": CONTRACT_VERSION,
-    }
+    return await voice_gateway.connect(
+        user_id=device_id,
+        session_id=payload.session_id,
+        timezone_name=timezone_name,
+        request=request,
+    )
 
 
 @app.post("/agent/events/execute")
@@ -5205,6 +6122,152 @@ async def task_query(payload: TaskQueryRequest) -> Dict[str, Any]:
     return output
 
 
+@app.websocket("/agent/session/ws")
+async def session_ws(
+    websocket: WebSocket,
+    device_id: str = Query(...),
+    session_id: str = Query(...),
+    timezone: str | None = Query(None),
+) -> None:
+    await websocket.accept()
+    socket_closed = False
+    unsubscribe_session_stream = None
+
+    async def _safe_send_json(payload: Dict[str, Any]) -> bool:
+        nonlocal socket_closed
+        if socket_closed:
+            return False
+        try:
+            await websocket.send_json(payload)
+            return True
+        except WebSocketDisconnect:
+            socket_closed = True
+            return False
+        except RuntimeError as error:
+            if 'Cannot call "send" once a close message has been sent.' in str(error):
+                socket_closed = True
+                return False
+            raise
+
+    try:
+        timezone_name = await _resolve_timezone_for_user(
+            user_id=device_id,
+            provided_timezone=timezone,
+        )
+    except HTTPException as error:
+        detail = _error_envelope(status_code=error.status_code, detail=error.detail)["error"]["message"]
+        await _safe_send_json({"type": "error", "code": "invalid_timezone", "detail": detail})
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        return
+
+    target_session_id = session_id.strip()
+    if not target_session_id:
+        await _safe_send_json(
+            {
+                "type": "error",
+                "code": "invalid_session_id",
+                "detail": "session_id is required",
+            }
+        )
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        return
+
+    try:
+        existing_session = await repository.get_session_by_id(session_id=target_session_id)
+        if existing_session and existing_session.user_id != device_id:
+            raise _http_error(403, "SESSION_FORBIDDEN", "Session does not belong to device")
+
+        snapshot = await session_service.build_snapshot(
+            user_id=device_id,
+            session_id=target_session_id,
+            timezone_name=timezone_name,
+        )
+
+        async def _session_listener(payload: Dict[str, Any]) -> bool:
+            return await _safe_send_json(payload)
+
+        unsubscribe_session_stream = _subscribe_session_stream(
+            device_id,
+            target_session_id,
+            _session_listener,
+        )
+        if not await _safe_send_json(
+            {
+                "type": "session_snapshot",
+                "snapshot": snapshot,
+            }
+        ):
+            return
+
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                frame = json.loads(raw)
+            except json.JSONDecodeError:
+                if not await _safe_send_json(
+                    {
+                        "type": "error",
+                        "code": "invalid_json",
+                        "detail": "Invalid JSON frame",
+                    }
+                ):
+                    break
+                continue
+
+            if frame.get("type") == "ping":
+                if not await _safe_send_json(
+                    {
+                        "type": "heartbeat",
+                        "at": _iso_now(),
+                    }
+                ):
+                    break
+                continue
+
+            if not await _safe_send_json(
+                {
+                    "type": "error",
+                    "code": "unknown_frame",
+                    "detail": "Unknown frame type",
+                }
+            ):
+                break
+
+    except WebSocketDisconnect:
+        return
+    except HTTPException as error:
+        detail = _error_envelope(status_code=error.status_code, detail=error.detail)["error"]["message"]
+        await _safe_send_json({"type": "error", "code": "session_stream_failed", "detail": detail})
+    except Exception as error:
+        logger.exception(
+            "Session stream websocket failed",
+            extra={
+                "device_id": device_id,
+                "session_id": target_session_id,
+                "error": str(error),
+            },
+        )
+        await _safe_send_json(
+            {
+                "type": "error",
+                "code": "session_stream_failed",
+                "detail": str(error),
+            }
+        )
+    finally:
+        if unsubscribe_session_stream:
+            unsubscribe_session_stream()
+
+
+# Compatibility-only websocket for legacy clients. Keep this route thin and
+# aligned to the canonical flow (`conversation/turn` + `session/ws`). Do not
+# add new product behavior here.
 @app.websocket("/agent/ws")
 async def agent_ws(
     websocket: WebSocket,
@@ -5213,6 +6276,7 @@ async def agent_ws(
 ) -> None:
     await websocket.accept()
     socket_closed = False
+    unsubscribe_task_panel = None
 
     async def _safe_send_json(payload: Dict[str, Any]) -> bool:
         nonlocal socket_closed
@@ -5244,194 +6308,18 @@ async def agent_ws(
         except Exception:
             pass
         return
-    active_user_id = device_id
+
     active_session_id: str | None = None
-    unsubscribe_task_panel = None
-    initialized = False
-    latest_entry_context = EntryContext()
-    latest_missed_proactive_events: List[Dict[str, Any]] = []
-    latest_profile_context: Dict[str, Any] = {}
     ws_correlation_id = _new_correlation_id()
 
     _log_event(
         logging.INFO,
         "WebSocket connected",
-        device_id=active_user_id,
+        device_id=device_id,
         session_id="",
         timezone=timezone_name,
         correlation_id=ws_correlation_id,
     )
-
-    async def _build_runtime_context() -> Dict[str, str]:
-        if not active_session_id:
-            raise RuntimeError("Session not initialized")
-        return await _build_runtime_context_for_session(
-            user_id=active_user_id,
-            session_id=active_session_id,
-            timezone_name=timezone_name,
-            entry_context=latest_entry_context,
-            missed_proactive_events=latest_missed_proactive_events,
-        )
-
-    async def _run_assistant_turn(
-        *,
-        prompt: str,
-        metadata: Dict[str, Any] | None = None,
-        user_task_intent: bool = False,
-    ) -> bool:
-        if not active_session_id:
-            return False
-        assistant_message_id = str(uuid.uuid4())
-        context_map = await _build_runtime_context()
-        use_onboarding_agent = _onboarding_agent_enabled(latest_profile_context)
-        selected_agent = onboarding_agent if use_onboarding_agent else agent
-
-        cumulative = ""
-        try:
-            async for delta in selected_agent.run_stream(
-                prompt=prompt,
-                user_id=active_user_id,
-                session_id=active_session_id,
-                context=context_map,
-            ):
-                if not delta:
-                    continue
-                cumulative += delta
-                if not await _safe_send_json(
-                    {
-                        "type": "assistant_delta",
-                        "message_id": assistant_message_id,
-                        "delta": delta,
-                        "text": cumulative,
-                    }
-                ):
-                    return False
-        except WebSocketDisconnect:
-            return False
-        except Exception as error:
-            model_name = _active_adk_model_name()
-            logger.exception(
-                "WebSocket ADK stream failed",
-                extra={
-                    "device_id": active_user_id,
-                    "session_id": active_session_id,
-                    "timezone": timezone_name,
-                    "model": model_name,
-                    "error": str(error),
-                },
-            )
-            await _safe_send_json(
-                {
-                    "type": "error",
-                    "code": "adk_error",
-                    "detail": f"Google ADK unavailable (model={model_name}): {error}",
-                }
-            )
-            return False
-
-        assistant_text = cumulative.strip() or "I could not generate a response right now."
-        assistant_metadata: Dict[str, Any] = {"model": "google-adk", "streamed": True}
-        if metadata:
-            assistant_metadata.update(metadata)
-        assistant_metadata["agent_mode"] = "onboarding" if use_onboarding_agent else "main"
-        startup_turn = bool(assistant_metadata.get("startup_turn"))
-        task_write_count = 0
-        consume_write_count = getattr(selected_agent, "consume_task_write_count", None)
-        if callable(consume_write_count):
-            try:
-                task_write_count = int(
-                    consume_write_count(user_id=active_user_id, session_id=active_session_id)
-                )
-            except Exception:
-                task_write_count = 0
-        task_written = task_write_count > 0
-        task_action_counts: Dict[str, int] = {}
-        consume_action_counts = getattr(selected_agent, "consume_task_action_counts", None)
-        if callable(consume_action_counts):
-            try:
-                raw_counts = consume_action_counts(user_id=active_user_id, session_id=active_session_id)
-                if isinstance(raw_counts, dict):
-                    task_action_counts = {
-                        str(key): int(value) for key, value in raw_counts.items() if isinstance(value, int)
-                    }
-            except Exception:
-                task_action_counts = {}
-        assistant_claimed_task_action = _looks_like_task_claim(assistant_text)
-        assistant_claimed_schedule = _looks_like_schedule_claim(assistant_text)
-        schedule_write_count = int(task_action_counts.get("timebox", 0)) + int(
-            task_action_counts.get("reschedule", 0)
-        )
-
-        if assistant_claimed_schedule and schedule_write_count <= 0 and not startup_turn:
-            assistant_text = (
-                "I could not safely schedule that yet. "
-                "Please share an explicit time window and I will set it now."
-            )
-        elif (user_task_intent or assistant_claimed_task_action) and not task_written and not startup_turn:
-            assistant_text = (
-                "I could not safely apply that task change yet. "
-                "Please confirm the task details and I will retry."
-            )
-
-        assistant_message = MessageRecord(
-            id=assistant_message_id,
-            session_id=active_session_id,
-            user_id=active_user_id,
-            role="assistant",
-            content=assistant_text,
-            metadata=assistant_metadata,
-            created_at=_iso_now(),
-        )
-        await repository.insert_message(payload=assistant_message)
-
-        await _ensure_session(
-            user_id=active_user_id,
-            session_id=active_session_id,
-            timezone_name=timezone_name,
-            entry_context=latest_entry_context,
-            state_patch={"last_message_id": assistant_message_id, "last_role": "assistant"},
-        )
-
-        if assistant_claimed_schedule and schedule_write_count <= 0 and not startup_turn:
-            _log_event(
-                logging.WARNING,
-                "Schedule claim detected without schedule write",
-                device_id=active_user_id,
-                session_id=active_session_id,
-                schedule_write_count=schedule_write_count,
-                task_action_counts=task_action_counts,
-            )
-        elif (user_task_intent or assistant_claimed_task_action) and not task_written and not startup_turn:
-            _log_event(
-                logging.WARNING,
-                "Task intent detected without task write",
-                device_id=active_user_id,
-                session_id=active_session_id,
-                user_task_intent=user_task_intent,
-                assistant_claimed_task_action=assistant_claimed_task_action,
-                task_written=False,
-            )
-        else:
-            _log_event(
-                logging.INFO,
-                "Assistant turn completed",
-                device_id=active_user_id,
-                session_id=active_session_id,
-                startup_turn=startup_turn,
-                task_written=task_written,
-                task_write_count=task_write_count,
-                task_action_counts=task_action_counts,
-            )
-
-        return await _safe_send_json(
-            {
-                "type": "assistant_done",
-                "message_id": assistant_message_id,
-                "text": assistant_text,
-                "created_at": assistant_message.created_at,
-                "cursor": _message_cursor_for(assistant_message),
-            }
-        )
 
     try:
         while True:
@@ -5463,20 +6351,19 @@ async def agent_ws(
                     ):
                         break
                     continue
-                active_session_id = next_session_id
+
                 try:
-                    existing_session = await repository.get_session_by_id(session_id=active_session_id)
-                    if existing_session and existing_session.user_id != active_user_id:
+                    existing_session = await repository.get_session_by_id(session_id=next_session_id)
+                    if existing_session and existing_session.user_id != device_id:
                         raise _http_error(403, "SESSION_FORBIDDEN", "Session does not belong to device")
                     session_entry_context = _entry_context_from_state(
                         existing_session.state if existing_session else {}
                     )
-                    prepared = await _prepare_session_state(
-                        user_id=active_user_id,
-                        session_id=active_session_id,
+                    snapshot = await session_service.build_snapshot(
+                        user_id=device_id,
+                        session_id=next_session_id,
                         timezone_name=timezone_name,
                         entry_context=session_entry_context,
-                        persist_event_state=False,
                     )
                 except HTTPException as error:
                     detail = _error_envelope(status_code=error.status_code, detail=error.detail)["error"][
@@ -5486,8 +6373,8 @@ async def agent_ws(
                     _log_event(
                         logging.WARNING,
                         "WebSocket session init rejected",
-                        device_id=active_user_id,
-                        session_id=active_session_id,
+                        device_id=device_id,
+                        session_id=next_session_id,
                         correlation_id=ws_correlation_id,
                         status_code=error.status_code,
                         error_code=code,
@@ -5496,17 +6383,21 @@ async def agent_ws(
                     if not await _safe_send_json({"type": "error", "code": code, "detail": detail}):
                         break
                     continue
-                latest_entry_context = prepared.entry_context
-                latest_missed_proactive_events = prepared.missed_proactive_events
-                latest_profile_context = prepared.profile_context
+
+                active_session_id = next_session_id
                 if unsubscribe_task_panel:
                     unsubscribe_task_panel()
 
-                async def _task_panel_listener(snapshot: Dict[str, Any]) -> bool:
-                    return await _safe_send_json({"type": "task_panel_state", "state": snapshot})
+                async def _task_panel_listener(state: Dict[str, Any]) -> bool:
+                    return await _safe_send_json(
+                        {
+                            "type": "task_panel_state",
+                            "state": state,
+                        }
+                    )
 
                 unsubscribe_task_panel = _subscribe_task_panel(
-                    active_user_id,
+                    device_id,
                     active_session_id,
                     _task_panel_listener,
                 )
@@ -5520,21 +6411,20 @@ async def agent_ws(
                 if not await _safe_send_json(
                     {
                         "type": "task_panel_state",
-                        "state": prepared.task_panel_state,
+                        "state": snapshot["task_panel_state"],
                     }
                 ):
                     break
-                initialized = True
                 _log_event(
                     logging.INFO,
                     "WebSocket session initialized",
-                    device_id=active_user_id,
+                    device_id=device_id,
                     session_id=active_session_id,
                     correlation_id=ws_correlation_id,
                     ws_init=True,
-                    message_count=len(prepared.messages),
-                    entry_mode=latest_entry_context.entry_mode,
-                    trigger_type=latest_entry_context.trigger_type or "",
+                    message_count=len(snapshot["messages"]),
+                    entry_mode=session_entry_context.entry_mode,
+                    trigger_type=session_entry_context.trigger_type or "",
                 )
                 continue
 
@@ -5545,14 +6435,14 @@ async def agent_ws(
                     break
                 continue
 
-            if not initialized:
+            if not active_session_id:
                 if not await _safe_send_json(
                     {"type": "error", "code": "not_initialized", "detail": "Send init first"}
                 ):
                     break
                 continue
 
-            message_id = str(frame.get("message_id") or "")
+            message_id = str(frame.get("message_id") or "").strip()
             text = str(frame.get("text") or "").strip()
             if not message_id or not text:
                 if not await _safe_send_json(
@@ -5564,7 +6454,6 @@ async def agent_ws(
                 ):
                     break
                 continue
-
             if await repository.message_exists(session_id=active_session_id, message_id=message_id):
                 if not await _safe_send_json(
                     {
@@ -5576,37 +6465,86 @@ async def agent_ws(
                     break
                 continue
 
-            user_message = MessageRecord(
-                id=message_id,
-                session_id=active_session_id,
-                user_id=active_user_id,
-                role="user",
-                content=text,
-                metadata={"entry_context": latest_entry_context.model_dump()},
-                created_at=_iso_now(),
-            )
-            await repository.insert_message(payload=user_message)
-
-            if not await _run_assistant_turn(
-                prompt=text,
-                user_task_intent=_looks_like_task_intent(text),
-            ):
-                if socket_closed:
+            existing_session = await repository.get_session_by_id(session_id=active_session_id)
+            if existing_session and existing_session.user_id != device_id:
+                if not await _safe_send_json(
+                    {
+                        "type": "error",
+                        "code": "session_forbidden",
+                        "detail": "Session does not belong to device",
+                    }
+                ):
                     break
                 continue
+            session_entry_context = _entry_context_from_state(
+                existing_session.state if existing_session else {}
+            )
+
+            async def _on_delta(message_id: str, delta: str, cumulative: str) -> bool:
+                await _broadcast_session_stream(
+                    user_id=device_id,
+                    session_id=active_session_id,
+                    payload={
+                        "type": "assistant_delta",
+                        "message_id": message_id,
+                        "delta": delta,
+                        "text": cumulative,
+                    },
+                )
+                return await _safe_send_json(
+                    {
+                        "type": "assistant_delta",
+                        "message_id": message_id,
+                        "delta": delta,
+                        "text": cumulative,
+                    }
+                )
+
+            try:
+                result = await conversation_engine.stream_turn(
+                    user_id=device_id,
+                    session_id=active_session_id,
+                    timezone_name=timezone_name,
+                    prompt=text,
+                    transport="chat",
+                    entry_context=session_entry_context,
+                    on_delta=_on_delta,
+                    user_message_id=message_id,
+                )
+            except HTTPException as error:
+                detail = _error_envelope(status_code=error.status_code, detail=error.detail)["error"]["message"]
+                if not await _safe_send_json(
+                    {"type": "error", "code": "adk_error", "detail": detail}
+                ):
+                    break
+                continue
+            except WebSocketDisconnect:
+                break
+
+            if result is None:
+                break
+            if not await _safe_send_json(
+                {
+                    "type": "assistant_done",
+                    "message_id": result["message_id"],
+                    "text": result["output"],
+                    "created_at": result["created_at"],
+                }
+            ):
+                break
 
     except WebSocketDisconnect:
         _log_event(
             logging.INFO,
             "WebSocket disconnected",
-            device_id=active_user_id,
+            device_id=device_id,
             session_id=active_session_id,
         )
     except Exception as error:
         logger.exception(
             "WebSocket failure",
             extra={
-                "device_id": active_user_id,
+                "device_id": device_id,
                 "session_id": active_session_id,
                 "error": str(error),
             },

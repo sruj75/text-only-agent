@@ -2,6 +2,7 @@ import logging
 import os
 import json
 from contextlib import aclosing
+from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Tuple
 
 from google.adk.agents import LlmAgent
@@ -133,6 +134,22 @@ OnboardingSleepScheduleToolHandler = Callable[
 ]
 
 
+@dataclass(frozen=True)
+class TurnExecutionResult:
+    assistant_text: str
+    task_action_counts: Dict[str, int]
+    task_written: bool
+    streamed: bool
+    agent_mode: str | None = None
+
+
+@dataclass
+class TurnState:
+    runtime_context: Dict[str, str]
+    task_write_count: int = 0
+    task_action_counts: Dict[str, int] = field(default_factory=dict)
+
+
 class SimpleADK:
     """Google ADK-backed agent runner with optional function tool integration."""
 
@@ -154,9 +171,7 @@ class SimpleADK:
         self._task_management_tool = task_management_tool
         self._task_query_tool = task_query_tool
         self._onboarding_sleep_schedule_tool = onboarding_sleep_schedule_tool
-        self._runtime_context: Dict[Tuple[str, str], Dict[str, str]] = {}
-        self._task_write_counts: Dict[Tuple[str, str], int] = {}
-        self._task_action_counts: Dict[Tuple[str, str], Dict[str, int]] = {}
+        self._turn_states: Dict[Tuple[str, str], TurnState] = {}
 
         tools = []
         use_tools = enable_task_tools if enable_task_tools is not None else False
@@ -185,6 +200,9 @@ class SimpleADK:
         )
         self.has_credentials = bool(os.getenv("GOOGLE_API_KEY"))
 
+    def _runtime_context_map(self, context: Dict[str, str] | None) -> Dict[str, str]:
+        return dict(context or {})
+
     def _prompt_with_context(
         self,
         prompt: str,
@@ -193,20 +211,87 @@ class SimpleADK:
         clean_prompt = prompt.strip()
         if not clean_prompt:
             return ""
-        if not context:
+        runtime_context = self._runtime_context_map(context)
+        if not runtime_context:
             return clean_prompt
-        context_lines = "\n".join(f"- {key}: {value}" for key, value in context.items())
+        context_lines = "\n".join(
+            f"- {key}: {value}" for key, value in runtime_context.items()
+        )
         return (
             "Use this execution context while replying:\n"
             f"{context_lines}\n\n"
             f"User message:\n{clean_prompt}"
         )
 
+    def _turn_key(self, *, user_id: str, session_id: str) -> Tuple[str, str]:
+        return (user_id, session_id)
+
+    def _start_turn_state(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        context: Dict[str, str] | None,
+    ) -> Tuple[str, str]:
+        key = self._turn_key(user_id=user_id, session_id=session_id)
+        self._turn_states[key] = TurnState(
+            runtime_context=self._runtime_context_map(context)
+        )
+        return key
+
+    def _finish_turn_state(
+        self,
+        *,
+        key: Tuple[str, str],
+        assistant_text: str,
+        streamed: bool,
+    ) -> TurnExecutionResult:
+        state = self._turn_states.pop(key, TurnState(runtime_context={}))
+        return TurnExecutionResult(
+            assistant_text=assistant_text,
+            task_action_counts={
+                str(name): int(count)
+                for name, count in state.task_action_counts.items()
+                if isinstance(count, int)
+            },
+            task_written=state.task_write_count > 0,
+            streamed=streamed,
+        )
+
+    def _record_task_output(
+        self,
+        *,
+        key: Tuple[str, str] | None,
+        intent: TaskManagementIntent,
+        output: Dict[str, Any],
+    ) -> None:
+        if key is None or output.get("ok") is not True:
+            return
+        state = self._turn_states.get(key)
+        if state is None:
+            return
+        if intent in TASK_WRITE_INTENTS:
+            state.task_write_count += 1
+        state.task_action_counts[intent] = state.task_action_counts.get(intent, 0) + 1
+        telemetry = output.get("result", {}).get("telemetry", {})
+        if isinstance(telemetry, dict):
+            timeboxed_count = telemetry.get("tasks_timeboxed")
+            if isinstance(timeboxed_count, int) and timeboxed_count > 0:
+                state.task_action_counts["timebox"] = (
+                    state.task_action_counts.get("timebox", 0) + timeboxed_count
+                )
+            rescheduled_count = telemetry.get("tasks_rescheduled")
+            if isinstance(rescheduled_count, int) and rescheduled_count > 0:
+                state.task_action_counts["reschedule"] = (
+                    state.task_action_counts.get("reschedule", 0) + rescheduled_count
+                )
+
     def _tool_runtime_context(self, tool_context: ToolContext | None) -> Dict[str, str]:
         if not tool_context:
             return {}
-        key = (tool_context.user_id, tool_context.session.id)
-        return dict(self._runtime_context.get(key, {}))
+        key = self._turn_key(user_id=tool_context.user_id, session_id=tool_context.session.id)
+        state = self._turn_states.get(key)
+        return dict(state.runtime_context if state else {})
 
     async def get_current_time(
         self,
@@ -273,28 +358,11 @@ class SimpleADK:
             timezone,
             runtime_context,
         )
-        if (
-            context_key
-            and output.get("ok") is True
-            and intent in TASK_WRITE_INTENTS
-        ):
-            self._task_write_counts[context_key] = self._task_write_counts.get(context_key, 0) + 1
-        if context_key and output.get("ok") is True:
-            action_counts = dict(self._task_action_counts.get(context_key, {}))
-            action_counts[intent] = action_counts.get(intent, 0) + 1
-            telemetry = output.get("result", {}).get("telemetry", {})
-            if isinstance(telemetry, dict):
-                timeboxed_count = telemetry.get("tasks_timeboxed")
-                if isinstance(timeboxed_count, int) and timeboxed_count > 0:
-                    action_counts["timebox"] = (
-                        action_counts.get("timebox", 0) + timeboxed_count
-                    )
-                rescheduled_count = telemetry.get("tasks_rescheduled")
-                if isinstance(rescheduled_count, int) and rescheduled_count > 0:
-                    action_counts["reschedule"] = (
-                        action_counts.get("reschedule", 0) + rescheduled_count
-                    )
-            self._task_action_counts[context_key] = action_counts
+        self._record_task_output(
+            key=context_key,
+            intent=intent,
+            output=output,
+        )
         return output
 
     async def task_query(
@@ -347,6 +415,48 @@ class SimpleADK:
             runtime_context,
         )
 
+    def _format_model_error(self, error: Exception) -> RuntimeError:
+        message = str(error)
+        if "no longer available to new users" in message:
+            message = (
+                f"{message} Update startup_agent/adk.py with a currently available model."
+            )
+        return RuntimeError(message)
+
+    def _append_model_text(self, last_seen: str, text: str) -> Tuple[str, str]:
+        if text.startswith(last_seen):
+            return text[len(last_seen):], text
+        return text, last_seen + text
+
+    async def _iter_model_deltas(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        content: types.Content,
+    ) -> AsyncGenerator[Tuple[str, str], None]:
+        last_seen = ""
+        try:
+            async with aclosing(
+                self.runner.run_async(
+                    user_id=user_id,
+                    session_id=session_id,
+                    new_message=content,
+                )
+            ) as agen:
+                async for event in agen:
+                    if event.author == "user":
+                        continue
+                    if not event.content or not event.content.parts:
+                        continue
+                    text = "".join(part.text or "" for part in event.content.parts)
+                    if not text:
+                        continue
+                    delta, last_seen = self._append_model_text(last_seen, text)
+                    yield delta, last_seen
+        except Exception as error:
+            raise self._format_model_error(error) from error
+
     async def run_stream(
         self,
         *,
@@ -355,7 +465,8 @@ class SimpleADK:
         session_id: str,
         context: Dict[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
-        composed_prompt = self._prompt_with_context(prompt, context)
+        runtime_context = self._runtime_context_map(context)
+        composed_prompt = self._prompt_with_context(prompt, runtime_context)
         if not composed_prompt:
             yield "Please send a non-empty prompt."
             return
@@ -365,62 +476,106 @@ class SimpleADK:
             )
 
         content = types.Content(role="user", parts=[types.Part(text=composed_prompt)])
-        last_seen = ""
-        context_key = (user_id, session_id)
-        self._runtime_context[context_key] = dict(context or {})
-        self._task_write_counts[context_key] = 0
-        self._task_action_counts[context_key] = {}
-        stream_completed = False
-
-        async with aclosing(
-            self.runner.run_async(
+        context_key = self._start_turn_state(
+            user_id=user_id,
+            session_id=session_id,
+            context=runtime_context,
+        )
+        try:
+            async for delta, _ in self._iter_model_deltas(
                 user_id=user_id,
                 session_id=session_id,
-                new_message=content,
+                content=content,
+            ):
+                if delta:
+                    yield delta
+        finally:
+            self._turn_states.pop(context_key, None)
+
+    async def _execute_turn(
+        self,
+        *,
+        prompt: str,
+        user_id: str,
+        session_id: str,
+        context: Dict[str, str] | None,
+        streamed: bool,
+        on_delta: Callable[[str, str], Awaitable[bool]] | None = None,
+    ) -> TurnExecutionResult | None:
+        runtime_context = self._runtime_context_map(context)
+        composed_prompt = self._prompt_with_context(prompt, runtime_context)
+        if not composed_prompt:
+            return TurnExecutionResult(
+                assistant_text="Please send a non-empty prompt.",
+                task_action_counts={},
+                task_written=False,
+                streamed=streamed,
             )
-        ) as agen:
-            try:
-                async for event in agen:
-                    if event.author == "user":
-                        continue
-                    if not event.content or not event.content.parts:
-                        continue
-                    text = "".join(part.text or "" for part in event.content.parts)
-                    if not text:
-                        continue
+        if not self.has_credentials:
+            raise RuntimeError("Missing Google ADK credentials. Set GOOGLE_API_KEY.")
 
-                    if text.startswith(last_seen):
-                        delta = text[len(last_seen):]
-                        last_seen = text
-                    else:
-                        delta = text
-                        last_seen += text
+        content = types.Content(role="user", parts=[types.Part(text=composed_prompt)])
+        context_key = self._start_turn_state(
+            user_id=user_id,
+            session_id=session_id,
+            context=runtime_context,
+        )
+        last_seen = ""
+        try:
+            async for delta, cumulative in self._iter_model_deltas(
+                user_id=user_id,
+                session_id=session_id,
+                content=content,
+            ):
+                last_seen = cumulative
+                if on_delta and delta and not await on_delta(delta, cumulative):
+                    self._turn_states.pop(context_key, None)
+                    return None
+        except RuntimeError:
+            self._turn_states.pop(context_key, None)
+            raise
 
-                    if delta:
-                        yield delta
-                stream_completed = True
-            except Exception as error:
-                message = str(error)
-                if "no longer available to new users" in message:
-                    message = (
-                        f"{message} Update startup_agent/adk.py with a currently available model."
-                    )
-                raise RuntimeError(message) from error
-            finally:
-                self._runtime_context.pop(context_key, None)
-                if not stream_completed:
-                    self._task_write_counts.pop(context_key, None)
-                    self._task_action_counts.pop(context_key, None)
+        return self._finish_turn_state(
+            key=context_key,
+            assistant_text=last_seen,
+            streamed=streamed,
+        )
 
-    def consume_task_write_count(self, *, user_id: str, session_id: str) -> int:
-        return int(self._task_write_counts.pop((user_id, session_id), 0))
+    async def run_turn(
+        self,
+        *,
+        prompt: str,
+        user_id: str,
+        session_id: str,
+        context: Dict[str, str] | None = None,
+    ) -> TurnExecutionResult:
+        result = await self._execute_turn(
+            prompt=prompt,
+            user_id=user_id,
+            session_id=session_id,
+            context=context,
+            streamed=False,
+        )
+        assert result is not None
+        return result
 
-    def consume_task_action_counts(self, *, user_id: str, session_id: str) -> Dict[str, int]:
-        raw = self._task_action_counts.pop((user_id, session_id), {})
-        output: Dict[str, int] = {}
-        for key, value in raw.items():
-            output[str(key)] = int(value)
-        return output
+    async def run_stream_turn(
+        self,
+        *,
+        prompt: str,
+        user_id: str,
+        session_id: str,
+        context: Dict[str, str] | None = None,
+        on_delta: Callable[[str, str], Awaitable[bool]],
+    ) -> TurnExecutionResult | None:
+        return await self._execute_turn(
+            prompt=prompt,
+            user_id=user_id,
+            session_id=session_id,
+            context=context,
+            streamed=True,
+            on_delta=on_delta,
+        )
 
     async def run(
         self,

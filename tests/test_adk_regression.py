@@ -102,7 +102,7 @@ def test_adk_task_management_action_contract_is_canonical():
     }
 
 
-def test_adk_cleans_task_write_counter_when_stream_is_interrupted(monkeypatch):
+def test_adk_run_turn_returns_explicit_execution_result(monkeypatch):
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
     adk = SimpleADK()
 
@@ -127,18 +127,15 @@ def test_adk_cleans_task_write_counter_when_stream_is_interrupted(monkeypatch):
 
     adk.runner = _Runner()
 
-    async def _consume_and_interrupt():
-        stream = adk.run_stream(
+    result = asyncio.run(
+        adk.run_turn(
             prompt="hello",
-            user_id="u-cleanup",
-            session_id="s-cleanup",
+            user_id="u-result",
+            session_id="s-result",
             context={"timezone": "UTC"},
         )
-        first_chunk = await anext(stream)
-        assert first_chunk
-        await stream.aclose()
+    )
 
-    asyncio.run(_consume_and_interrupt())
-
-    assert ("u-cleanup", "s-cleanup") not in adk._task_write_counts
-    assert adk.consume_task_write_count(user_id="u-cleanup", session_id="s-cleanup") == 0
+    assert result.assistant_text == "hello world"
+    assert result.streamed is False
+    assert result.task_written is False

@@ -2,10 +2,70 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+import types
 import uuid
 from zoneinfo import ZoneInfo
 
 import main
+
+
+class FakeLiveKitCoordinator:
+    def __init__(
+        self,
+        *,
+        dispatch_mode: str = "explicit",
+        fallback_used: bool = False,
+        diagnostic_code: str | None = None,
+    ) -> None:
+        self.url = "wss://example.livekit.cloud"
+        self.dispatch_mode = dispatch_mode
+        self.fallback_used = fallback_used
+        self.diagnostic_code = diagnostic_code
+        self.ensure_room_calls: list[dict[str, object]] = []
+        self.dispatch_calls: list[dict[str, object]] = []
+
+    async def ensure_room(self, *, room_name: str, metadata: dict[str, object]) -> None:
+        self.ensure_room_calls.append({"room_name": room_name, "metadata": metadata})
+
+    async def dispatch_agent(self, *, room_name: str, metadata: dict[str, object]):
+        self.dispatch_calls.append({"room_name": room_name, "metadata": metadata})
+        return type(
+            "DispatchResult",
+            (),
+            {
+                "mode": self.dispatch_mode,
+                "fallback_used": self.fallback_used,
+                "diagnostic_code": self.diagnostic_code,
+                "diagnostic": (
+                    {"diagnostic_code": self.diagnostic_code}
+                    if self.diagnostic_code
+                    else None
+                ),
+            },
+        )()
+
+    def participant_identity(self, *, device_id: str, session_id: str) -> str:
+        return f"user-{device_id}-{session_id}"
+
+    def build_participant_token(
+        self,
+        *,
+        room_name: str,
+        participant_identity: str,
+        participant_name: str,
+        participant_metadata: dict[str, object],
+        dispatch_metadata: dict[str, object],
+        use_token_dispatch_fallback: bool,
+    ) -> tuple[str, str]:
+        del room_name
+        del participant_identity
+        del participant_name
+        del participant_metadata
+        del dispatch_metadata
+        return (
+            "livekit-token",
+            "2026-03-13T00:00:00+00:00" if not use_token_dispatch_fallback else "2026-03-13T00:30:00+00:00",
+        )
 
 
 def _session_open_payload(
@@ -161,6 +221,52 @@ def test_session_open_accepts_explicit_session_id(app_client):
     assert payload["session_id"] == "session_device-beta_custom_1"
 
 
+
+def test_conversation_turn_streams_deltas_through_session_ws(app_client):
+    client = app_client["client"]
+    _start_and_configure_onboarding(client, device_id="device-turn-stream", timezone="UTC")
+    opened = client.post(
+        "/agent/session/open",
+        json=_session_open_payload(device_id="device-turn-stream", timezone="UTC"),
+    )
+    assert opened.status_code == 200
+    session_id = opened.json()["session_id"]
+
+    with client.websocket_connect(
+        "/agent/session/ws?device_id=device-turn-stream&session_id="
+        f"{session_id}&timezone=UTC"
+    ) as ws:
+        initial = ws.receive_json()
+        assert initial["type"] == "session_snapshot"
+
+        response = client.post(
+            "/agent/conversation/turn",
+            json={
+                "device_id": "device-turn-stream",
+                "session_id": session_id,
+                "timezone": "UTC",
+                "prompt": "help me focus",
+                "transport": "chat",
+                "user_message_id": "user-turn-1",
+            },
+        )
+        assert response.status_code == 200
+        frames = []
+        while True:
+            frame = ws.receive_json()
+            frames.append(frame)
+            if frame["type"] == "assistant_done":
+                break
+        snapshot = ws.receive_json()
+
+    deltas = [frame["delta"] for frame in frames if frame["type"] == "assistant_delta"]
+    done = next(frame for frame in frames if frame["type"] == "assistant_done")
+    assert deltas == ["hello", " world"]
+    assert done["text"] == "hello world"
+    assert snapshot["type"] == "session_snapshot"
+    assert response.json()["output"] == "hello world"
+
+
 def test_session_open_requires_timezone_when_user_has_none(app_client):
     client = app_client["client"]
 
@@ -217,6 +323,600 @@ def test_session_open_rejects_foreign_session_id(app_client):
     assert second.status_code == 403
     assert second.json()["error"]["message"] == "Session does not belong to device"
     assert repository.sessions["session_shared_forbidden"].user_id == "device-owner"
+
+
+def test_session_state_returns_current_messages_and_task_panel(app_client):
+    client = app_client["client"]
+    repository = app_client["repository"]
+
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-state",
+        timezone="UTC",
+    )
+    opened = client.post(
+        "/agent/session/open",
+        json=_session_open_payload(device_id="device-state", timezone="UTC"),
+    )
+    assert opened.status_code == 200
+    session_id = opened.json()["session_id"]
+
+    asyncio.run(
+        repository.insert_message(
+            payload=main.MessageRecord(
+                id="msg-state-1",
+                session_id=session_id,
+                user_id="device-state",
+                role="assistant",
+                content="already here",
+                metadata={"transport": "seed"},
+            )
+        )
+    )
+
+    response = client.post(
+        "/agent/session/state",
+        json={
+            "device_id": "device-state",
+            "session_id": session_id,
+            "timezone": "UTC",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["session_id"] == session_id
+    assert payload["messages"][-1]["content"] == "already here"
+    assert "task_panel_state" in payload
+
+
+def test_conversation_turn_persists_user_and_assistant_messages(app_client):
+    client = app_client["client"]
+    fake_agent = app_client["agent"]
+    repository = app_client["repository"]
+
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-voice-turn",
+        timezone="UTC",
+    )
+    opened = client.post(
+        "/agent/session/open",
+        json=_session_open_payload(device_id="device-voice-turn", timezone="UTC"),
+    )
+    assert opened.status_code == 200
+    session_id = opened.json()["session_id"]
+
+    response = client.post(
+        "/agent/conversation/turn",
+        json={
+            "device_id": "device-voice-turn",
+            "session_id": session_id,
+            "timezone": "UTC",
+            "prompt": "help me focus",
+            "transport": "voice",
+            "entry_context": {
+                "source": "manual",
+                "event_id": None,
+                "trigger_type": None,
+                "scheduled_time": None,
+                "calendar_event_id": None,
+                "entry_mode": "reactive",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["output"] == "hello world"
+    assert fake_agent.stream_calls[-1]["prompt"] == "help me focus"
+    stored_messages = [
+        message.model_dump()
+        for message in asyncio.run(repository.list_messages(session_id=session_id))
+    ]
+    assert [message["role"] for message in stored_messages[-2:]] == ["user", "assistant"]
+    assert stored_messages[-2]["metadata"]["transport"] == "voice"
+    assert stored_messages[-1]["content"] == "hello world"
+
+
+def test_conversation_turn_accepts_chat_transport(app_client):
+    client = app_client["client"]
+
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-chat-turn",
+        timezone="UTC",
+    )
+    opened = client.post(
+        "/agent/session/open",
+        json=_session_open_payload(device_id="device-chat-turn", timezone="UTC"),
+    )
+    assert opened.status_code == 200
+    session_id = opened.json()["session_id"]
+
+    response = client.post(
+        "/agent/conversation/turn",
+        json={
+            "device_id": "device-chat-turn",
+            "session_id": session_id,
+            "timezone": "UTC",
+            "prompt": "hello chat",
+            "transport": "chat",
+            "entry_context": {
+                "source": "manual",
+                "event_id": None,
+                "trigger_type": None,
+                "scheduled_time": None,
+                "calendar_event_id": None,
+                "entry_mode": "reactive",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["output"] == "hello world"
+
+
+def test_conversation_turn_replay_returns_original_assistant_metadata(app_client):
+    client = app_client["client"]
+
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-chat-replay",
+        timezone="UTC",
+    )
+    opened = client.post(
+        "/agent/session/open",
+        json=_session_open_payload(device_id="device-chat-replay", timezone="UTC"),
+    )
+    assert opened.status_code == 200
+    session_id = opened.json()["session_id"]
+    payload = {
+        "device_id": "device-chat-replay",
+        "session_id": session_id,
+        "timezone": "UTC",
+        "prompt": "hello replay",
+        "transport": "chat",
+        "user_message_id": "user-turn-replay-1",
+    }
+
+    first = client.post("/agent/conversation/turn", json=payload)
+    second = client.post("/agent/conversation/turn", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_body = first.json()
+    second_body = second.json()
+    assert first_body["message_id"] != payload["user_message_id"]
+    assert second_body["message_id"] == first_body["message_id"]
+    assert second_body["created_at"] == first_body["created_at"]
+    assert second_body["output"] == first_body["output"]
+
+
+def test_conversation_turn_replay_reruns_when_user_message_saved_without_assistant(app_client):
+    client = app_client["client"]
+    fake_agent = app_client["agent"]
+    repository = app_client["repository"]
+    failed_once = {"value": False}
+
+    async def flaky_run_stream(self, *, prompt, user_id, session_id, context=None):
+        self.stream_calls.append(
+            {
+                "prompt": prompt,
+                "user_id": user_id,
+                "session_id": session_id,
+                "context": context or {},
+            }
+        )
+        if prompt == "flaky replay" and not failed_once["value"]:
+            failed_once["value"] = True
+            raise RuntimeError("stream exploded once")
+        for chunk in ["recovered", " output"]:
+            yield chunk
+
+    fake_agent.run_stream = types.MethodType(flaky_run_stream, fake_agent)
+
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-chat-retry",
+        timezone="UTC",
+    )
+    opened = client.post(
+        "/agent/session/open",
+        json=_session_open_payload(device_id="device-chat-retry", timezone="UTC"),
+    )
+    assert opened.status_code == 200
+    session_id = opened.json()["session_id"]
+    payload = {
+        "device_id": "device-chat-retry",
+        "session_id": session_id,
+        "timezone": "UTC",
+        "prompt": "flaky replay",
+        "transport": "chat",
+        "user_message_id": "user-turn-flaky-retry",
+    }
+
+    first = client.post("/agent/conversation/turn", json=payload)
+    second = client.post("/agent/conversation/turn", json=payload)
+
+    assert first.status_code == 503
+    assert second.status_code == 200
+    second_body = second.json()
+    assert second_body["message_id"] != payload["user_message_id"]
+    assert second_body["output"] == "recovered output"
+
+    persisted = [
+        message.model_dump()
+        for message in asyncio.run(repository.list_messages(session_id=session_id))
+    ]
+    persisted_users = [
+        message for message in persisted if message["role"] == "user" and message["id"] == payload["user_message_id"]
+    ]
+    persisted_assistants = [
+        message
+        for message in persisted
+        if message["role"] == "assistant"
+        and (message.get("metadata") or {}).get("in_reply_to") == payload["user_message_id"]
+    ]
+    assert len(persisted_users) == 1
+    assert len(persisted_assistants) == 1
+
+
+def test_conversation_turn_replay_rejects_prompt_mismatch(app_client):
+    client = app_client["client"]
+
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-chat-mismatch",
+        timezone="UTC",
+    )
+    opened = client.post(
+        "/agent/session/open",
+        json=_session_open_payload(device_id="device-chat-mismatch", timezone="UTC"),
+    )
+    assert opened.status_code == 200
+    session_id = opened.json()["session_id"]
+
+    first = client.post(
+        "/agent/conversation/turn",
+        json={
+            "device_id": "device-chat-mismatch",
+            "session_id": session_id,
+            "timezone": "UTC",
+            "prompt": "original prompt",
+            "transport": "chat",
+            "user_message_id": "user-turn-mismatch",
+        },
+    )
+    assert first.status_code == 200
+
+    replay_with_different_prompt = client.post(
+        "/agent/conversation/turn",
+        json={
+            "device_id": "device-chat-mismatch",
+            "session_id": session_id,
+            "timezone": "UTC",
+            "prompt": "different prompt",
+            "transport": "chat",
+            "user_message_id": "user-turn-mismatch",
+        },
+    )
+    assert replay_with_different_prompt.status_code == 409
+    assert replay_with_different_prompt.json()["error"]["code"] == "USER_MESSAGE_ID_PROMPT_MISMATCH"
+
+
+def test_conversation_turn_replay_does_not_return_later_assistant_turn(app_client):
+    client = app_client["client"]
+    fake_agent = app_client["agent"]
+    fail_turn_one_once = {"value": False}
+
+    async def selective_run_stream(self, *, prompt, user_id, session_id, context=None):
+        self.stream_calls.append(
+            {
+                "prompt": prompt,
+                "user_id": user_id,
+                "session_id": session_id,
+                "context": context or {},
+            }
+        )
+        if prompt == "turn one" and not fail_turn_one_once["value"]:
+            fail_turn_one_once["value"] = True
+            raise RuntimeError("turn one failed once")
+        if prompt == "turn one":
+            chunks = ["turn", " one"]
+        elif prompt == "turn two":
+            chunks = ["turn", " two"]
+        else:
+            chunks = ["hello", " world"]
+        for chunk in chunks:
+            yield chunk
+
+    fake_agent.run_stream = types.MethodType(selective_run_stream, fake_agent)
+
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-chat-ordering",
+        timezone="UTC",
+    )
+    opened = client.post(
+        "/agent/session/open",
+        json=_session_open_payload(device_id="device-chat-ordering", timezone="UTC"),
+    )
+    assert opened.status_code == 200
+    session_id = opened.json()["session_id"]
+
+    first_attempt = client.post(
+        "/agent/conversation/turn",
+        json={
+            "device_id": "device-chat-ordering",
+            "session_id": session_id,
+            "timezone": "UTC",
+            "prompt": "turn one",
+            "transport": "chat",
+            "user_message_id": "user-turn-ordering-1",
+        },
+    )
+    assert first_attempt.status_code == 503
+
+    second_turn = client.post(
+        "/agent/conversation/turn",
+        json={
+            "device_id": "device-chat-ordering",
+            "session_id": session_id,
+            "timezone": "UTC",
+            "prompt": "turn two",
+            "transport": "chat",
+            "user_message_id": "user-turn-ordering-2",
+        },
+    )
+    assert second_turn.status_code == 200
+    second_body = second_turn.json()
+    assert second_body["output"] == "turn two"
+
+    replay_first = client.post(
+        "/agent/conversation/turn",
+        json={
+            "device_id": "device-chat-ordering",
+            "session_id": session_id,
+            "timezone": "UTC",
+            "prompt": "turn one",
+            "transport": "chat",
+            "user_message_id": "user-turn-ordering-1",
+        },
+    )
+    assert replay_first.status_code == 200
+    replay_body = replay_first.json()
+    assert replay_body["output"] == "turn one"
+    assert replay_body["message_id"] != "user-turn-ordering-1"
+    assert replay_body["message_id"] != second_body["message_id"]
+
+
+def test_conversation_turn_duplicate_insert_race_returns_replay(app_client, monkeypatch):
+    client = app_client["client"]
+    repository = app_client["repository"]
+
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-chat-race",
+        timezone="UTC",
+    )
+    opened = client.post(
+        "/agent/session/open",
+        json=_session_open_payload(device_id="device-chat-race", timezone="UTC"),
+    )
+    assert opened.status_code == 200
+    session_id = opened.json()["session_id"]
+
+    asyncio.run(
+        repository.insert_message(
+            payload=main.MessageRecord(
+                id="user-turn-race-1",
+                session_id=session_id,
+                user_id="device-chat-race",
+                role="user",
+                content="race prompt",
+                metadata={"transport": "chat"},
+            )
+        )
+    )
+    asyncio.run(
+        repository.insert_message(
+            payload=main.MessageRecord(
+                id="assistant-turn-race-1",
+                session_id=session_id,
+                user_id="device-chat-race",
+                role="assistant",
+                content="race resolved",
+                metadata={"in_reply_to": "user-turn-race-1"},
+            )
+        )
+    )
+
+    original_message_exists = repository.message_exists
+    call_count = {"value": 0}
+
+    async def staged_message_exists(session_id: str, message_id: str) -> bool:
+        call_count["value"] += 1
+        if call_count["value"] == 1:
+            return False
+        return await original_message_exists(session_id=session_id, message_id=message_id)
+
+    async def duplicate_stream_turn(**kwargs):
+        del kwargs
+        raise RuntimeError(
+            'Supabase error 409: duplicate key value violates unique constraint "session_messages_pkey"'
+        )
+
+    monkeypatch.setattr(repository, "message_exists", staged_message_exists)
+    monkeypatch.setattr(main.conversation_engine, "stream_turn", duplicate_stream_turn)
+
+    response = client.post(
+        "/agent/conversation/turn",
+        json={
+            "device_id": "device-chat-race",
+            "session_id": session_id,
+            "timezone": "UTC",
+            "prompt": "race prompt",
+            "transport": "chat",
+            "user_message_id": "user-turn-race-1",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["output"] == "race resolved"
+    assert payload["message_id"] == "assistant-turn-race-1"
+
+
+def test_voice_connect_returns_livekit_credentials(app_client, monkeypatch):
+    client = app_client["client"]
+    fake_livekit = FakeLiveKitCoordinator(dispatch_mode="token_fallback", fallback_used=True)
+    monkeypatch.setattr(main, "livekit_voice", fake_livekit)
+    monkeypatch.setenv("INTENTIVE_BACKEND_URL", "https://backend.intentive.test")
+
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-voice-room",
+        timezone="UTC",
+    )
+    opened = client.post(
+        "/agent/session/open",
+        json=_session_open_payload(device_id="device-voice-room", timezone="UTC"),
+    )
+    assert opened.status_code == 200
+    session_id = opened.json()["session_id"]
+
+    response = client.post(
+        "/agent/voice/connect",
+        json={
+            "device_id": "device-voice-room",
+            "session_id": session_id,
+            "timezone": "UTC",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["room_name"] == f"voice_{session_id}"
+    assert payload["server_url"] == "wss://example.livekit.cloud"
+    assert payload["participant_token"] == "livekit-token"
+    assert payload["dispatch_mode"] == "token_fallback"
+    assert payload["fallback_used"] is True
+    assert fake_livekit.ensure_room_calls[0]["room_name"] == f"voice_{session_id}"
+    dispatch_metadata = fake_livekit.dispatch_calls[0]["metadata"]
+    assert dispatch_metadata["backend_url"] == "https://backend.intentive.test"
+
+
+def test_voice_connect_includes_debug_diagnostic_code_when_enabled(app_client, monkeypatch):
+    client = app_client["client"]
+    fake_livekit = FakeLiveKitCoordinator(
+        dispatch_mode="token_fallback",
+        fallback_used=True,
+        diagnostic_code="LIVEKIT_AUTH_MISCONFIG",
+    )
+    monkeypatch.setattr(main, "livekit_voice", fake_livekit)
+    monkeypatch.setenv("INTENTIVE_BACKEND_URL", "https://backend.intentive.test")
+    monkeypatch.setenv("VOICE_DEBUG", "true")
+
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-voice-debug",
+        timezone="UTC",
+    )
+    opened = client.post(
+        "/agent/session/open",
+        json=_session_open_payload(device_id="device-voice-debug", timezone="UTC"),
+    )
+    assert opened.status_code == 200
+    session_id = opened.json()["session_id"]
+
+    response = client.post(
+        "/agent/voice/connect",
+        json={
+            "device_id": "device-voice-debug",
+            "session_id": session_id,
+            "timezone": "UTC",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["fallback_used"] is True
+    assert payload["voice_diagnostic_code"] == "LIVEKIT_AUTH_MISCONFIG"
+
+
+def test_voice_connect_hides_diagnostic_code_when_debug_disabled(app_client, monkeypatch):
+    client = app_client["client"]
+    fake_livekit = FakeLiveKitCoordinator(
+        dispatch_mode="token_fallback",
+        fallback_used=True,
+        diagnostic_code="LIVEKIT_AUTH_MISCONFIG",
+    )
+    monkeypatch.setattr(main, "livekit_voice", fake_livekit)
+    monkeypatch.setenv("INTENTIVE_BACKEND_URL", "https://backend.intentive.test")
+    monkeypatch.setenv("VOICE_DEBUG", "false")
+
+    _start_and_configure_onboarding(
+        client,
+        device_id="device-voice-no-debug",
+        timezone="UTC",
+    )
+    opened = client.post(
+        "/agent/session/open",
+        json=_session_open_payload(device_id="device-voice-no-debug", timezone="UTC"),
+    )
+    assert opened.status_code == 200
+    session_id = opened.json()["session_id"]
+
+    response = client.post(
+        "/agent/voice/connect",
+        json={
+            "device_id": "device-voice-no-debug",
+            "session_id": session_id,
+            "timezone": "UTC",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["fallback_used"] is True
+    assert "voice_diagnostic_code" not in payload
+
+
+def test_voice_health_reports_degraded_when_livekit_env_missing(app_client, monkeypatch):
+    client = app_client["client"]
+    monkeypatch.delenv("LIVEKIT_URL", raising=False)
+    monkeypatch.delenv("LIVEKIT_API_KEY", raising=False)
+    monkeypatch.delenv("LIVEKIT_API_SECRET", raising=False)
+    monkeypatch.setattr(main, "livekit_voice", None)
+
+    response = client.get("/agent/voice/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "degraded"
+    assert payload["configured"] is False
+    assert "LIVEKIT_URL" in payload["missing_env_vars"]
+    assert "LIVEKIT_API_KEY" in payload["missing_env_vars"]
+    assert "LIVEKIT_API_SECRET" in payload["missing_env_vars"]
+
+
+def test_voice_health_reports_ok_when_configured(app_client, monkeypatch):
+    client = app_client["client"]
+    monkeypatch.setenv("LIVEKIT_URL", "wss://configured.livekit.cloud")
+    monkeypatch.setenv("LIVEKIT_API_KEY", "api-key")
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "api-secret")
+    monkeypatch.setenv("LIVEKIT_AGENT_NAME", "configured-agent")
+    monkeypatch.setattr(main, "livekit_voice", FakeLiveKitCoordinator())
+
+    response = client.get("/agent/voice/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["configured"] is True
+    assert payload["coordinator_loaded"] is True
+    assert payload["agent_name"] == "configured-agent"
 
 
 def test_session_open_rejects_contract_version_mismatch(app_client):
